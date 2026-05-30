@@ -4,16 +4,23 @@
   English | <a href="README.zh-CN.md">中文</a>
 </div>
 
-OpenWorkflow is a Tauri desktop editor for AI workflow graphs. It lets you design workflows visually, inspect node-level settings, run them locally, and compile the same IR into executable Claude Code-style scripts.
+OpenWorkflow is a visual multi-model AI workflow editor. Its core advantage is that one workflow graph can target different LLM runtimes such as Claude Code, Codex, Gemini, and future local or cloud model adapters.
+
+Build the workflow once, then switch the runtime, tune node-level models, and keep the graph portable through a shared IR.
 
 ![OpenWorkflow editor screenshot](docs/assets/openworkflow-editor.png)
 
+## Multi-Model Workflow Support
+
+- Multi-model runtime adapters are the first-class design goal, not an afterthought.
+- The same workflow can be edited visually and targeted at Claude Code, Codex, Gemini, or additional adapters.
+- The canvas stores workflows in a shared IR, so model/runtime choice stays separate from workflow structure.
+- Each node can carry its own prompt, model tier, schema, and execution settings.
+- The script view compiles the graph into runnable Claude Code-style workflow scripts today, with the adapter layer ready for other model runtimes.
+
 ## Why OpenWorkflow
 
-- Visual workflow authoring instead of hand-editing large scripts.
-- One IR shared by the canvas, parser, emitter, and history system.
-- Multiple runtime adapters, including Claude Code, Codex, and Gemini.
-- Node-level editing for prompts, models, schemas, and other parameters.
+- Visual workflow authoring instead of hand-editing large multi-agent scripts.
 - A reusable prompt library with common workflow rewrites and review prompts.
 - Workspace and session history so you can return to earlier work quickly.
 - Run/stop controls with per-node execution state on the canvas.
@@ -46,7 +53,7 @@ From the repository root, `run.bat` launches the app and rebuilds when needed, a
 ## Basic Usage
 
 1. Create a new workflow or open an existing one.
-2. Pick a runtime adapter and adjust the node model if needed.
+2. Pick a runtime adapter such as Claude Code, Codex, or Gemini, then tune node models as needed.
 3. Select a node on the canvas to edit its prompt and parameters.
 4. Use the prompt panel to apply common edits such as clarity, completeness, cost, reliability, and rollback-oriented fixes.
 5. Run the workflow, watch node status updates, and stop at any time.
