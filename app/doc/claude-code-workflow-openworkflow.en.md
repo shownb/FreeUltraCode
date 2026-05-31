@@ -1,4 +1,4 @@
-# Claude Code Has Workflows. What About Other Models? I Tried OpenWorkflow
+# Claude Code Has Workflows. What About Other Models? I Tried OpenWorkflows
 
 Recently I have been looking closely at Claude Code workflows.
 
@@ -8,33 +8,35 @@ That matters because a workflow is no longer a temporary arrangement inside one 
 
 That also raised a question for me: if workflows are becoming a common layer in AI coding, why should they be tied to one model or one CLI?
 
-So I tried OpenWorkflow. It turns Claude Code-style workflows into a visual canvas, and it tries to make the same workflow target Claude Code, Codex, Gemini, and more local or cloud runtimes.
+So I tried OpenWorkflows. It turns Claude Code-style workflows into a visual canvas, and it tries to make the same workflow target Claude Code, Codex, Gemini, and more local or cloud runtimes.
 
-This tutorial does not start with abstract concepts. It walks through the screenshots in order. The example is concrete: make OpenWorkflow support multiple appearance themes, default to Pencil, and allow switching in Settings / Appearance.
+This tutorial does not start with abstract concepts. It walks through the screenshots in order. The example is concrete: make OpenWorkflows support multiple appearance themes, default to Pencil, and allow switching in Settings / Appearance.
 
 > This is the English version of the screenshot-based usage tutorial.
 >
-> Chinese version: [OpenWorkflow 使用教程](claude-code-workflow-openworkflow.md)
+> Chinese version: [OpenWorkflows 使用教程](claude-code-workflow-openworkflow.md)
 
 ## 0. Start with the final interface
 
 <p align="center">
-  <img src="images/0-标题使用.png" alt="OpenWorkflow canvas, history rail, node properties, and AI input area" width="960">
+  <img src="images/0-标题使用.png" alt="OpenWorkflows canvas, history rail, node properties, and AI input area" width="960">
 </p>
-<p align="center"><em>Figure 0: The main OpenWorkflow workspace, with the blueprint in the center, node properties on the right, and AI input and output at the bottom.</em></p>
+<p align="center"><em>Figure 0: The main OpenWorkflows workspace, with the blueprint in the center, node properties on the right, and AI input and output at the bottom.</em></p>
 
 The main UI has four parts: workflow history on the left, the visual canvas in the center, node properties and common prompts on the right, and AI input plus response panels at the bottom.
 
 The workflow in the screenshot is titled "Pencil multi-theme appearance plan." It is not a static diagram. It is a workflow you can keep editing, turn into a script, run, and revisit later.
 
-## 1. Download OpenWorkflow
+## 1. Download OpenWorkflows
 
 <p align="center">
-  <img src="images/1-下载.png" alt="OpenWorkflow GitHub page with the Releases entry" width="840">
+  <img src="images/1-下载.png" alt="OpenWorkflows GitHub page with the Releases entry" width="840">
 </p>
 <p align="center"><em>Figure 1: Find the latest build from the Releases section on the GitHub page.</em></p>
 
-The fastest way to try it is to open the GitHub project page and download the latest release from Releases. The About panel on the right makes the positioning clear: this is a visual editor that extends Claude Code Workflows to Codex, Gemini, and more LLM runtimes.
+The fastest way to try it is to open the GitHub project page and download the latest release from Releases.
+
+The About panel on the right makes the positioning clear. This is a visual editor that extends Claude Code Workflows to Codex, Gemini, and more LLM runtimes.
 
 If you want to work on the code, clone the repo and start from the `app/` directory:
 
@@ -52,7 +54,7 @@ npm run desktop
 ## 2. Configure models first
 
 <p align="center">
-  <img src="images/2-配置大模型.png" alt="OpenWorkflow model settings page" width="640">
+  <img src="images/2-配置大模型.png" alt="OpenWorkflows model settings page" width="640">
 </p>
 <p align="center"><em>Figure 2: Configure providers, local CLI, and the default model in Settings / Models.</em></p>
 
@@ -74,12 +76,12 @@ After the model is configured, click **New Workflow** on the left. The canvas st
 The real starting point is not manual node drawing. It is the AI input in the bottom-right corner. In this example, I typed:
 
 ```text
-I want OpenWorkflow to support multiple appearance themes,
+I want OpenWorkflows to support multiple appearance themes,
 default to Pencil,
 and allow switching them in Settings / Appearance.
 ```
 
-After you send it with `Ctrl+Enter`, or by clicking the send button, OpenWorkflow turns the request into an editable workflow blueprint.
+After you send it with `Ctrl+Enter`, or by clicking the send button, OpenWorkflows turns the request into an editable workflow blueprint.
 
 ## 4-1. Generate the workflow blueprint
 
@@ -88,7 +90,7 @@ After you send it with `Ctrl+Enter`, or by clicking the send button, OpenWorkflo
 </p>
 <p align="center"><em>Figure 4-1: The AI splits the goal into parallel branches, a summary node, implementation nodes, validation, and delivery.</em></p>
 
-Once the request is sent, OpenWorkflow rewrites the current step into a complete workflow.
+Once the request is sent, OpenWorkflows rewrites the current step into a complete workflow.
 
 The blueprint in the screenshot roughly becomes:
 
@@ -121,7 +123,7 @@ There is a **Script** button in the top bar. Open it and you will see the script
 
 In the screenshot, you can see `parallel(...)` and `agent(...)` structures. Parallel nodes become concurrent branches, and regular nodes become individual agent calls.
 
-This shows that OpenWorkflow is not just drawing boxes. The canvas is backed by a shared workflow structure that can later target different runtimes.
+This shows that OpenWorkflows is not just drawing boxes. The canvas is backed by a shared workflow structure that can later target different runtimes.
 
 ## 5. Keep refining with common prompts
 
@@ -154,7 +156,7 @@ Once you choose, the AI writes that decision back into the workflow blueprint an
 ## 7. Click Run
 
 <p align="center">
-  <img src="images/7-运行.png" alt="Top Run button in OpenWorkflow" width="960">
+  <img src="images/7-运行.png" alt="Top Run button in OpenWorkflows" width="960">
 </p>
 <p align="center"><em>Figure 7: After the blueprint is ready, click Run in the top bar.</em></p>
 
@@ -184,15 +186,15 @@ That is more readable than a long log. If something fails, you do not need to th
 </p>
 <p align="center"><em>Figure 9: The final feature lands in Settings / Appearance, where you can choose Pencil, Deep Night, Aurora, Daylight, Ember, and more.</em></p>
 
-The goal of this example is to let OpenWorkflow support multiple appearance themes. The final entry point is **Settings / Appearance**.
+The goal of this example is to let OpenWorkflows support multiple appearance themes. The final entry point is **Settings / Appearance**.
 
 The screenshot shows theme cards such as Pencil, Deep Night, Aurora, Daylight, and Ember. When you pick one, it changes the global background, panels, borders, and run-state colors.
 
-That also shows the real use case here. OpenWorkflow is not only for demo diagrams. It can break a product request into research, design, implementation, validation, and delivery tracking, then push each piece through the right node.
+That also shows the real use case here. OpenWorkflows is not only for demo diagrams. It can break a product request into research, design, implementation, validation, and delivery tracking, then push each piece through the right node.
 
 ## What I think is actually useful
 
-OpenWorkflow is valuable for more than wrapping a prompt in a UI.
+OpenWorkflows is valuable for more than wrapping a prompt in a UI.
 
 It connects request, blueprint, script, execution, and history review. You can generate a flow in natural language, inspect the structure on the canvas, use common prompts to tighten the boundaries, and only then run it.
 
@@ -202,17 +204,17 @@ For complex AI coding tasks, that structure is much easier to maintain than one 
 
 ## How this relates to Claude Code
 
-OpenWorkflow does not look like a replacement for Claude Code.
+OpenWorkflows does not look like a replacement for Claude Code.
 
 Claude Code already made the workflow direction clear: complex work can be written as dynamic scripts, coordinated across multiple subagents, and run in the background.
 
-OpenWorkflow adds a visual layer to that direction: draw the workflow, edit it, save it, and then try the same structure against more models and runtimes.
+OpenWorkflows adds a visual layer to that direction: draw the workflow, edit it, save it, and then try the same structure against more models and runtimes.
 
 So it is not going against Claude Code. It is extending the workflow idea outward.
 
 ## Still early, but worth watching
 
-OpenWorkflow is not mature yet. Runtime adapters, node capabilities, and the script ecosystem will keep changing.
+OpenWorkflows is not mature yet. Runtime adapters, node capabilities, and the script ecosystem will keep changing.
 
 But the direction is clear. AI coding will not stay at "open a chat box and manually push every step" forever.
 
@@ -220,7 +222,7 @@ Eventually, complex tasks will become workflows. The only real question is wheth
 
 Project:
 
-https://github.com/wellingfeng/OpenWorkflow
+https://github.com/wellingfeng/OpenWorkflows
 
 Reference:
 

@@ -1,6 +1,6 @@
-# 在 OpenWorkflow 里开发 OpenWorkflow（自举 / Self-Dev）
+# 在 OpenWorkflows 里开发 OpenWorkflows（自举 / Self-Dev）
 
-你想用 OpenWorkflow 跑工作流来改 OpenWorkflow 自己的源码。难点：**真正执行工作流的 `claude -p` 只在 Tauri 桌面壳里有**（浏览器里只会模拟），而开发命令 `npm run desktop`（`tauri dev`）会**监听源码**——工作流一改 `app/src/**` 或 Rust，它就热更新/重启 webview，正在跑的工作流（等 `ai_cli` 返回的 Promise）随之全部丢失，运行中断。
+你想用 OpenWorkflows 跑工作流来改 OpenWorkflows 自己的源码。难点：**真正执行工作流的 `claude -p` 只在 Tauri 桌面壳里有**（浏览器里只会模拟），而开发命令 `npm run desktop`（`tauri dev`）会**监听源码**——工作流一改 `app/src/**` 或 Rust，它就热更新/重启 webview，正在跑的工作流（等 `ai_cli` 返回的 Promise）随之全部丢失，运行中断。
 
 核心原则：**让“运行实例”和“被修改的源码”互不影响。**
 
