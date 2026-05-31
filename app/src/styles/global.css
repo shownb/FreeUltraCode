@@ -19,13 +19,17 @@
   --accent-4: #f778ba;
   --status-ai-edit: #4da3ff;
   --status-ai-edit-border: #2c6fb3;
-  --status-success: var(--accent-2);
-  --status-success-border: #1f8f7b;
-  --status-error: #f78b8b;
-  --status-error-border: #b94a4a;
+  --status-running: #22c55e;
+  --status-success: #22c55e;
+  --status-success-border: var(--status-success);
+  --status-error: #ef4444;
+  --status-error-border: var(--status-error);
   --status-interrupted: var(--accent-3);
   --status-interrupted-border: #9b6a05;
   --status-running-track: var(--border);
+  --owf-status-slot-size: 20px;
+  --owf-status-indicator-size: 14px;
+  --owf-status-spinner-ring: 2px;
 
   color-scheme: dark;
 }
@@ -76,6 +80,48 @@ pre,
   .omc-pulse-dot {
     animation: none !important;
   }
+
+  .owf-status-spinner {
+    animation: none !important;
+  }
+}
+
+@keyframes owf-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.owf-status-slot {
+  contain: layout paint;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--owf-status-slot-size);
+  min-width: var(--owf-status-slot-size);
+  height: var(--owf-status-slot-size);
+  line-height: 0;
+  pointer-events: none;
+}
+
+.owf-status-indicator {
+  box-sizing: border-box;
+  display: block;
+  flex: none;
+  width: var(--owf-status-indicator-size);
+  height: var(--owf-status-indicator-size);
+  border: 0;
+  border-radius: 9999px;
+  background: var(--owf-status-color, transparent);
+}
+
+.owf-status-spinner {
+  background: transparent;
+  border: var(--owf-status-spinner-ring) solid var(--status-running-track);
+  border-right-color: var(--status-running);
+  border-top-color: var(--status-running);
+  animation: owf-status-spin 900ms linear infinite;
 }
 
 /* React Flow dark theme overrides */

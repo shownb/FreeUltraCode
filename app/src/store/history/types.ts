@@ -345,6 +345,20 @@ export type SessionSummary = Pick<
   metadata?: HistoryMetadata;
 };
 
+export type CcSwitchAutoImportStatus =
+  | 'imported'
+  | 'no-source'
+  | 'empty'
+  | 'failed';
+
+export interface CcSwitchAutoImportRecord {
+  version: 1;
+  attemptedAt: string;
+  status: CcSwitchAutoImportStatus;
+  importedCount?: number;
+  reason?: string;
+}
+
 export interface HistoryConfig {
   schemaVersion: number;
   lastActiveWorkspaceId?: string;
@@ -358,6 +372,8 @@ export interface HistoryConfig {
   cliAdapter?: unknown;
   /** Set true once the first-run localStorage migration has run. */
   migratedFromLocalStorage?: boolean;
+  /** One-shot marker for the first-run cc-switch provider import. */
+  ccSwitchAutoImport?: CcSwitchAutoImportRecord;
   migrationVersion?: number;
   migrations?: HistoryMigrationRecord[];
   metadata?: HistoryMetadata;

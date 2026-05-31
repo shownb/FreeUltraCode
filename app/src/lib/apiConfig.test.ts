@@ -5,6 +5,7 @@ import {
   addProvider,
   getActiveProvider,
   getActiveProviderId,
+  importProviders,
   listProviders,
   readApiKey,
   readBaseUrl,
@@ -92,5 +93,40 @@ describe('apiConfig provider compatibility', () => {
     });
 
     expect(getActiveProviderId()).toBe('p_1');
+  });
+
+  it('skips duplicate imports without overwriting user-edited provider details', () => {
+    seedProviders(
+      [
+        {
+          id: 'p_1',
+          kind: 'anthropic',
+          name: 'Claude',
+          apiKey: 'manual-key',
+          baseUrl: 'https://proxy.example/v1',
+          model: 'claude-sonnet-4',
+        },
+      ],
+      'p_1',
+    );
+
+    const result = importProviders([
+      {
+        kind: 'anthropic',
+        name: 'Claude',
+        apiKey: 'cc-switch-key',
+        baseUrl: 'https://proxy.example/v1/',
+        model: 'claude-sonnet-4',
+      },
+    ]);
+
+    expect(result).toEqual({ imported: 0, skipped: 1 });
+    expect(listProviders()).toHaveLength(1);
+    expect(listProviders()[0]).toMatchObject({
+      id: 'p_1',
+      apiKey: 'manual-key',
+      baseUrl: 'https://proxy.example/v1',
+    });
+    expect(readApiKey()).toBe('manual-key');
   });
 });

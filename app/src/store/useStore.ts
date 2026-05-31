@@ -28,6 +28,7 @@ import {
   clearActiveGatewaySelection,
   setActiveGatewaySelection as writeStoredGatewaySelection,
 } from '@/lib/gatewayConfig';
+import { maybeRunCcSwitchAutoImportOnFirstRun } from '@/lib/ccSwitchAutoImport';
 import {
   modelClassFromModelId,
   nodeParamsWithGatewayOverride,
@@ -1481,6 +1482,7 @@ async function initHistoryFromDisk(): Promise<void> {
         workspace: workspace.path || s.composer.workspace,
       },
     }));
+    void maybeRunCcSwitchAutoImportOnFirstRun();
     await historyStore.patchConfig({
       schemaVersion: HISTORY_SCHEMA_VERSION,
       lastActiveWorkspaceId: workspace.id,
@@ -2011,7 +2013,7 @@ export const useStore = create<StoreState>((set) => ({
       }
       let full = '';
       if (!directRoute) throw new Error('NO_MODEL_GATEWAY_BACKEND');
-      await completeGatewayText({
+      const returned = await completeGatewayText({
         route: directRoute,
         system,
         userContent: convo,
@@ -2021,7 +2023,7 @@ export const useStore = create<StoreState>((set) => ({
           setActive(liveProse(full) || '⟳ 生成中…');
         },
       });
-      return full;
+      return full || returned;
     };
 
     void (async () => {

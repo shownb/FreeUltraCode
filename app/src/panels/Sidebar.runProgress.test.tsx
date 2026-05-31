@@ -17,6 +17,7 @@ type MockSession = {
   updatedAt?: number;
   preview?: string;
   isWorkflow: boolean;
+  runStatus?: 'success' | 'error' | 'interrupted';
 };
 
 type MockWorkspace = {
@@ -182,8 +183,19 @@ function runningDot(
   percent: number,
 ): HTMLElement | null {
   return container.querySelector(
-    `[aria-label="正在运行，进度 ${percent}%"]`,
+    `[data-status="running"][title="正在运行，进度 ${percent}%"]`,
   );
+}
+
+function statusDot(
+  container: HTMLElement,
+  status: 'none' | 'running' | 'aiEditing' | 'success' | 'error' | 'interrupted',
+): HTMLElement | null {
+  return container.querySelector(`[data-status="${status}"]`);
+}
+
+function statusIndicator(dot: HTMLElement | null): HTMLElement | null {
+  return dot?.querySelector<HTMLElement>('.owf-status-indicator') ?? null;
 }
 
 function newWorkflowButton(container: HTMLElement): HTMLButtonElement {
@@ -201,7 +213,7 @@ afterEach(() => {
 });
 
 describe('Sidebar running progress dot', () => {
-  it('updates the worktree running dot when completion counts change', async () => {
+  it('keeps the running indicator green and spinning while progress changes', async () => {
     resetSidebarStore();
     mockState.runningSessions = [SESSION_KEY];
     mockState.runningSessionProgress = {
@@ -217,8 +229,9 @@ describe('Sidebar running progress dot', () => {
     try {
       const zeroDot = runningDot(view.container, 0);
       expect(zeroDot).not.toBeNull();
-      expect(zeroDot?.getAttribute('title')).toBe('正在运行，进度 0%');
-      expect(zeroDot?.getAttribute('style')).toContain('background: transparent');
+      const zeroSpinner = statusIndicator(zeroDot);
+      expect(zeroSpinner).not.toBeNull();
+      expect(zeroSpinner?.classList.contains('owf-status-spinner')).toBe(true);
 
       mockState.runningSessionProgress = {
         [WORKSPACE.id + '::' + SESSION.id]: {
@@ -232,29 +245,58 @@ describe('Sidebar running progress dot', () => {
       const completeDot = runningDot(view.container, 100);
       expect(completeDot).not.toBeNull();
       expect(completeDot?.getAttribute('title')).toBe('正在运行，进度 100%');
-      expect(completeDot?.getAttribute('style')).toContain(
-        'background: var(--accent-2)',
-      );
-      expect(runningDot(view.container, 0)).toBeNull();
+      const completeSpinner = statusIndicator(completeDot);
+      expect(completeSpinner).not.toBeNull();
+      expect(completeSpinner?.classList.contains('owf-status-spinner')).toBe(true);
+      expect(statusDot(view.container, 'success')).toBeNull();
     } finally {
       await view.cleanup();
     }
   });
 
-  it('does not show a running progress indicator for non-running worktree sessions', async () => {
+  it('reserves a fixed status slot when a session has no status', async () => {
     resetSidebarStore();
-    mockState.runningSessionProgress = {
-      [WORKSPACE.id + '::' + SESSION.id]: {
-        completed: 1,
-        incomplete: 1,
-        percent: 50,
-      },
+    const view = await renderSidebar();
+
+    try {
+      const button = Array.from(view.container.querySelectorAll('button')).find(
+        (item) => item.textContent?.includes(SESSION.title),
+      );
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      const emptySlot = (button as HTMLButtonElement).querySelector(
+        '[data-status="none"]',
+      );
+      expect(emptySlot).not.toBeNull();
+      expect(emptySlot?.classList.contains('owf-status-slot')).toBe(true);
+      expect(statusIndicator(emptySlot as HTMLElement)).toBeNull();
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it.each([
+    ['success', '已完成', 'var(--status-success)'],
+    ['error', '已失败', 'var(--status-error)'],
+    ['interrupted', '已中断', 'var(--status-interrupted)'],
+  ] as const)('renders the %s terminal status indicator', async (status, label, color) => {
+    resetSidebarStore();
+    mockState.sessionTree = {
+      [WORKSPACE.id]: [{ ...SESSION, runStatus: status }],
     };
+    mockState.sessions = [{ ...SESSION, runStatus: status }];
 
     const view = await renderSidebar();
 
     try {
-      expect(view.container.querySelector('[aria-label^="正在运行，进度"]')).toBeNull();
+      const dot = statusDot(view.container, status);
+      expect(dot).not.toBeNull();
+      expect(dot?.getAttribute('title')).toBe(label);
+      const indicator = statusIndicator(dot);
+      expect(indicator).not.toBeNull();
+      expect(indicator?.classList.contains('owf-status-spinner')).toBe(false);
+      expect(indicator?.style.getPropertyValue('--owf-status-color')).toBe(
+        color,
+      );
     } finally {
       await view.cleanup();
     }

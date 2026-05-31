@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import StatusIndicator, { type StatusTone } from '@/components/StatusIndicator';
 import {
   isActiveAiEditingSession,
   isWorkflowReadOnly,
@@ -56,36 +57,17 @@ function runningProgressLabel(
     : `正在运行，进度 ${clamped}%`;
 }
 
-function RunningProgressDot({
-  locale,
-  percent,
-}: {
-  locale: Locale;
-  percent: number | null | undefined;
-}) {
-  const clamped = clampPercent(percent);
-  const degrees = (clamped ?? 0) * 3.6;
-  const background =
-    clamped == null || clamped <= 0
-      ? 'transparent'
-      : clamped >= 100
-        ? 'var(--accent-2)'
-        : `conic-gradient(from 0deg, var(--accent-2) 0deg ${degrees}deg, transparent ${degrees}deg 360deg)`;
-  const label = runningProgressLabel(locale, clamped);
-
-  return (
-    <span
-      aria-label={label}
-      className="omc-pulse-dot shrink-0"
-      role="img"
-      style={{
-        background,
-        border: '1px solid var(--border)',
-        color: 'var(--accent-2)',
-      }}
-      title={label}
-    />
-  );
+function historyStatusLabel(
+  locale: Locale,
+  status: StatusTone | null,
+  percent: number | null | undefined,
+): string | undefined {
+  if (!status) return undefined;
+  if (status === 'running') return runningProgressLabel(locale, percent);
+  if (status === 'aiEditing') return t(locale, 'sidebar.aiEditing');
+  if (status === 'success') return t(locale, 'sidebar.completed');
+  if (status === 'error') return t(locale, 'sidebar.failed');
+  return t(locale, 'sidebar.interrupted');
 }
 
 export default function Sidebar() {
@@ -219,8 +201,14 @@ export default function Sidebar() {
                             sessionKey,
                             { runningSessions, aiEditingSessions },
                           );
+                          const status = liveStatus ?? session.runStatus ?? null;
                           const runProgress =
                             runningSessionProgress[workflowSessionKeyId(sessionKey)];
+                          const statusLabel = historyStatusLabel(
+                            locale,
+                            status,
+                            runProgress?.percent,
+                          );
                           return (
                             <li key={session.id}>
                               <button
@@ -233,7 +221,7 @@ export default function Sidebar() {
                                     : 'text-fg-dim hover:bg-border-soft hover:text-fg')
                                 }
                               >
-                                <span className="flex w-full items-center gap-1.5">
+                                <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
                                   <span
                                     className={
                                       'rounded border px-1 font-mono text-[9px] leading-4 ' +
@@ -247,23 +235,10 @@ export default function Sidebar() {
                                   <span className="min-w-0 flex-1 truncate text-sm">
                                     {session.title}
                                   </span>
-                                  {liveStatus === 'running' ? (
-                                    <RunningProgressDot
-                                      locale={locale}
-                                      percent={runProgress?.percent}
-                                    />
-                                  ) : liveStatus ? (
-                                    <span
-                                      className="omc-pulse-dot shrink-0"
-                                      style={{
-                                        color: 'var(--status-ai-edit)',
-                                      }}
-                                      title={t(
-                                        locale,
-                                        'sidebar.aiEditing',
-                                      )}
-                                    />
-                                  ) : null}
+                                  <StatusIndicator
+                                    label={statusLabel}
+                                    tone={status}
+                                  />
                                 </span>
                                 <span className="flex w-full items-center gap-1 pl-10 font-mono text-[10px] text-fg-faint">
                                   <span>{formatTime(session.updatedAt ?? session.createdAt)}</span>
@@ -291,9 +266,18 @@ export default function Sidebar() {
             <ul className="flex flex-col gap-0.5">
               {sessions.map((session) => {
                 const active = session.id === activeSessionId;
+                const sessionKey = { workspaceId: null, sessionId: session.id };
                 const liveStatus = sessionLiveStatus(
-                  { workspaceId: null, sessionId: session.id },
+                  sessionKey,
                   { runningSessions, aiEditingSessions },
+                );
+                const status = liveStatus ?? session.runStatus ?? null;
+                const runProgress =
+                  runningSessionProgress[workflowSessionKeyId(sessionKey)];
+                const statusLabel = historyStatusLabel(
+                  locale,
+                  status,
+                  runProgress?.percent,
                 );
                 return (
                   <li key={session.id}>
@@ -307,7 +291,7 @@ export default function Sidebar() {
                           : 'text-fg-dim hover:bg-border-soft hover:text-fg')
                       }
                     >
-                      <span className="flex w-full items-center gap-1.5">
+                      <span className="grid w-full grid-cols-[auto_minmax(0,1fr)_var(--owf-status-slot-size)] items-center gap-1.5">
                         <span
                           className={
                             'text-[10px] leading-none ' +
@@ -319,23 +303,7 @@ export default function Sidebar() {
                         <span className="min-w-0 flex-1 truncate text-sm">
                           {session.title}
                         </span>
-                        {liveStatus && (
-                          <span
-                            className="omc-pulse-dot shrink-0"
-                            style={{
-                              color:
-                                liveStatus === 'running'
-                                  ? 'var(--accent-2)'
-                                  : 'var(--status-ai-edit)',
-                            }}
-                            title={t(
-                              locale,
-                              liveStatus === 'running'
-                                ? 'sidebar.running'
-                                : 'sidebar.aiEditing',
-                            )}
-                          />
-                        )}
+                        <StatusIndicator label={statusLabel} tone={status} />
                       </span>
                       <span className="pl-3.5 font-mono text-[10px] text-fg-faint">
                         {formatTime(session.createdAt)}
