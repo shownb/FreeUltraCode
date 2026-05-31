@@ -1,5 +1,12 @@
 import { useState } from 'react';
-import { useStore } from '@/store/useStore';
+import {
+  isActiveAiEditingSession,
+  isWorkflowReadOnly,
+  sessionLiveStatus,
+  useStore,
+  workflowSessionKeyId,
+} from '@/store/useStore';
+import type { Locale } from '@/lib/i18n';
 import { openWorkflow } from '@/lib/persist';
 import { useResizableWidth } from '@/lib/useResizableWidth';
 import { t } from '@/lib/i18n';
@@ -29,6 +36,58 @@ function formatTime(ts: number): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${hhmm}`;
 }
 
+function clampPercent(percent: number | null | undefined): number | null {
+  if (percent == null || !Number.isFinite(percent)) return null;
+  return Math.min(100, Math.max(0, Math.round(percent)));
+}
+
+function runningProgressLabel(
+  locale: Locale,
+  percent: number | null | undefined,
+): string {
+  const clamped = clampPercent(percent);
+  if (clamped == null) {
+    return locale === 'en-US'
+      ? 'Running, progress unknown'
+      : '正在运行，进度未知';
+  }
+  return locale === 'en-US'
+    ? `Running, progress ${clamped}%`
+    : `正在运行，进度 ${clamped}%`;
+}
+
+function RunningProgressDot({
+  locale,
+  percent,
+}: {
+  locale: Locale;
+  percent: number | null | undefined;
+}) {
+  const clamped = clampPercent(percent);
+  const degrees = (clamped ?? 0) * 3.6;
+  const background =
+    clamped == null || clamped <= 0
+      ? 'transparent'
+      : clamped >= 100
+        ? 'var(--accent-2)'
+        : `conic-gradient(from 0deg, var(--accent-2) 0deg ${degrees}deg, transparent ${degrees}deg 360deg)`;
+  const label = runningProgressLabel(locale, clamped);
+
+  return (
+    <span
+      aria-label={label}
+      className="omc-pulse-dot shrink-0"
+      role="img"
+      style={{
+        background,
+        border: '1px solid var(--border)',
+        color: 'var(--accent-2)',
+      }}
+      title={label}
+    />
+  );
+}
+
 export default function Sidebar() {
   const locale = useStore((s) => s.locale);
   const sessions = useStore((s) => s.sessions);
@@ -36,6 +95,11 @@ export default function Sidebar() {
   const sessionTree = useStore((s) => s.sessionTree);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const activeSessionId = useStore((s) => s.activeSessionId);
+  const runningSessions = useStore((s) => s.runningSessions);
+  const runningSessionProgress = useStore((s) => s.runningSessionProgress);
+  const aiEditingSessions = useStore((s) => s.aiEditingSessions);
+  const readOnly = useStore((s) => isWorkflowReadOnly(s));
+  const newWorkflowLocked = useStore((s) => isActiveAiEditingSession(s));
   const newWorkflow = useStore((s) => s.newWorkflow);
   const selectSession = useStore((s) => s.selectSession);
   const setWorkflow = useStore((s) => s.setWorkflow);
@@ -55,6 +119,7 @@ export default function Sidebar() {
   // toolbar reads "已保存" immediately after load.
   const handleOpen = async () => {
     try {
+      if (readOnly) return;
       const loaded = await openWorkflow(t(locale, 'dialog.openWorkflow'));
       if (!loaded) return; // user cancelled or nothing to load
       setWorkflow(loaded.ir);
@@ -91,7 +156,8 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={newWorkflow}
-          className="flex items-center gap-2 rounded-md bg-accent px-3 py-2 text-sm font-medium text-bg transition-opacity hover:opacity-90"
+          disabled={newWorkflowLocked}
+          className="flex items-center gap-2 rounded-md bg-accent px-3 py-2 text-sm font-medium text-bg transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <span className="text-base leading-none">＋</span>
           {t(locale, 'sidebar.newWorkflow')}
@@ -99,7 +165,8 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={() => void handleOpen()}
-          className="flex items-center gap-2 rounded-md border border-border bg-panel-2 px-3 py-2 text-sm text-fg transition-colors hover:border-accent hover:bg-border-soft"
+          disabled={readOnly}
+          className="flex items-center gap-2 rounded-md border border-border bg-panel-2 px-3 py-2 text-sm text-fg transition-colors hover:border-accent hover:bg-border-soft disabled:cursor-not-allowed disabled:opacity-40"
         >
           <span className="text-base leading-none">⤓</span>
           {t(locale, 'sidebar.open')}
@@ -144,6 +211,16 @@ export default function Sidebar() {
                           const active =
                             session.id === activeSessionId &&
                             workspace.id === activeWorkspaceId;
+                          const sessionKey = {
+                            workspaceId: workspace.id,
+                            sessionId: session.id,
+                          };
+                          const liveStatus = sessionLiveStatus(
+                            sessionKey,
+                            { runningSessions, aiEditingSessions },
+                          );
+                          const runProgress =
+                            runningSessionProgress[workflowSessionKeyId(sessionKey)];
                           return (
                             <li key={session.id}>
                               <button
@@ -170,6 +247,23 @@ export default function Sidebar() {
                                   <span className="min-w-0 flex-1 truncate text-sm">
                                     {session.title}
                                   </span>
+                                  {liveStatus === 'running' ? (
+                                    <RunningProgressDot
+                                      locale={locale}
+                                      percent={runProgress?.percent}
+                                    />
+                                  ) : liveStatus ? (
+                                    <span
+                                      className="omc-pulse-dot shrink-0"
+                                      style={{
+                                        color: 'var(--status-ai-edit)',
+                                      }}
+                                      title={t(
+                                        locale,
+                                        'sidebar.aiEditing',
+                                      )}
+                                    />
+                                  ) : null}
                                 </span>
                                 <span className="flex w-full items-center gap-1 pl-10 font-mono text-[10px] text-fg-faint">
                                   <span>{formatTime(session.updatedAt ?? session.createdAt)}</span>
@@ -197,6 +291,10 @@ export default function Sidebar() {
             <ul className="flex flex-col gap-0.5">
               {sessions.map((session) => {
                 const active = session.id === activeSessionId;
+                const liveStatus = sessionLiveStatus(
+                  { workspaceId: null, sessionId: session.id },
+                  { runningSessions, aiEditingSessions },
+                );
                 return (
                   <li key={session.id}>
                     <button
@@ -221,6 +319,23 @@ export default function Sidebar() {
                         <span className="min-w-0 flex-1 truncate text-sm">
                           {session.title}
                         </span>
+                        {liveStatus && (
+                          <span
+                            className="omc-pulse-dot shrink-0"
+                            style={{
+                              color:
+                                liveStatus === 'running'
+                                  ? 'var(--accent-2)'
+                                  : 'var(--status-ai-edit)',
+                            }}
+                            title={t(
+                              locale,
+                              liveStatus === 'running'
+                                ? 'sidebar.running'
+                                : 'sidebar.aiEditing',
+                            )}
+                          />
+                        )}
                       </span>
                       <span className="pl-3.5 font-mono text-[10px] text-fg-faint">
                         {formatTime(session.createdAt)}

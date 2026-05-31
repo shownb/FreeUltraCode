@@ -1,4 +1,4 @@
-import { isTauri } from '@tauri-apps/api/core';
+import { tauriAvailable } from '@/lib/tauri';
 
 /**
  * Open a native folder-selection dialog and return the chosen path, or null if
@@ -11,7 +11,7 @@ import { isTauri } from '@tauri-apps/api/core';
  *   full path. If unavailable, returns null without throwing.
  */
 export async function pickFolder(title = '选择工作区文件夹'): Promise<string | null> {
-  if (isTauri()) {
+  if (tauriAvailable()) {
     // Dynamic import so the browser build never tries to resolve the plugin's
     // IPC at load time.
     const { open } = await import('@tauri-apps/plugin-dialog');
@@ -39,6 +39,22 @@ export async function pickFolder(title = '选择工作区文件夹'): Promise<st
   }
 
   return null;
+}
+
+/**
+ * Open a native file-selection dialog and return the chosen full path, or null
+ * if cancelled / unavailable. Browsers intentionally return null because the
+ * File API does not expose executable paths.
+ */
+export async function pickFile(title = '选择文件'): Promise<string | null> {
+  if (!tauriAvailable()) return null;
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  const result = await open({
+    directory: false,
+    multiple: false,
+    title,
+  });
+  return typeof result === 'string' ? result : null;
 }
 
 /** Last path segment, splitting on both POSIX and Windows separators. */

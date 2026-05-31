@@ -57,6 +57,7 @@ type Direction = 'forward' | 'backward';
 export function estimateNodeSize(type: NodeType): Size {
   switch (type) {
     case 'start':
+      return { w: 320, h: 104 };
     case 'end':
       return { w: 130, h: 56 };
     case 'branch':

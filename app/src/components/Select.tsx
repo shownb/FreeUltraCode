@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/cn';
 import type { SelectOption } from '@/store/types';
 
@@ -12,6 +12,7 @@ export interface SelectProps {
   options: SelectOption[];
   value: string;
   onChange: (id: string) => void;
+  disabled?: boolean;
   /** Optional leading glyph, e.g. a folder icon for the workspace selector. */
   icon?: string;
   /** Accessible label for the trigger. */
@@ -23,6 +24,7 @@ export default function Select({
   options,
   value,
   onChange,
+  disabled = false,
   icon,
   title,
   className,
@@ -49,12 +51,14 @@ export default function Select({
       <button
         type="button"
         title={title}
+        disabled={disabled}
         onClick={() => setOpen((v) => !v)}
         className={cn(
           'flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors',
           open
             ? 'border-accent bg-border-soft text-fg'
             : 'border-border bg-panel-2 text-fg-dim hover:border-accent hover:text-fg',
+          disabled && 'cursor-not-allowed opacity-50 hover:border-border hover:text-fg-dim',
         )}
       >
         {icon && <span className="text-fg-faint">{icon}</span>}
@@ -67,16 +71,30 @@ export default function Select({
         <span className="text-[9px] text-fg-faint">▾</span>
       </button>
 
-      {open && (
+      {open && !disabled && (
         <ul
           className="absolute bottom-full left-0 z-10 mb-1 min-w-full overflow-hidden rounded-md border border-border bg-panel py-1 shadow-lg"
           role="listbox"
         >
-          {options.map((opt) => {
+          {options.map((opt, index) => {
             const active = opt.id === selected?.id;
+            const showGroupHeader =
+              !!opt.group && opt.group !== options[index - 1]?.group;
             return (
-              <li key={opt.id}>
-                <button
+              <Fragment key={opt.id}>
+                {showGroupHeader && (
+                  <li
+                    role="presentation"
+                    className={cn(
+                      'px-3 pb-1 pt-1.5 font-mono text-[9px] uppercase tracking-wider text-fg-faint',
+                      index > 0 && 'mt-1 border-t border-border-soft',
+                    )}
+                  >
+                    {opt.group}
+                  </li>
+                )}
+                <li>
+                  <button
                   type="button"
                   role="option"
                   aria-selected={active}
@@ -103,8 +121,9 @@ export default function Select({
                   {opt.hint && (
                     <span className="text-[10px] text-fg-faint">{opt.hint}</span>
                   )}
-                </button>
-              </li>
+                  </button>
+                </li>
+              </Fragment>
             );
           })}
         </ul>

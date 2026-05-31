@@ -12,7 +12,7 @@ export const PLACEHOLDER_PROMPTS = ['描述你的第一个步骤', '描述你的
  * CONTRACT: defaultBlueprint(name?) returns the canonical starter graph used by
  * newWorkflow(). It is a minimal, ready-to-edit spine:
  *
- *   start → agent("描述你的第一个步骤", model:'sonnet') → end
+ *   start → agent("描述你的第一个步骤") → end
  *
  * Two execution edges wire the spine; layout coordinates are pre-placed so the
  * canvas paints a clean left-to-right row. Downstream code relies on the node
@@ -22,20 +22,23 @@ export const PLACEHOLDER_PROMPTS = ['描述你的第一个步骤', '描述你的
 export function defaultBlueprint(name = '未命名工作流'): IRGraph {
   return {
     version: 1,
-    meta: { name, adapter: 'claude-code' },
+    meta: {
+      name,
+      adapter: 'claude-code',
+      gateway: { defaults: { adapter: 'claude-code', modelClass: 'sonnet' } },
+    },
     nodes: [
       {
         id: 'n_start',
         type: 'start',
         label: 'Start',
-        params: {},
+        params: { userInputs: [] },
       },
       {
         id: 'n_step1',
         type: 'agent',
         label: '描述你的第一个步骤',
         params: {
-          model: 'sonnet',
           prompt: '描述你的第一个步骤',
         },
       },

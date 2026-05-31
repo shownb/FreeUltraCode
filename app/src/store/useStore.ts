@@ -2,11 +2,13 @@ import { create } from 'zustand';
 import {
   DATA,
   type IREndpoint,
+  type GatewaySelection,
   type IRGraph,
   type IRLayout,
   type IRNode,
   type IRRunSnapshot,
   type IRRunStatus,
+  type NodeGatewayOverride,
   type NodeType,
   type PinKind,
 } from '@/core/ir';
@@ -18,14 +20,37 @@ import {
 import { defaultBlueprint } from '@/core/defaultBlueprint';
 import { isEmptyWorkflow } from '@/core/isEmptyWorkflow';
 import { applyIntent } from '@/core/intentEngine';
+import { appendStartUserInputs } from '@/core/startInputs';
 import { isRunnable, topoOrderExec } from '@/core/topo';
+import { readApiKey, readBaseUrl } from '@/lib/apiConfig';
+import { appendComposerDraftState } from '@/lib/composerEntryPolicy';
+import {
+  clearActiveGatewaySelection,
+  setActiveGatewaySelection as writeStoredGatewaySelection,
+} from '@/lib/gatewayConfig';
+import {
+  modelClassFromModelId,
+  nodeParamsWithGatewayOverride,
+  normalizeGatewayWorkflow as migrateWorkflowGateway,
+  workflowDefaultGatewaySelection,
+  workflowGatewaySelection,
+  withWorkflowGatewaySelection as withGatewayDefaults,
+  withoutWorkflowGatewayDefaults,
+} from '@/lib/modelGateway/resolver';
 import { shortId } from '@/lib/id';
 import { translatePromptFields } from '@/lib/promptTranslation';
 import { aiEditViaCli, cancelAiCli, isTauri } from '@/lib/tauri';
 import {
+  applyGatewayOverride,
+  completeGatewayText,
+  nodeGatewayOverride,
+  resolveCliGatewayRoute,
+  resolveDirectGatewayRoute,
+} from '@/lib/modelGateway/modelGateway';
+import {
   UNIFIED_SYSTEM,
   extractJsonObject,
-  streamAnthropic,
+  modelStrategyGuidance,
 } from '@/lib/anthropic';
 import {
   INTERACTION_PROTOCOL,
@@ -33,6 +58,7 @@ import {
   liveProse,
   parseInteraction,
   stripInteraction,
+  summarizeAnswer,
   type InteractionAnswer,
   type InteractionRequest,
 } from '@/core/interaction';
@@ -80,6 +106,7 @@ import {
   type WorkspaceSummary,
 } from './history/types';
 import type {
+  CanvasViewport,
   ComposerSettings,
   Message,
   NodeRunState,
@@ -87,7 +114,20 @@ import type {
   PromptItem,
   SelectOption,
   Session,
+  SessionRunStatus,
 } from './types';
+import {
+  selectRunProgress,
+  type RunProgressSummary,
+} from './runProgress';
+
+export { selectRunProgress } from './runProgress';
+export type { RunProgressSummary } from './runProgress';
+
+export type WorkflowSessionKey = {
+  workspaceId: string | null;
+  sessionId: string | null;
+};
 
 /**
  * CONTRACT: the single zustand store. App.tsx and panels rely on this exact
@@ -134,12 +174,19 @@ export interface StoreState {
   runState: Record<string, NodeRunState>;
   runOutputs: Record<string, string>;
   lastRunFailedNodeId: string | null;
+  canvasViewport: CanvasViewport | null;
   dirty: boolean;
   currentFilePath: string | null;
 
   // AI state (browser-direct streaming).
   /** True while an AI request is streaming in (drives loading + disables send). */
   aiStreaming: boolean;
+  /**
+   * Session-bound workflow edits currently owned by the AI-input dock. This is
+   * the source for blueprint read-only locking and Sidebar live badges; keep
+   * `aiStreaming` as request/loading state only.
+   */
+  aiEditingSessions: WorkflowSessionKey[];
 
   // Session / UI state
   sessions: Session[];
@@ -169,6 +216,22 @@ export interface StoreState {
   sessionTree: Record<string, Session[]>;
   /** Currently selected workspace bucket. */
   activeWorkspaceId: string | null;
+  /**
+   * Workflow sessions that are currently executing. A run is bound to its owning
+   * session (not the active view), so it keeps running in the background when the
+   * user switches sessions. Drives the Sidebar "running" badges. See the
+   * `RunChannel` machinery below.
+   */
+  runningSessions: WorkflowSessionKey[];
+  /** Lightweight live progress keyed by the owning workflow session. */
+  runningSessionProgress: Record<string, RunProgressSummary>;
+  /**
+   * Compatibility marker for older UI code: the first currently executing
+   * session, or null when nothing is running. Prefer `runningSessions`.
+   */
+  runningSessionId: string | null;
+  /** Workspace id of `runningSessionId`. Prefer `runningSessions`. */
+  runningWorkspaceId: string | null;
 
   // Actions
   initHistory: () => void;
@@ -177,6 +240,9 @@ export interface StoreState {
   selectNode: (id: string | null) => void;
   setWorkflow: (ir: IRGraph) => void;
   setAdapter: (adapter: string) => void;
+  setGlobalRunSelection: (selection: GatewaySelection) => void;
+  /** Clear the composer model pin so it inherits the Settings-active provider. */
+  clearGlobalRunSelection: () => void;
   runWorkflow: () => void;
   resumeWorkflow: () => void;
   stopWorkflow: () => void;
@@ -208,6 +274,10 @@ export interface StoreState {
     parent?: string,
   ) => string;
   updateNodeParams: (id: string, patch: Record<string, unknown>) => void;
+  updateNodeGatewayOverride: (
+    id: string,
+    override: NodeGatewayOverride | null,
+  ) => void;
   updateNodeLabel: (id: string, label: string) => void;
   removeNode: (id: string) => void;
   addEdge: (from: IREndpoint, to: IREndpoint, kind: PinKind) => string;
@@ -218,6 +288,7 @@ export interface StoreState {
   setMode: (mode: 'design' | 'running') => void;
   setRunState: (id: string, state: NodeRunState) => void;
   resetRunState: () => void;
+  setCanvasViewport: (viewport: CanvasViewport | null) => void;
 
   // Whole-graph + persistence
   applyGraphEdit: (ir: IRGraph) => void;
@@ -259,21 +330,107 @@ export interface StoreState {
   resetPromptGroups: () => void;
 }
 
-const WORKSPACE_HISTORY_LIMIT = 8;
+export type WorkflowReadOnlyReason = 'running' | 'aiEditing';
+export type SessionLiveStatus = 'running' | 'aiEditing' | null;
 
-/** localStorage key holding the user's Anthropic API key (set via AIDock). */
-const API_KEY_STORAGE = 'owf_anthropic_key';
+type WorkflowWriteSource = 'user' | 'ai';
+type WorkflowSessionState = Pick<
+  StoreState,
+  'activeWorkspaceId' | 'activeSessionId'
+>;
+type WorkflowReadOnlyState = Pick<
+  StoreState,
+  'mode' | 'activeWorkspaceId' | 'activeSessionId' | 'aiEditingSessions'
+>;
+type SessionLiveStatusState = Pick<
+  StoreState,
+  'runningSessions' | 'aiEditingSessions'
+>;
 
-/** Read the API key from localStorage; returns null in non-browser contexts. */
-function readApiKey(): string | null {
-  try {
-    if (typeof window === 'undefined') return null;
-    const v = window.localStorage.getItem(API_KEY_STORAGE);
-    return v && v.trim() ? v.trim() : null;
-  } catch {
-    return null;
-  }
+function activeWorkflowSessionKey(
+  state: WorkflowSessionState,
+): WorkflowSessionKey {
+  return {
+    workspaceId: state.activeWorkspaceId ?? null,
+    sessionId: state.activeSessionId ?? null,
+  };
 }
+
+function sameSessionKey(
+  a: WorkflowSessionKey,
+  b: WorkflowSessionKey,
+): boolean {
+  return a.workspaceId === b.workspaceId && a.sessionId === b.sessionId;
+}
+
+function hasSessionKey(
+  sessions: WorkflowSessionKey[],
+  key: WorkflowSessionKey,
+): boolean {
+  return sessions.some((item) => sameSessionKey(item, key));
+}
+
+export function workflowSessionKeyId(sessionKey: WorkflowSessionKey): string {
+  return `${sessionKey.workspaceId ?? ''}::${sessionKey.sessionId ?? ''}`;
+}
+
+export function isActiveAiEditingSession(
+  state: WorkflowReadOnlyState,
+): boolean {
+  return hasSessionKey(
+    state.aiEditingSessions,
+    activeWorkflowSessionKey(state),
+  );
+}
+
+export function workflowReadOnlyReason(
+  state: WorkflowReadOnlyState,
+): WorkflowReadOnlyReason | null {
+  if (state.mode === 'running') return 'running';
+  if (isActiveAiEditingSession(state)) return 'aiEditing';
+  return null;
+}
+
+export function isWorkflowMutable(state: WorkflowReadOnlyState): boolean {
+  return workflowReadOnlyReason(state) === null;
+}
+
+export function isWorkflowReadOnly(state: WorkflowReadOnlyState): boolean {
+  return !isWorkflowMutable(state);
+}
+
+function canWriteWorkflow(
+  state: WorkflowReadOnlyState,
+  source: WorkflowWriteSource = 'user',
+  sessionKey?: WorkflowSessionKey,
+): boolean {
+  if (
+    sessionKey &&
+    !sameSessionKey(activeWorkflowSessionKey(state), sessionKey)
+  ) {
+    return false;
+  }
+  const reason = workflowReadOnlyReason(state);
+  return reason === null || (reason === 'aiEditing' && source === 'ai');
+}
+
+export function sessionLiveStatus(
+  sessionKey: WorkflowSessionKey,
+  state: SessionLiveStatusState,
+): SessionLiveStatus {
+  if (hasSessionKey(state.runningSessions, sessionKey)) return 'running';
+  if (hasSessionKey(state.aiEditingSessions, sessionKey)) return 'aiEditing';
+  return null;
+}
+
+const WORKSPACE_HISTORY_LIMIT = 8;
+const CANVAS_VIEWPORT_PERSIST_DEBOUNCE_MS = 250;
+
+const canvasViewportPersistTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
+const canvasViewportMemory = new Map<string, CanvasViewport | null>();
 
 /**
  * Per-type default label + params used by addNode. Mirrors the node catalogue
@@ -283,9 +440,9 @@ const NODE_DEFAULTS: Record<
   NodeType,
   { label: string; params: Record<string, unknown> }
 > = {
-  start: { label: 'Start', params: {} },
+  start: { label: 'Start', params: { userInputs: [] } },
   end: { label: 'End', params: {} },
-  agent: { label: '描述你的步骤', params: { model: 'sonnet' } },
+  agent: { label: '描述你的步骤', params: {} },
   parallel: { label: '并行', params: { branches: [] } },
   pipeline: { label: '流水线', params: { items: 'args', stages: [] } },
   phase: { label: '阶段', params: { title: '阶段' } },
@@ -317,6 +474,34 @@ function collectSubtree(nodes: IRNode[], rootId: string): Set<string> {
   return doomed;
 }
 
+function patchParams(
+  params: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...params };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+  }
+  return next;
+}
+
+function promptTranslationGatewayOptions(state: StoreState): {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  adapter?: string;
+} {
+  const selection = workflowGatewaySelection(state.workflow, state.composer.model);
+  const direct = resolveDirectGatewayRoute(selection);
+  return {
+    apiKey: (direct?.apiKey ?? readApiKey()) || undefined,
+    baseUrl: (direct?.baseUrl ?? readBaseUrl()) || undefined,
+    model: direct?.model ?? selection.modelClass,
+    adapter: direct?.adapter ?? selection.adapter,
+  };
+}
+
 function makeSession(locale: Locale = DEFAULT_LOCALE): Session {
   const ts = Date.now();
   return {
@@ -329,7 +514,15 @@ function makeSession(locale: Locale = DEFAULT_LOCALE): Session {
   };
 }
 
+function historySessionRunStatus(
+  status?: unknown,
+): SessionRunStatus | undefined {
+  if (!isRunStatus(status) || status === 'idle') return undefined;
+  return persistedStatusForDisplay(status) as SessionRunStatus;
+}
+
 function sessionFromSummary(summary: SessionSummary): Session {
+  const runStatus = historySessionRunStatus(summary.runStatus);
   return {
     id: summary.id,
     workspaceId: summary.workspaceId,
@@ -339,11 +532,13 @@ function sessionFromSummary(summary: SessionSummary): Session {
     isWorkflow: summary.isWorkflow,
     preview: summary.preview,
     messageCount: summary.messageCount,
+    ...(runStatus ? { runStatus } : {}),
   };
 }
 
 function summaryFromRecord(record: SessionRecord): SessionSummary {
   const last = record.messages[record.messages.length - 1]?.text?.trim();
+  const runStatus = record.meta?.runStatus;
   return {
     id: record.id,
     workspaceId: record.workspaceId,
@@ -353,6 +548,7 @@ function summaryFromRecord(record: SessionRecord): SessionSummary {
     updatedAt: record.updatedAt,
     preview: last ? last.slice(0, 80) : undefined,
     messageCount: record.messages.length,
+    ...(runStatus ? { runStatus } : {}),
   };
 }
 
@@ -399,6 +595,155 @@ async function persistCurrentMessages(): Promise<void> {
   });
 }
 
+function historySessionKey(workspaceId: string, sessionId: string): string {
+  return `${workspaceId}::${sessionId}`;
+}
+
+function normalizeCanvasViewport(
+  viewport: CanvasViewport | null | undefined,
+): CanvasViewport | null {
+  if (!viewport) return null;
+  const x = Number(viewport.x);
+  const y = Number(viewport.y);
+  const zoom = Number(viewport.zoom);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(zoom) || zoom <= 0) {
+    return null;
+  }
+  return {
+    x: Math.round(x * 100) / 100,
+    y: Math.round(y * 100) / 100,
+    zoom: Math.round(zoom * 1000) / 1000,
+  };
+}
+
+function canvasViewportFromMeta(meta?: SessionMeta): CanvasViewport | null {
+  return normalizeCanvasViewport(
+    (meta?.canvasViewport as CanvasViewport | null | undefined) ?? null,
+  );
+}
+
+function canvasViewportForSession(
+  workspaceId: string,
+  sessionId: string,
+  meta?: SessionMeta,
+): CanvasViewport | null {
+  const key = historySessionKey(workspaceId, sessionId);
+  if (canvasViewportMemory.has(key)) {
+    return canvasViewportMemory.get(key) ?? null;
+  }
+  return canvasViewportFromMeta(meta);
+}
+
+function sameCanvasViewport(
+  a: CanvasViewport | null,
+  b: CanvasViewport | null,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.x === b.x && a.y === b.y && a.zoom === b.zoom;
+}
+
+function scheduleCanvasViewportPersist(
+  workspaceId: string,
+  sessionId: string,
+  viewport: CanvasViewport | null,
+): void {
+  const key = historySessionKey(workspaceId, sessionId);
+  const timer = canvasViewportPersistTimers.get(key);
+  if (timer) clearTimeout(timer);
+  const nextViewport = normalizeCanvasViewport(viewport);
+  canvasViewportMemory.set(key, nextViewport);
+  canvasViewportPersistTimers.set(
+    key,
+    setTimeout(() => {
+      canvasViewportPersistTimers.delete(key);
+      void historyStore
+        .updateSession(workspaceId, sessionId, {
+          meta: { canvasViewport: nextViewport },
+        })
+        .catch(() => undefined);
+    }, CANVAS_VIEWPORT_PERSIST_DEBOUNCE_MS),
+  );
+}
+
+function addAiEditingSession(sessionKey: WorkflowSessionKey): void {
+  useStore.setState((state) =>
+    hasSessionKey(state.aiEditingSessions, sessionKey)
+      ? state
+      : { aiEditingSessions: [...state.aiEditingSessions, sessionKey] },
+  );
+}
+
+function removeAiEditingSession(sessionKey: WorkflowSessionKey): void {
+  useStore.setState((state) => {
+    const aiEditingSessions = state.aiEditingSessions.filter(
+      (item) => !sameSessionKey(item, sessionKey),
+    );
+    if (aiEditingSessions.length === state.aiEditingSessions.length) return state;
+    return { aiEditingSessions };
+  });
+}
+
+function updateSessionRunStatus(
+  state: StoreState,
+  sessionKey: WorkflowSessionKey,
+  runStatus: SessionRunStatus | undefined,
+): Pick<StoreState, 'sessions' | 'sessionTree'> | null {
+  const matchesSession = (session: Session): boolean => {
+    if (session.id !== sessionKey.sessionId) return false;
+    if (
+      sessionKey.workspaceId !== null &&
+      session.workspaceId !== undefined &&
+      session.workspaceId !== sessionKey.workspaceId
+    ) {
+      return false;
+    }
+    return true;
+  };
+
+  let sessionsChanged = false;
+  const nextSessions = state.sessions.map((session) => {
+    if (!matchesSession(session) || session.runStatus === runStatus) return session;
+    sessionsChanged = true;
+    return runStatus ? { ...session, runStatus } : { ...session, runStatus: undefined };
+  });
+
+  let sessionTreeChanged = false;
+  let nextSessionTree = state.sessionTree;
+  if (sessionKey.workspaceId !== null) {
+    const current = state.sessionTree[sessionKey.workspaceId];
+    if (current) {
+      const mapped = current.map((session) => {
+        if (!matchesSession(session) || session.runStatus === runStatus) return session;
+        sessionTreeChanged = true;
+        return runStatus
+          ? { ...session, runStatus }
+          : { ...session, runStatus: undefined };
+      });
+      if (sessionTreeChanged) {
+        nextSessionTree = {
+          ...state.sessionTree,
+          [sessionKey.workspaceId]: mapped,
+        };
+      }
+    }
+  }
+
+  if (!sessionsChanged && !sessionTreeChanged) return null;
+  return {
+    sessions: sessionsChanged ? nextSessions : state.sessions,
+    sessionTree: sessionTreeChanged ? nextSessionTree : state.sessionTree,
+  };
+}
+
+function syncSessionRunStatus(
+  sessionKey: WorkflowSessionKey,
+  status: IRRunStatus | undefined,
+): void {
+  const runStatus = historySessionRunStatus(status);
+  useStore.setState((state) => updateSessionRunStatus(state, sessionKey, runStatus) ?? state);
+}
+
 function markLocalActiveSessionWorkflow(): void {
   useStore.setState((state) => {
     const sessions = markedSessions(state.sessions, state.activeSessionId);
@@ -426,6 +771,10 @@ async function persistActiveWorkflowSnapshot(
   meta?: Partial<SessionMeta>,
 ): Promise<void> {
   markLocalActiveSessionWorkflow();
+  if (meta && 'runStatus' in meta && meta.runStatus !== 'running') {
+    const state = useStore.getState();
+    syncSessionRunStatus(activeWorkflowSessionKey(state), meta.runStatus);
+  }
   const ctx = getActiveHistoryContext();
   if (!ctx) return;
   const state = useStore.getState();
@@ -568,6 +917,53 @@ function emptyRunMeta(): Partial<SessionMeta> {
   };
 }
 
+function applyWorkflowEdit(
+  source: WorkflowWriteSource,
+  edit: (
+    state: StoreState,
+  ) => (Partial<
+    Pick<
+      StoreState,
+      | 'selectedNodeId'
+      | 'dirty'
+      | 'runState'
+      | 'runOutputs'
+      | 'lastRunFailedNodeId'
+    >
+  > & { workflow: IRGraph }) | null,
+  persistMeta: Partial<SessionMeta> = emptyRunMeta(),
+  sessionKey?: WorkflowSessionKey,
+): boolean {
+  let committed = false;
+  let nextWorkflow: IRGraph | null = null;
+
+  useStore.setState((state) => {
+    if (!canWriteWorkflow(state, source, sessionKey)) return state;
+    const patch = edit(state);
+    if (!patch) return state;
+
+    committed = true;
+    nextWorkflow = patch.workflow;
+
+    const next: Partial<StoreState> = { workflow: patch.workflow };
+    if (patch.selectedNodeId !== undefined) {
+      next.selectedNodeId = patch.selectedNodeId;
+    }
+    if (patch.dirty !== undefined) next.dirty = patch.dirty;
+    if (patch.runState !== undefined) next.runState = patch.runState;
+    if (patch.runOutputs !== undefined) next.runOutputs = patch.runOutputs;
+    if (patch.lastRunFailedNodeId !== undefined) {
+      next.lastRunFailedNodeId = patch.lastRunFailedNodeId;
+    }
+    return next;
+  });
+
+  if (committed && nextWorkflow) {
+    void persistActiveWorkflowSnapshot(nextWorkflow, persistMeta);
+  }
+  return committed;
+}
+
 function workflowWithoutRunSnapshot(workflow: IRGraph): IRGraph {
   if (!workflow.meta.run) return workflow;
   const meta = { ...workflow.meta };
@@ -591,6 +987,38 @@ function workflowWithRunSnapshot(
     return workflowWithoutRunSnapshot(workflow);
   }
   return { ...workflow, meta: { ...workflow.meta, run: snapshot } };
+}
+
+function commitGraphEdit(
+  ir: IRGraph,
+  source: WorkflowWriteSource = 'user',
+  sessionKey?: WorkflowSessionKey,
+): boolean {
+  let nextWorkflow = ir;
+  return applyWorkflowEdit(source, (state) => {
+    const trustedLayout: IRLayout = {};
+    for (const node of ir.nodes) {
+      const pos = state.workflow.layout?.[node.id];
+      if (pos) trustedLayout[node.id] = { x: pos.x, y: pos.y };
+    }
+    const irWithTrustedLayout = { ...ir, layout: trustedLayout };
+    const shouldRelayout =
+      hasStructuralChanges(state.workflow, ir) ||
+      hasMissingLayout(irWithTrustedLayout);
+    nextWorkflow = shouldRelayout
+      ? autoLayoutGraph(irWithTrustedLayout, state.workflow, { relayout: 'all' })
+      : irWithTrustedLayout;
+    nextWorkflow = workflowWithoutRunSnapshot(nextWorkflow);
+    if (!nextWorkflow.meta.gateway?.defaults && state.workflow.meta.gateway?.defaults) {
+      nextWorkflow = withGatewayDefaults(nextWorkflow, state.workflow.meta.gateway.defaults);
+    }
+    return {
+      workflow: nextWorkflow,
+      selectedNodeId: null,
+      dirty: true,
+      ...emptyRunProgress(),
+    };
+  }, emptyRunMeta(), sessionKey);
 }
 
 function runSnapshotFromState(
@@ -624,6 +1052,10 @@ function runSnapshotFromState(
     outputs,
     failedNodeId: state.lastRunFailedNodeId,
     error,
+    route: workflowDefaultGatewaySelection(
+      state.workflow,
+      state.composer.model,
+    ),
     updatedAt: Date.now(),
   };
 }
@@ -642,10 +1074,11 @@ function restoreWorkflowRunSnapshot(
   workflow: IRGraph,
   meta?: SessionMeta,
 ): IRGraph {
-  const source = runSnapshotFromMeta(meta) ?? workflow.meta.run ?? null;
-  if (!source) return workflowWithoutRunSnapshot(workflow);
-  const progress = runProgressFromSnapshot(workflow, source);
-  return workflowWithRunSnapshot(workflow, {
+  const migrated = migrateWorkflowGateway(workflow, defaultComposer.model);
+  const source = runSnapshotFromMeta(meta) ?? migrated.meta.run ?? null;
+  if (!source) return workflowWithoutRunSnapshot(migrated);
+  const progress = runProgressFromSnapshot(migrated, source);
+  return workflowWithRunSnapshot(migrated, {
     status: source.status === 'running' ? 'interrupted' : source.status,
     nodeStates: progress.runState,
     outputs: progress.runOutputs,
@@ -666,16 +1099,6 @@ async function persistWorkflowRunSnapshot(
   if (path) useStore.getState().markSaved(path);
 }
 
-function persistCurrentRunSnapshot(
-  status?: IRRunStatus,
-  error: Record<string, unknown> | null = null,
-): void {
-  const state = useStore.getState();
-  const snapshot = runSnapshotFromState(state, status, error);
-  const workflow = workflowWithRunSnapshot(state.workflow, snapshot);
-  useStore.setState({ workflow });
-  void persistWorkflowRunSnapshot(workflow, snapshot);
-}
 
 function previewFromText(text: string): string {
   const compact = text.trim().replace(/\s+/g, ' ');
@@ -745,6 +1168,7 @@ async function createNewChatSession(): Promise<void> {
       sessions: [session, ...state.sessions],
       activeSessionId: session.id,
       messages: [],
+      canvasViewport: null,
     });
     return;
   }
@@ -764,6 +1188,7 @@ async function createNewChatSession(): Promise<void> {
     sessionTree,
     activeSessionId: session.id,
     messages: [],
+    canvasViewport: null,
   });
   await historyStore.patchConfig({
     lastActiveWorkspaceId: workspaceId,
@@ -773,11 +1198,40 @@ async function createNewChatSession(): Promise<void> {
 
 async function createNewWorkflowSession(): Promise<void> {
   const state = useStore.getState();
+  // New workflow switches context; it does not mutate the running blueprint.
+  // Keep blocking only while the active session has an in-flight AI graph edit.
+  if (isActiveAiEditingSession(state)) return;
+
   const workspaceId = state.activeWorkspaceId;
   const workflow = defaultBlueprint(
     state.locale === 'en-US' ? 'Untitled Workflow' : '未命名工作流',
   );
   if (!state.historyReady || !workspaceId) {
+    if (state.mode === 'running') {
+      const createdAt = Date.now();
+      const session: Session = {
+        id: shortId('s'),
+        title:
+          workflow.meta.name ??
+          (state.locale === 'en-US' ? 'New Workflow' : '新建工作流'),
+        createdAt,
+        updatedAt: createdAt,
+        isWorkflow: true,
+      };
+      useStore.setState({
+        workflow,
+        selectedNodeId: null,
+        dirty: false,
+        runState: {},
+        runOutputs: {},
+        lastRunFailedNodeId: null,
+        canvasViewport: null,
+        mode: 'design',
+        sessions: [session, ...state.sessions],
+        activeSessionId: session.id,
+      });
+      return;
+    }
     useStore.setState({
       workflow,
       selectedNodeId: null,
@@ -785,6 +1239,7 @@ async function createNewWorkflowSession(): Promise<void> {
       runState: {},
       runOutputs: {},
       lastRunFailedNodeId: null,
+      canvasViewport: null,
       mode: 'design',
     });
     return;
@@ -808,6 +1263,7 @@ async function createNewWorkflowSession(): Promise<void> {
     runState: {},
     runOutputs: {},
     lastRunFailedNodeId: null,
+    canvasViewport: null,
     mode: 'design',
     workspaces,
     sessions: sessionTree[workspaceId] ?? [session],
@@ -828,7 +1284,7 @@ async function activateHistorySession(
   const state = useStore.getState();
   const targetWorkspaceId = workspaceId ?? state.activeWorkspaceId ?? undefined;
   if (!state.historyReady || !targetWorkspaceId) {
-    useStore.setState({ activeSessionId: sessionId });
+    useStore.setState({ activeSessionId: sessionId, canvasViewport: null });
     return;
   }
 
@@ -836,11 +1292,30 @@ async function activateHistorySession(
   if (!record) return;
   const session = sessionFromRecord(record);
   const workspace = state.workspaces.find((ws) => ws.id === targetWorkspaceId);
-  const workflow = restoreWorkflowRunSnapshot(
-    record.workflow ?? state.workflow,
+
+  // If we're switching BACK to the session whose run is still executing, rebuild
+  // the view from the live in-memory channel (not the persisted snapshot, which
+  // may lag a tick behind and would show stale/interrupted state). This keeps
+  // the run visibly live — including any mid-flight streaming message — and
+  // crucially does NOT cancel its CLI processes.
+  const ch = getRunChannel(targetWorkspaceId, session.id);
+  const liveRun = runActive(ch) ? ch : null;
+
+  const workflow = liveRun
+    ? liveRun.workflow
+    : restoreWorkflowRunSnapshot(record.workflow ?? state.workflow, record.meta);
+  const runProgress = liveRun
+    ? {
+        runState: liveRun.runState,
+        runOutputs: liveRun.runOutputs,
+        lastRunFailedNodeId: liveRun.failedNodeId,
+      }
+    : runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
+  const canvasViewport = canvasViewportForSession(
+    targetWorkspaceId,
+    session.id,
     record.meta,
   );
-  const runProgress = runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
   useStore.setState((s) => {
     const composer = workspace
       ? { ...s.composer, workspace: workspace.path }
@@ -867,10 +1342,11 @@ async function activateHistorySession(
           ),
       ],
       },
-      messages: record.messages,
+      messages: liveRun ? liveRun.messages : record.messages,
       workflow,
       ...runProgress,
-      mode: 'design',
+      canvasViewport,
+      mode: liveRun ? 'running' : 'design',
     };
   });
   await historyStore.patchConfig({
@@ -908,6 +1384,11 @@ async function activateWorkspacePath(path: string): Promise<void> {
     activeRecord?.meta,
   );
   const runProgress = runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
+  const canvasViewport = canvasViewportForSession(
+    workspace.id,
+    active?.id ?? '',
+    activeRecord?.meta,
+  );
   useStore.setState((s) => ({
     workspaces,
     activeWorkspaceId: workspace.id,
@@ -917,6 +1398,7 @@ async function activateWorkspacePath(path: string): Promise<void> {
     messages: activeRecord?.messages ?? [],
     workflow,
     ...runProgress,
+    canvasViewport,
     mode: 'design',
     composer: { ...s.composer, workspace: trimmed },
   }));
@@ -975,6 +1457,11 @@ async function initHistoryFromDisk(): Promise<void> {
       activeRecord?.meta,
     );
     const runProgress = runProgressFromSnapshot(workflow, workflow.meta.run ?? null);
+    const canvasViewport = canvasViewportForSession(
+      workspace.id,
+      active?.id ?? '',
+      activeRecord?.meta,
+    );
 
     useStore.setState((s) => ({
       historyReady: true,
@@ -987,6 +1474,7 @@ async function initHistoryFromDisk(): Promise<void> {
       messages: activeRecord?.messages ?? [],
       workflow,
       ...runProgress,
+      canvasViewport,
       mode: 'design',
       composer: {
         ...s.composer,
@@ -1032,8 +1520,13 @@ function markedSessions(
 const persisted = loadComposer();
 const seedComposer: ComposerSettings = (() => {
   const c = persisted?.composer ?? defaultComposer;
-  const valid = modelOptions.some((o) => o.id === c.model);
-  return valid ? c : { ...c, model: defaultComposer.model };
+  // Backfill modelStrategy for legacy persisted composers that predate the field.
+  const withStrategy: ComposerSettings = {
+    ...c,
+    modelStrategy: c.modelStrategy ?? defaultComposer.modelStrategy,
+  };
+  const valid = modelOptions.some((o) => o.id === withStrategy.model);
+  return valid ? withStrategy : { ...withStrategy, model: defaultComposer.model };
 })();
 const seedLocale = loadLocale();
 const seedPromptAutoTranslate = loadPromptAutoTranslate();
@@ -1042,9 +1535,13 @@ const seedPromptAutoTranslate = loadPromptAutoTranslate();
 // from a fresh default blueprint (start → agent → end). We deliberately do NOT
 // seed the demo sample here: that caused "new workflow" to flicker back to the
 // review-changes sample whenever the store module re-initialised (e.g. on HMR).
-const seedWorkflow =
+const seedWorkflow = migrateWorkflowGateway(
   loadLocalWorkflow() ??
-  defaultBlueprint(seedLocale === 'en-US' ? 'Untitled Workflow' : '未命名工作流');
+    defaultBlueprint(
+      seedLocale === 'en-US' ? 'Untitled Workflow' : '未命名工作流',
+    ),
+  defaultComposer.model,
+);
 const seedWorkflowState = restoreWorkflowRunSnapshot(seedWorkflow);
 const seedRunProgress = runProgressFromSnapshot(
   seedWorkflowState,
@@ -1087,11 +1584,13 @@ export const useStore = create<StoreState>((set) => ({
   runState: seedRunProgress.runState,
   runOutputs: seedRunProgress.runOutputs,
   lastRunFailedNodeId: seedRunProgress.lastRunFailedNodeId,
+  canvasViewport: null,
   dirty: false,
   currentFilePath: null,
 
   // AI: idle.
   aiStreaming: false,
+  aiEditingSessions: [],
 
   // Seed session-domain state from the sample module so the dev UI renders
   // a populated session history, message stream, and prompt library.
@@ -1118,6 +1617,10 @@ export const useStore = create<StoreState>((set) => ({
   workspaces: [],
   sessionTree: {},
   activeWorkspaceId: null,
+  runningSessions: [],
+  runningSessionProgress: {},
+  runningSessionId: null,
+  runningWorkspaceId: null,
 
   initHistory: () => {
     void initHistoryFromDisk();
@@ -1136,14 +1639,16 @@ export const useStore = create<StoreState>((set) => ({
   selectNode: (id) => set({ selectedNodeId: id }),
 
   setWorkflow: (ir) => {
-    const workflow = restoreWorkflowRunSnapshot(ir);
+    const workflow = restoreWorkflowRunSnapshot(
+      migrateWorkflowGateway(ir, defaultComposer.model),
+    );
     const runProgress = runProgressFromSnapshot(
       workflow,
       workflow.meta.run ?? null,
     );
-    set({ workflow, ...runProgress });
-    void persistActiveWorkflowSnapshot(
-      workflow,
+    applyWorkflowEdit(
+      'user',
+      () => ({ workflow, ...runProgress }),
       workflow.meta.run ? runMetaFromSnapshot(workflow.meta.run) : emptyRunMeta(),
     );
   },
@@ -1151,14 +1656,35 @@ export const useStore = create<StoreState>((set) => ({
   // Switch the target runtime adapter (Claude Code / Codex / Gemini). The
   // adapter lives in the IR meta so the emitter can target the right runtime.
   setAdapter: (adapter) => {
-    set((state) => ({
-      workflow: workflowWithoutRunSnapshot({
-        ...state.workflow,
-        meta: { ...state.workflow.meta, adapter },
-      }),
+    applyWorkflowEdit('user', (state) => ({
+      workflow: workflowWithoutRunSnapshot(
+        withGatewayDefaults(state.workflow, {
+          ...workflowGatewaySelection(state.workflow, state.composer.model),
+          adapter,
+        }),
+      ),
       ...emptyRunProgress(),
     }));
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
+  },
+
+  setGlobalRunSelection: (selection) => {
+    writeStoredGatewaySelection(selection);
+    applyWorkflowEdit('user', (state) => ({
+      workflow: workflowWithoutRunSnapshot(
+        withGatewayDefaults(state.workflow, selection),
+      ),
+      ...emptyRunProgress(),
+    }));
+  },
+
+  clearGlobalRunSelection: () => {
+    clearActiveGatewaySelection();
+    applyWorkflowEdit('user', (state) => ({
+      workflow: workflowWithoutRunSnapshot(
+        withoutWorkflowGatewayDefaults(state.workflow),
+      ),
+      ...emptyRunProgress(),
+    }));
   },
 
   // Run action — execute the blueprint node-by-node.
@@ -1224,7 +1750,9 @@ export const useStore = create<StoreState>((set) => ({
     const trimmed = text.trim();
     if (!trimmed) return;
     const state = useStore.getState();
-    if (state.mode === 'running' || state.aiStreaming) return;
+    if (isWorkflowReadOnly(state)) return;
+    const aiEditingSession = activeWorkflowSessionKey(state);
+    const capturedStartInputs: string[] = [trimmed];
 
     const userMsg: Message = {
       id: shortId('m'),
@@ -1251,14 +1779,10 @@ export const useStore = create<StoreState>((set) => ({
     void persistMessage(userMsg);
 
     const ir = useStore.getState().workflow;
-    const apiKey = readApiKey() ?? undefined;
-    const model = state.composer.model;
-    const adapter = ir.meta.adapter ?? 'claude-code';
+    const gatewaySelection = workflowGatewaySelection(ir, state.composer.model);
+    const directRoute = resolveDirectGatewayRoute(gatewaySelection);
     const inTauri = isTauri();
-    // Claude Code edits can use the Anthropic API when a key is configured.
-    // Other adapters (Codex / Gemini) should respect the selected runtime and
-    // go through the local CLI in the desktop shell.
-    const useApi = !!apiKey && adapter === 'claude-code';
+    const useApi = !!directRoute;
     const useCli = !useApi && inTauri;
 
     const pushAssistant = (txt: string) => {
@@ -1276,7 +1800,9 @@ export const useStore = create<StoreState>((set) => ({
     if (!useApi && !useCli) {
       const result = applyIntent(ir, trimmed);
       if (result.changed) {
-        useStore.getState().applyGraphEdit(result.ir);
+        useStore
+          .getState()
+          .applyGraphEdit(appendStartUserInputs(result.ir, capturedStartInputs));
         pushAssistant(`⟳ 已修改蓝图 (本地意图引擎)。${result.note}`);
       } else {
         pushAssistant(
@@ -1286,10 +1812,10 @@ export const useStore = create<StoreState>((set) => ({
       return;
     }
 
-    // "grill-me" (and a few aliases) flips the editor into an interrogation
-    // mode: instead of editing immediately, the AI uses the interaction protocol
-    // to ask the user, one at a time, about gaps it spots in the blueprint.
-    const isGrill = /^(grill[-\s]?me|拷问我|审问我|质询我|挑战我)$/i.test(trimmed);
+    // "grill-me" and explicit clarification prompts opt into interrogation
+    // mode. Ordinary AI-input turns should produce/apply a blueprint directly.
+    const isGrill = isGrillRequest(trimmed);
+    let allowClarification = isClarifyingEditRequest(trimmed);
     const wrapped = isGrill
       ? `请扮演严格的需求评审者。针对当前工作流蓝图，用交互（select / input）逐个向我追问还没考虑清楚的关键问题，例如：每个节点的输入/输出、边界与异常处理、成功/验收标准、节点依赖与先后顺序、该并行还是串行、用什么运行时与模型。一次只问一个问题；问清若干轮后，再据此优化蓝图并按要求输出。`
       : isEmptyWorkflow(ir)
@@ -1309,12 +1835,35 @@ export const useStore = create<StoreState>((set) => ({
             meta: { ...nextIr.meta, name: promptWorkflowName },
           }
         : nextIr;
+    const withCapturedStartInputs = (nextIr: IRGraph): IRGraph =>
+      appendStartUserInputs(
+        withPromptWorkflowName(nextIr),
+        capturedStartInputs,
+      );
+    const commitAiBlueprint = (nextIr: IRGraph): 'ok' | 'stale' | 'locked' => {
+      if (
+        !sameSessionKey(
+          activeWorkflowSessionKey(useStore.getState()),
+          aiEditingSession,
+        )
+      ) {
+        return 'stale';
+      }
+      return commitGraphEdit(nextIr, 'ai', aiEditingSession) ? 'ok' : 'locked';
+    };
+    const capturedAnswerText = (
+      req: InteractionRequest,
+      answer: InteractionAnswer,
+    ): string => {
+      const questionLabel = state.locale === 'en-US' ? 'Question' : '问题';
+      const answerLabel = state.locale === 'en-US' ? 'Answer' : '回答';
+      return `${questionLabel}: ${req.prompt}\n${answerLabel}: ${summarizeAnswer(req, answer)}`;
+    };
 
-    // The edit may, instead of (or before) returning a blueprint, ask the user
-    // clarifying questions via the interaction protocol (e.g. "grill-me"). So we
-    // wrap the call in a bounded loop: each round streams into a fresh assistant
-    // bubble; an interaction block renders a widget and waits for the answer
-    // before re-calling, otherwise the returned graph is applied and we stop.
+    // Explicit clarification mode may ask questions via the interaction
+    // protocol. Normal edit mode goes straight for a blueprint and gets one
+    // stricter retry if the model returns prose/markdown without an IRGraph.
+    addAiEditingSession(aiEditingSession);
     set({ aiStreaming: true });
 
     let activeId = '';
@@ -1347,9 +1896,20 @@ export const useStore = create<StoreState>((set) => ({
         const maybe = extractJsonObject(full);
         if (maybe.trim().startsWith('{')) {
           try {
-            const nextIr = withPromptWorkflowName(JSON.parse(maybe) as IRGraph);
+            const nextIr = withCapturedStartInputs(JSON.parse(maybe) as IRGraph);
             if (Array.isArray(nextIr.nodes) && Array.isArray(nextIr.edges)) {
-              useStore.getState().applyGraphEdit(nextIr);
+              const commitState = commitAiBlueprint(nextIr);
+              if (commitState !== 'ok') {
+                setActive(
+                  withAiTiming(
+                    commitState === 'stale'
+                      ? '⚠ 蓝图未更新：AI 结果对应的会话已切换，未写入当前工作流。'
+                      : '⚠ 蓝图未更新：当前 workflow 处于只读状态，无法写入 AI 生成的蓝图。',
+                  ),
+                );
+                void persistCurrentMessages();
+                return;
+              }
               setActive(
                 withAiTiming(
                   `✓ 已更新蓝图（${nextIr.nodes.length} 节点 / ${nextIr.edges.length} 边）。`,
@@ -1362,23 +1922,34 @@ export const useStore = create<StoreState>((set) => ({
             /* fall through to prose */
           }
         }
+        const head = explanation ? `${explanation}\n\n` : '';
         setActive(
           withAiTiming(
-            explanation ||
-              '(模型未返回蓝图。请把意图描述得更具体，例如“在 X 后加一个 Y 节点”。)',
+            `${head}⚠ 蓝图未更新：这次模型只给了说明、没有输出可写入的蓝图。\n请把需求写得更具体（例如“在 X 节点后加一个 Y 节点”），或再发送一次让我据此改图。`,
           ),
         );
         void persistCurrentMessages();
         return;
       }
       try {
-        const nextIr = withPromptWorkflowName(
+        const nextIr = withCapturedStartInputs(
           JSON.parse(extractJsonObject(full)) as IRGraph,
         );
         if (!Array.isArray(nextIr.nodes) || !Array.isArray(nextIr.edges)) {
           throw new Error('返回的不是合法 IRGraph');
         }
-        useStore.getState().applyGraphEdit(nextIr);
+        const commitState = commitAiBlueprint(nextIr);
+        if (commitState !== 'ok') {
+          setActive(
+            withAiTiming(
+              commitState === 'stale'
+                ? '⚠ 蓝图未更新：AI 结果对应的会话已切换，未写入当前工作流。'
+                : '⚠ 蓝图未更新：当前 workflow 处于只读状态，无法写入 AI 生成的蓝图。',
+            ),
+          );
+          void persistCurrentMessages();
+          return;
+        }
         const head = explanation ? `${explanation}\n\n` : '';
         setActive(
           withAiTiming(
@@ -1394,30 +1965,55 @@ export const useStore = create<StoreState>((set) => ({
       }
     };
 
-    // System prompt + interaction protocol so the editor MAY ask the user to
-    // clarify (select/input/confirm) before producing the blueprint.
-    const systemWithProtocol =
-      `${UNIFIED_SYSTEM}\n\n${INTERACTION_PROTOCOL}\n` +
-      `（编辑场景：若需澄清，或用户要你反问，就用上面的交互块逐个提问；问清后再按上面的格式输出中文说明 + \`\`\`json 蓝图。）`;
+    // Per-node model-strategy guidance is injected after UNIFIED_SYSTEM so both
+    // the API and CLI paths (cliPrompt derives from system) carry it. 'inherit'
+    // yields an empty string, preserving the pre-feature behavior exactly.
+    const unifiedBase =
+      UNIFIED_SYSTEM + modelStrategyGuidance(state.composer.modelStrategy);
+    const clarifyingSystem =
+      `${unifiedBase}\n\n${INTERACTION_PROTOCOL}\n` +
+      `（交互澄清模式：用户明确要求你先澄清/确认/反问时，才使用上面的交互块提一个关键问题；用户回答后不要继续追问，必须把回答吸收到 workflow 蓝图，并输出中文说明 + \`\`\`json 蓝图。）`;
+    // Strict, blueprint-only system (no interaction) used once we force output.
+    const directSystem = `${unifiedBase}\n\n${BLUEPRINT_DIRECT_EDIT_CONTRACT}`;
+    // First-pass direct system: still aims for a blueprint, but lets the model
+    // emit ONE granularity-choice select when the requested scale is ambiguous.
+    const directWithEscapeSystem =
+      `${unifiedBase}\n\n${INTERACTION_PROTOCOL}\n\n${SIMPLE_TASK_ESCAPE_CONTRACT}`;
+    let forceBlueprintOnly = false;
+    let sawInteraction = false;
+    let blueprintRetries = 0;
 
     // One backend round. Streams live into the active bubble (API) or returns the
     // CLI's full reply. Returns the raw text for interaction/graph parsing.
     const callOnce = async (convo: string): Promise<string> => {
+      const system = forceBlueprintOnly
+        ? directSystem
+        : allowClarification
+          ? clarifyingSystem
+          : directWithEscapeSystem;
       if (useCli) {
+        const cli = await resolveCliGatewayRoute(gatewaySelection);
         const cliPrompt =
-          `${systemWithProtocol}\n\n` +
-          `只针对工作流蓝图作答，不要读取或探索任何代码文件。` +
-          `如需澄清就用交互块提问；否则输出中文说明 + 一个 \`\`\`json IRGraph 代码块。\n\n` +
+          `${system}\n\n` +
+          `只针对工作流蓝图作答，不要读取或探索任何代码文件，不要创建或修改任何本地文件。` +
+          (forceBlueprintOnly
+            ? `不要提问、不要等待确认、不要输出 Markdown 计划；直接输出中文说明 + 一个完整 \`\`\`json IRGraph 代码块。蓝图规模要和任务复杂度匹配，简单需求优先最小充分结构。\n\n`
+            : allowClarification
+              ? `用户明确要求澄清时才用交互块提问；问清后输出中文说明 + 一个 \`\`\`json IRGraph 代码块。\n\n`
+              : `默认直接输出与任务复杂度匹配的中文说明 + 一个完整 \`\`\`json IRGraph 代码块；简单需求优先最小充分结构，复杂需求再展开。仅当你判断当前输入在“最小改动”与“完整多步蓝图”之间真的存在结构性歧义时，可改为只发一个两选项 select（“${SIMPLE_OPT_MINIMAL}” / “${SIMPLE_OPT_FULL}”）让用户选择，不要输出 Markdown 计划。\n\n`) +
           convo;
-        return aiEditViaCli(cliPrompt, adapter, {
+        return aiEditViaCli(cliPrompt, cli.adapter, {
           permission: 'full', // -> --dangerously-skip-permissions, no prompts
+          model: cli.model,
+          cliCommand: cli.cliCommand,
+          env: cli.env,
         });
       }
       let full = '';
-      await streamAnthropic({
-        apiKey,
-        model,
-        system: systemWithProtocol,
+      if (!directRoute) throw new Error('NO_MODEL_GATEWAY_BACKEND');
+      await completeGatewayText({
+        route: directRoute,
+        system,
         userContent: convo,
         maxTokens: 8192,
         onDelta: (chunk) => {
@@ -1433,10 +2029,33 @@ export const useStore = create<StoreState>((set) => ({
       let finalized = false;
       try {
         for (let round = 0; round < MAX_INTERACTION_ROUNDS; round += 1) {
-          newBubble(useCli ? `⟳ 通过命令行调用 ${adapter}…` : '⟳ 生成中…');
+          newBubble(
+            useCli
+              ? `⟳ 通过命令行调用 ${gatewaySelection.adapter}…`
+              : '⟳ 生成中…',
+          );
           const full = await callOnce(convo);
-          const req = parseInteraction(full);
+          // Parse an interaction whenever we haven't yet forced blueprint-only
+          // output. In direct mode this is the single "task is trivial" select;
+          // in clarify mode it's the user's explicit clarification question.
+          const req = !forceBlueprintOnly ? parseInteraction(full) : null;
           if (!req) {
+            const hasBlueprint = replyIncludesIRGraph(full);
+            const shouldForceBlueprint =
+              !hasBlueprint && blueprintRetries < MAX_BLUEPRINT_RETRIES;
+            if (shouldForceBlueprint) {
+              blueprintRetries += 1;
+              forceBlueprintOnly = true;
+              setActive(
+                withAiTiming(
+                  allowClarification || sawInteraction
+                    ? `⚠ 澄清后模型仍未返回可写入的 workflow 蓝图，正在强制重试为 IRGraph（第 ${blueprintRetries}/${MAX_BLUEPRINT_RETRIES} 次）。`
+                    : `⚠ 模型未返回可写入的 workflow 蓝图，正在按严格 IRGraph 格式重试（第 ${blueprintRetries}/${MAX_BLUEPRINT_RETRIES} 次）。`,
+                ),
+              );
+              convo += strictBlueprintRetryAppendix(full);
+              continue;
+            }
             finalizeReply(full);
             finalized = true;
             break;
@@ -1446,13 +2065,19 @@ export const useStore = create<StoreState>((set) => ({
             withAiTiming(stripInteraction(full) || '（我有几个问题想先和你确认）'),
           );
           void persistCurrentMessages();
-          const answer = await awaitInteraction(req);
+          sawInteraction = true;
+          const answer = await awaitInteraction(null, req);
           if (!answer) {
+            forceBlueprintOnly = true;
+            allowClarification = false;
             convo +=
               '\n\n（用户跳过了这个澄清问题，请不要再追问，直接基于现有信息输出优化后的蓝图。）';
             continue;
           }
-          convo += `\n\n${formatAnswerForPrompt(req, answer)}`;
+          capturedStartInputs.push(capturedAnswerText(req, answer));
+          convo += `\n\n${formatAnswerForPrompt(req, answer)}\n\n${INTERACTION_BLUEPRINT_APPENDIX}`;
+          forceBlueprintOnly = true;
+          allowClarification = false;
         }
         if (!finalized) {
           newBubble(
@@ -1462,13 +2087,14 @@ export const useStore = create<StoreState>((set) => ({
           );
           void persistCurrentMessages();
         }
-        set({ aiStreaming: false });
       } catch (err) {
         const msg = (err as Error)?.message ?? String(err);
         if (activeId) setActive(withAiTiming(`✗ 调用失败: ${msg}`));
         else pushAssistant(withAiTiming(`✗ 调用失败: ${msg}`));
         void persistCurrentMessages();
+      } finally {
         set({ aiStreaming: false });
+        removeAiEditingSession(aiEditingSession);
       }
     })();
   },
@@ -1478,36 +2104,46 @@ export const useStore = create<StoreState>((set) => ({
   // promise the run loop is awaiting on (see awaitInteraction). A no-op resolver
   // (e.g. answering a stale widget after the run ended) just updates the message.
   answerInteraction: (messageId, answer) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === messageId && m.interactionStatus === 'pending'
-          ? { ...m, interactionAnswer: answer, interactionStatus: 'answered' }
-          : m,
-      ),
-    }));
-    void persistCurrentMessages();
+    const mark = (m: Message): Message =>
+      m.id === messageId && m.interactionStatus === 'pending'
+        ? { ...m, interactionAnswer: answer, interactionStatus: 'answered' }
+        : m;
+    set((s) => ({ messages: s.messages.map(mark) }));
     const resolver = pendingInteractionResolvers.get(messageId);
+    const ch = resolver?.runKey ? getRunChannelByKey(resolver.runKey) : null;
+    // Keep the run channel's shadow in sync so a later commit doesn't overwrite
+    // the answered status with stale messages.
+    if (ch) {
+      ch.messages = ch.messages.map(mark);
+      channelCommitMessages(ch, true);
+    } else {
+      void persistCurrentMessages();
+    }
     if (resolver) {
       pendingInteractionResolvers.delete(messageId);
-      resolver(answer);
+      resolver.resolve(answer);
     }
   },
 
   // Skip a pending interaction (the widget's "跳过"): mark it cancelled and
   // resolve the waiting loop with null (no answer).
   dismissInteraction: (messageId) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === messageId && m.interactionStatus === 'pending'
-          ? { ...m, interactionStatus: 'cancelled' }
-          : m,
-      ),
-    }));
-    void persistCurrentMessages();
+    const mark = (m: Message): Message =>
+      m.id === messageId && m.interactionStatus === 'pending'
+        ? { ...m, interactionStatus: 'cancelled' }
+        : m;
+    set((s) => ({ messages: s.messages.map(mark) }));
     const resolver = pendingInteractionResolvers.get(messageId);
+    const ch = resolver?.runKey ? getRunChannelByKey(resolver.runKey) : null;
+    if (ch) {
+      ch.messages = ch.messages.map(mark);
+      channelCommitMessages(ch, true);
+    } else {
+      void persistCurrentMessages();
+    }
     if (resolver) {
       pendingInteractionResolvers.delete(messageId);
-      resolver(null);
+      resolver.resolve(null);
     }
   },
 
@@ -1524,16 +2160,16 @@ export const useStore = create<StoreState>((set) => ({
     const addition = text.trim();
     if (!addition) return;
     set((state) => {
-      const current = state.composerDraft;
-      const next =
-        current.trim().length === 0
-          ? addition
-          : current.endsWith('\n')
-            ? `${current}${addition}`
-            : `${current}\n${addition}`;
+      const next = appendComposerDraftState(
+        state.composerDraft,
+        addition,
+        state.mode === 'running',
+      );
+      if (next.focusVersionDelta === 0) return state;
       return {
-        composerDraft: next,
-        composerFocusVersion: state.composerFocusVersion + 1,
+        composerDraft: next.draft,
+        composerFocusVersion:
+          state.composerFocusVersion + next.focusVersionDelta,
       };
     });
   },
@@ -1559,7 +2195,7 @@ export const useStore = create<StoreState>((set) => ({
 
   addNode: (type, params, parent) => {
     const id = shortId('n');
-    set((state) => {
+    const committed = applyWorkflowEdit('user', (state) => {
       const defaults = NODE_DEFAULTS[type];
       const node: IRNode = {
         id,
@@ -1581,26 +2217,41 @@ export const useStore = create<StoreState>((set) => ({
         ...emptyRunProgress(),
       };
     });
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
-    return id;
+    return committed ? id : '';
   },
 
   updateNodeParams: (id, patch) => {
-    set((state) => ({
+    applyWorkflowEdit('user', (state) => ({
       workflow: workflowWithoutRunSnapshot({
         ...state.workflow,
         nodes: state.workflow.nodes.map((n) =>
-          n.id === id ? { ...n, params: { ...n.params, ...patch } } : n,
+          n.id === id ? { ...n, params: patchParams(n.params, patch) } : n,
         ),
       }),
       dirty: true,
       ...emptyRunProgress(),
     }));
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
+  },
+
+  updateNodeGatewayOverride: (id, override) => {
+    applyWorkflowEdit('user', (state) => ({
+      workflow: workflowWithoutRunSnapshot({
+        ...state.workflow,
+        nodes: state.workflow.nodes.map((n) => {
+          if (n.id !== id) return n;
+          return {
+            ...n,
+            params: nodeParamsWithGatewayOverride(n.params ?? {}, override),
+          };
+        }),
+      }),
+      dirty: true,
+      ...emptyRunProgress(),
+    }));
   },
 
   updateNodeLabel: (id, label) => {
-    set((state) => ({
+    applyWorkflowEdit('user', (state) => ({
       workflow: workflowWithoutRunSnapshot({
         ...state.workflow,
         nodes: state.workflow.nodes.map((n) =>
@@ -1610,13 +2261,12 @@ export const useStore = create<StoreState>((set) => ({
       dirty: true,
       ...emptyRunProgress(),
     }));
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
   },
 
   // Remove a node and, when it is a container (branch/loop), all of its
   // transitive descendants — plus every edge touching any removed node.
   removeNode: (id) => {
-    set((state) => {
+    applyWorkflowEdit('user', (state) => {
       const doomed = collectSubtree(state.workflow.nodes, id);
       const layout = { ...(state.workflow.layout ?? {}) };
       for (const d of doomed) delete layout[d];
@@ -1636,12 +2286,11 @@ export const useStore = create<StoreState>((set) => ({
         ...emptyRunProgress(),
       };
     });
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
   },
 
   addEdge: (from, to, kind) => {
     const id = kind === DATA ? shortId('d') : shortId('e');
-    set((state) => {
+    const committed = applyWorkflowEdit('user', (state) => {
       // Dedupe: identical from/to/kind edges are ignored.
       const exists = state.workflow.edges.some(
         (e) =>
@@ -1651,7 +2300,7 @@ export const useStore = create<StoreState>((set) => ({
           e.to.node === to.node &&
           e.to.port === to.port,
       );
-      if (exists) return state;
+      if (exists) return null;
       return {
         workflow: workflowWithoutRunSnapshot({
           ...state.workflow,
@@ -1661,32 +2310,39 @@ export const useStore = create<StoreState>((set) => ({
         ...emptyRunProgress(),
       };
     });
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
-    return id;
+    return committed ? id : '';
   },
 
   removeEdge: (id) => {
-    set((state) => ({
-      workflow: workflowWithoutRunSnapshot({
-        ...state.workflow,
-        edges: state.workflow.edges.filter((e) => e.id !== id),
-      }),
-      dirty: true,
-      ...emptyRunProgress(),
-    }));
-    void persistActiveWorkflowSnapshot(undefined, emptyRunMeta());
+    applyWorkflowEdit('user', (state) => {
+      const edges = state.workflow.edges.filter((e) => e.id !== id);
+      if (edges.length === state.workflow.edges.length) return null;
+      return {
+        workflow: workflowWithoutRunSnapshot({
+          ...state.workflow,
+          edges,
+        }),
+        dirty: true,
+        ...emptyRunProgress(),
+      };
+    });
   },
 
   // Layout-only write. Deliberately does not set dirty: drags are frequent and
   // position is flushed to persistence via markSaved.
   setNodePosition: (id, x, y) => {
-    set((state) => ({
-      workflow: {
-        ...state.workflow,
-        layout: { ...(state.workflow.layout ?? {}), [id]: { x, y } },
-      },
-    }));
-    void markActiveHistorySessionWorkflow();
+    let committed = false;
+    set((state) => {
+      if (!canWriteWorkflow(state)) return state;
+      committed = true;
+      return {
+        workflow: {
+          ...state.workflow,
+          layout: { ...(state.workflow.layout ?? {}), [id]: { x, y } },
+        },
+      };
+    });
+    if (committed) void markActiveHistorySessionWorkflow();
   },
 
   // ── Run / mode control ─────────────────────────────────────────────────
@@ -1725,32 +2381,20 @@ export const useStore = create<StoreState>((set) => ({
     });
   },
 
+  setCanvasViewport: (viewport) => {
+    const nextViewport = normalizeCanvasViewport(viewport);
+    const state = useStore.getState();
+    if (sameCanvasViewport(state.canvasViewport, nextViewport)) return;
+    set({ canvasViewport: nextViewport });
+    const ctx = getActiveHistoryContext();
+    if (!ctx) return;
+    scheduleCanvasViewportPersist(ctx.workspaceId, ctx.sessionId, nextViewport);
+  },
+
   // ── Whole-graph + persistence ──────────────────────────────────────────
 
   applyGraphEdit: (ir) => {
-    let nextWorkflow = ir;
-    set((state) => {
-      const trustedLayout: IRLayout = {};
-      for (const node of ir.nodes) {
-        const pos = state.workflow.layout?.[node.id];
-        if (pos) trustedLayout[node.id] = { x: pos.x, y: pos.y };
-      }
-      const irWithTrustedLayout = { ...ir, layout: trustedLayout };
-      const shouldRelayout =
-        hasStructuralChanges(state.workflow, ir) ||
-        hasMissingLayout(irWithTrustedLayout);
-      nextWorkflow = shouldRelayout
-        ? autoLayoutGraph(irWithTrustedLayout, state.workflow, { relayout: 'all' })
-        : irWithTrustedLayout;
-      nextWorkflow = workflowWithoutRunSnapshot(nextWorkflow);
-      return {
-        workflow: nextWorkflow,
-        selectedNodeId: null,
-        dirty: true,
-        ...emptyRunProgress(),
-      };
-    });
-    void persistActiveWorkflowSnapshot(nextWorkflow, emptyRunMeta());
+    commitGraphEdit(ir);
   },
 
   markSaved: (path) =>
@@ -1869,11 +2513,7 @@ export const useStore = create<StoreState>((set) => ({
         sourceValue,
         sourceLocale,
         targetLocales,
-        {
-          apiKey: readApiKey() ?? undefined,
-          model: state.composer.model,
-          adapter: state.workflow.meta.adapter ?? 'claude-code',
-        },
+        promptTranslationGatewayOptions(state),
       );
       const translatedLocales = Object.entries(translated) as [
         Locale,
@@ -1973,11 +2613,7 @@ export const useStore = create<StoreState>((set) => ({
         { label: sourceLabel },
         sourceLocale,
         targetLocales,
-        {
-          apiKey: readApiKey() ?? undefined,
-          model: state.composer.model,
-          adapter: state.workflow.meta.adapter ?? 'claude-code',
-        },
+        promptTranslationGatewayOptions(state),
       );
       const translatedLocales = Object.entries(translated) as [
         Locale,
@@ -2024,35 +2660,326 @@ export const useStore = create<StoreState>((set) => ({
 /* Run execution helpers                                                      */
 /* -------------------------------------------------------------------------- */
 
+interface RunConfig {
+  cwd?: string;
+  permission?: string;
+  model?: string;
+  cliCommand?: string;
+  gatewaySelection?: GatewaySelection;
+}
+
 /**
- * Per-run CLI config (workspace + permission), captured from the AIDock controls
- * at run start and shared by every node's `aiEditViaCli` call. Only one run is
- * active at a time (guarded by `mode`), so a module-level value is safe and
- * avoids threading these through every interpreter helper.
+ * A run is bound to the session that started it — NOT to whatever session the
+ * user is currently viewing. This channel is that run's single source of truth:
+ * the run loop reads/writes the shadow state here, and `channelCommit` mirrors it
+ * into the live store ONLY while the owning session is the active view, and
+ * persists it to the owning session regardless. That decoupling is what lets a
+ * run keep executing in the background after the user switches to another
+ * session (and resume seamlessly when they switch back). Multiple sessions may
+ * have their own channels so independent workflow blueprints can run together.
  */
-let activeRunConfig: { cwd?: string; permission?: string } = {};
-const activeCliRunIds = new Set<string>();
+interface RunChannel {
+  key: string;
+  workspaceId: string | null;
+  sessionId: string | null;
+  cancelled: boolean;
+  workflow: IRGraph;
+  config: RunConfig;
+  cliRunIds: Set<string>;
+  messages: Message[];
+  runState: Record<string, NodeRunState>;
+  runOutputs: Record<string, string>;
+  failedNodeId: string | null;
+  error: Record<string, unknown> | null;
+}
+const activeRuns = new Map<string, RunChannel>();
+
+function runKey(workspaceId: string | null, sessionId: string | null): string {
+  return workflowSessionKeyId({ workspaceId, sessionId });
+}
+
+function getRunChannel(workspaceId: string | null, sessionId: string | null): RunChannel | null {
+  return activeRuns.get(runKey(workspaceId, sessionId)) ?? null;
+}
+
+function getRunChannelByKey(key: string): RunChannel | null {
+  return activeRuns.get(key) ?? null;
+}
+
+function activeRunChannels(): RunChannel[] {
+  return [...activeRuns.values()].filter((ch) => !ch.cancelled);
+}
+
+function runningProgressFromChannel(ch: RunChannel): RunProgressSummary {
+  return selectRunProgress(
+    ch.runState,
+    runnableOrder(ch.workflow).map((node) => node.id),
+  );
+}
+
+function runningSessionProgressByKey(): Record<string, RunProgressSummary> {
+  return Object.fromEntries(
+    [...activeRuns.values()].map((ch) => [
+      ch.key,
+      runningProgressFromChannel(ch),
+    ]),
+  );
+}
+
+function syncRunningSessions(): void {
+  const runningSessions = activeRunChannels().map((ch) => ({
+    workspaceId: ch.workspaceId,
+    sessionId: ch.sessionId,
+  }));
+  const first = runningSessions[0] ?? null;
+  useStore.setState({
+    runningSessions,
+    runningSessionProgress: runningSessionProgressByKey(),
+    runningSessionId: first?.sessionId ?? null,
+    runningWorkspaceId: first?.workspaceId ?? null,
+  });
+}
+
+function syncRunningSessionProgress(): void {
+  useStore.setState({ runningSessionProgress: runningSessionProgressByKey() });
+}
+
+/** Is a run alive? (false once the user hits 停止, or the channel is gone.) */
+function runRegistered(ch: RunChannel | null): ch is RunChannel {
+  return !!ch && activeRuns.get(ch.key) === ch;
+}
+
+/** Is a run alive? (false once the user hits 停止, or the channel is gone.) */
+function runActive(ch: RunChannel | null): boolean {
+  return runRegistered(ch) && !ch.cancelled;
+}
+
+/**
+ * Is the running session the one currently shown in the UI? When true, run
+ * writes mirror into the live store (the user watches live progress); when false
+ * the run is backgrounded and writes only persist to its owning session. Falls
+ * back to true when there is no history context (browser/simulator single view).
+ */
+function runViewActive(ch: RunChannel | null): boolean {
+  if (!ch) return false;
+  if (!ch.sessionId) return true;
+  const s = useStore.getState();
+  return s.activeSessionId === ch.sessionId && s.activeWorkspaceId === ch.workspaceId;
+}
+
+/** Build an IRRunSnapshot from the channel's shadow state. */
+function channelSnapshot(ch: RunChannel, status: IRRunStatus): IRRunSnapshot {
+  return {
+    status,
+    nodeStates: Object.fromEntries(
+      Object.entries(ch.runState).filter(([, s]) => s !== 'idle'),
+    ),
+    outputs: Object.fromEntries(
+      Object.entries(ch.runOutputs).filter(
+        (entry): entry is [string, string] => typeof entry[1] === 'string',
+      ),
+    ),
+    failedNodeId: ch.failedNodeId,
+    error: ch.error,
+    route: ch.config.gatewaySelection,
+    updatedAt: Date.now(),
+  };
+}
+
+/**
+ * Persist the channel's shadow to its OWNING session (not the active view).
+ * When the run has no history context (browser/simulator) it falls back to the
+ * active-session path only while that run is the visible session. Deliberately
+ * skips `.owf.json` file autosave for backgrounded runs so a background run
+ * never overwrites the file bound to the session the user is currently editing.
+ */
+async function persistChannelSnapshot(
+  ch: RunChannel,
+  snapshot: IRRunSnapshot,
+): Promise<void> {
+  const workflow = workflowWithRunSnapshot(ch.workflow, snapshot);
+  if (!ch.workspaceId || !ch.sessionId) {
+    if (runViewActive(ch)) {
+      await persistWorkflowRunSnapshot(workflow, snapshot);
+    }
+    return;
+  }
+  try {
+    await historyStore.updateSession(ch.workspaceId, ch.sessionId, {
+      messages: ch.messages,
+      workflow,
+      meta: runMetaFromSnapshot(snapshot),
+    });
+  } catch {
+    /* persistence is best-effort; the in-memory channel stays authoritative */
+  }
+}
+
+/**
+ * Mirror the channel's full shadow into the live store (only when its session is
+ * the active view) and persist a run snapshot to the owning session. Called on
+ * every node-state transition and at terminal states.
+ */
+function channelCommit(ch: RunChannel | null, status: IRRunStatus, persist = true): void {
+  if (!runRegistered(ch)) return;
+  const snapshot = channelSnapshot(ch, status);
+  ch.workflow = workflowWithRunSnapshot(ch.workflow, snapshot);
+  syncRunningSessionProgress();
+  if (status !== 'running') {
+    syncSessionRunStatus(
+      { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
+      status,
+    );
+  }
+  if (runViewActive(ch)) {
+    useStore.setState({
+      messages: ch.messages,
+      runState: ch.runState,
+      runOutputs: ch.runOutputs,
+      lastRunFailedNodeId: ch.failedNodeId,
+      workflow: ch.workflow,
+    });
+  }
+  if (persist) void persistChannelSnapshot(ch, snapshot);
+}
+
+/**
+ * Lightweight commit for message-only changes (logs, streaming chunks). Mirrors
+ * the channel's message buffer into the live store when viewed; persists only
+ * when asked (streaming chunks pass persist=false to avoid per-chunk writes).
+ */
+function channelCommitMessages(ch: RunChannel | null, persist: boolean): void {
+  if (!runRegistered(ch)) return;
+  if (runViewActive(ch)) {
+    useStore.setState({ messages: ch.messages });
+  }
+  if (persist && ch.workspaceId && ch.sessionId) {
+    const ws = ch.workspaceId;
+    const session = ch.sessionId;
+    const messages = ch.messages;
+    void historyStore
+      .updateSession(ws, session, { messages })
+      .catch(() => {});
+  }
+}
+
+/** Append a message to the run channel (or, with no run, to the live store). */
+function pushChannelMessage(
+  ch: RunChannel | null,
+  msg: Message,
+  persist: boolean,
+): void {
+  if (ch) {
+    ch.messages = [...ch.messages, msg];
+    channelCommitMessages(ch, persist);
+    return;
+  }
+  useStore.setState((s) => ({ messages: [...s.messages, msg] }));
+  void persistMessage(msg);
+}
+
+/** Mark a node's run state through the channel (or live store with no run). */
+function markRunNode(ch: RunChannel | null, id: string, state: NodeRunState): void {
+  if (ch) {
+    ch.runState = { ...ch.runState, [id]: state };
+    channelCommit(ch, 'running');
+    return;
+  }
+  useStore.getState().setRunState(id, state);
+}
+
+/** Tear down the active run channel and clear the Sidebar "running" markers. */
+function finishRun(ch: RunChannel | null): void {
+  if (!ch) return;
+  activeRuns.delete(ch.key);
+  syncRunningSessions();
+}
 
 /**
  * Resolvers for interaction messages the run loop is currently blocked on,
  * keyed by message id. `answerInteraction` (user submits the widget) or
- * `resolveAllPendingInteractions` (run stopped) calls the resolver to unblock
- * the awaiting node. Module-level for the same reason as `activeCliRunIds`:
- * only one run is active at a time.
+ * `resolvePendingInteractions` (run stopped) calls the resolver to unblock the
+ * awaiting node. Each entry tracks the owning run so multiple runs can wait on
+ * interactions independently.
  */
 const pendingInteractionResolvers = new Map<
   string,
-  (answer: InteractionAnswer | null) => void
+  { runKey: string | null; resolve: (answer: InteractionAnswer | null) => void }
 >();
 
 /** Max times a single node may ask the user before we stop re-invoking it. */
 const MAX_INTERACTION_ROUNDS = 6;
+
+/** How many times to force a blueprint-only retry when the model gives prose. */
+const MAX_BLUEPRINT_RETRIES = 2;
+
+const BLUEPRINT_DIRECT_EDIT_CONTRACT = `---
+普通 AI 输入框编辑规则：
+- 默认目标是把用户需求写入 workflow 蓝图，而不是生成 Markdown 计划或让用户确认后再做。
+- 必须基于当前 IRGraph 输出“简短中文说明 + 一个完整 \`\`\`json IRGraph 代码块”。
+- 不要输出交互块，不要提问，不要等待批准，不要创建/修改本地文件。
+- 如果需求提到“规划代码修改/支持某功能/实现某能力”，把它转成 workflow 节点：例如需求理解、代码定位、实现、验证、回归检查、总结等步骤。
+- 信息不足时自行做保守假设，并把需要后续确认的事项放进蓝图中的澄清/验证节点。
+- 蓝图规模要和任务复杂度匹配：简单需求优先最小充分结构，复杂需求才展开更多步骤、分支和验证。`;
+
+/** The two — and only two — option labels for the granularity-choice select. */
+const SIMPLE_OPT_MINIMAL = '直接改图（最小改动）';
+const SIMPLE_OPT_FULL = '生成完整多步工作流蓝图';
+
+const SIMPLE_TASK_ESCAPE_CONTRACT = `---
+普通 AI 输入框编辑规则（默认改蓝图）：
+- 默认目标是把用户需求写入 workflow 蓝图：直接基于当前 IRGraph 输出“简短中文说明 + 一个完整 \`\`\`json IRGraph 代码块”。
+- 不要输出 Markdown 计划/需求文档/TODO/文件名，不要等待用户批准，不要创建或修改本地文件。
+- 蓝图规模要和任务复杂度匹配：简单需求优先最小充分结构，复杂需求再展开成多步流程。
+- 唯一例外：只有当你判断当前输入在“直接改一个小点”与“需要完整多步蓝图”之间真的存在结构性歧义，且这个选择会明显改变蓝图形态时，才用下方交互协议发**一个** select（然后立刻结束本回合，不要再输出蓝图或其它文字），选项必须**正好**是这两项：
+  ["${SIMPLE_OPT_MINIMAL}", "${SIMPLE_OPT_FULL}"]
+  让用户自己选“直接做最小改动”还是“铺成完整多步蓝图”。
+- 除上面这一个例外，其余一切情况都必须直接出蓝图，绝不只输出说明。`;
+
+const INTERACTION_BLUEPRINT_APPENDIX = `---
+交互完成后的强制规则：
+- 用户已经回答了一个 select / input / confirm 之后，下一轮必须把这次回答吸收到当前 workflow 蓝图里并输出完整 IRGraph。
+- 不要继续把对话停留在问答、说明或 Markdown 计划上。
+- 不要再追问，除非当前回答根本无法理解；即使如此，也要尽快收口到蓝图修改。`;
+
+function isGrillRequest(text: string): boolean {
+  return /^(grill[-\s]?me|拷问我|审问我|质询我|挑战我)$/i.test(text.trim());
+}
+
+function isClarifyingEditRequest(text: string): boolean {
+  const trimmed = text.trim();
+  if (isGrillRequest(trimmed)) return true;
+  return /(?:先|动手前|改图前|修改前|执行前).*(?:确认|澄清|追问|提问|询问|反问)|(?:确认|澄清|追问|提问|询问|反问).*(?:再|后).*(?:改图|修改|优化|生成)|(?:用|通过).*(?:交互|select\s*\/\s*input|select|input|confirm).*(?:确认|澄清|提问|询问)|逐个.*(?:确认|澄清|提问|询问)|问清|grill[-\s]?me|clarify|ask me|question me|confirm with me/i.test(
+    trimmed,
+  );
+}
+
+function replyIncludesIRGraph(text: string): boolean {
+  try {
+    const parsed = JSON.parse(extractJsonObject(text)) as Partial<IRGraph>;
+    return Array.isArray(parsed.nodes) && Array.isArray(parsed.edges);
+  } catch {
+    return false;
+  }
+}
+
+function strictBlueprintRetryAppendix(previousReply: string): string {
+  return `\n\n---
+上一轮输出没有包含可解析的 workflow IRGraph，因此不能写入蓝图。上一轮输出节选如下：
+${previousReply.slice(0, 4000)}
+
+请忽略上一轮的 Markdown/计划/确认请求，直接基于最初的用户需求和当前 IRGraph 返回：
+1) 简短中文说明。
+2) 一个完整、可解析、可直接写入蓝图的 \`\`\`json IRGraph 代码块。
+不得创建或修改本地文件，不得等待用户批准。`;
+}
 
 /**
  * Push an interactive message into the dock and return a promise that resolves
  * when the user answers it (or null if the run is stopped first).
  */
 function awaitInteraction(
+  ch: RunChannel | null,
   req: InteractionRequest,
 ): Promise<InteractionAnswer | null> {
   const id = shortId('m');
@@ -2064,35 +2991,36 @@ function awaitInteraction(
     interaction: req,
     interactionStatus: 'pending',
   };
-  useStore.setState((s) => ({ messages: [...s.messages, msg] }));
-  void persistMessage(msg);
+  pushChannelMessage(ch, msg, true);
   return new Promise((resolve) => {
-    pendingInteractionResolvers.set(id, resolve);
+    pendingInteractionResolvers.set(id, { runKey: ch?.key ?? null, resolve });
   });
 }
 
-/** Cancel every in-flight interaction (run stopped): resolve null, mark them. */
-function resolveAllPendingInteractions(): void {
-  for (const [id, resolve] of [...pendingInteractionResolvers]) {
+/** Cancel in-flight interactions for one run (run stopped): resolve null, mark them. */
+function resolvePendingInteractions(ch: RunChannel | null): void {
+  if (!ch) return;
+  for (const [id, entry] of [...pendingInteractionResolvers]) {
+    if (entry.runKey !== ch.key) continue;
     pendingInteractionResolvers.delete(id);
-    resolve(null);
+    entry.resolve(null);
   }
-  useStore.setState((s) => ({
-    messages: s.messages.map((m) =>
-      m.interaction && m.interactionStatus === 'pending'
-        ? { ...m, interactionStatus: 'cancelled' }
-        : m,
-    ),
-  }));
+  const mark = (m: Message): Message =>
+    m.interaction && m.interactionStatus === 'pending'
+      ? { ...m, interactionStatus: 'cancelled' }
+      : m;
+  ch.messages = ch.messages.map(mark);
+  channelCommitMessages(ch, true);
 }
 
-/** Append a system log line to the message stream. */
-function pushRunLog(text: string, role: Message['role'] = 'system'): void {
+/** Append a system log line to the message stream (routed through the run channel). */
+function pushRunLog(
+  ch: RunChannel | null,
+  text: string,
+  role: Message['role'] = 'system',
+): void {
   const msg: Message = { id: shortId('m'), role, text, createdAt: Date.now() };
-  useStore.setState((s) => ({
-    messages: [...s.messages, msg],
-  }));
-  void persistMessage(msg);
+  pushChannelMessage(ch, msg, true);
 }
 
 function formatClock(ts: number): string {
@@ -2147,17 +3075,63 @@ function seedRunStateFromOutputs(
   return runState;
 }
 
+function workflowHasDirectGatewayRoute(
+  workflow: IRGraph,
+  workflowSelection: GatewaySelection,
+): boolean {
+  for (const node of runnableOrder(workflow)) {
+    const nodeSelection = applyGatewayOverride(
+      workflowSelection,
+      nodeGatewayOverride(node.params) ?? undefined,
+    );
+
+    if (node.type === 'agent' || node.type === 'workflow') {
+      if (resolveDirectGatewayRoute(nodeSelection)) return true;
+    } else if (node.type === 'parallel') {
+      for (const spec of specList(node.params.branches)) {
+        const selection = applyGatewayOverride(
+          nodeSelection,
+          runSpecGatewayOverride(spec),
+        );
+        if (resolveDirectGatewayRoute(selection)) return true;
+      }
+    } else if (node.type === 'pipeline') {
+      for (const spec of specList(node.params.stages)) {
+        const selection = applyGatewayOverride(
+          nodeSelection,
+          runSpecGatewayOverride(spec),
+        );
+        if (resolveDirectGatewayRoute(selection)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function getRunLaunchContext(state: StoreState): {
+  workspaceId: string | null;
+  sessionId: string | null;
+} {
+  const ctx = getActiveHistoryContext();
+  if (ctx) return ctx;
+  return { workspaceId: null, sessionId: state.activeSessionId };
+}
+
 function startWorkflowRun(resume: boolean): void {
   const state = useStore.getState();
-  if (state.mode === 'running') return;
+  if (isWorkflowReadOnly(state)) return;
 
   const { workflow } = state;
   const name = workflow.meta.name ?? 'untitled';
-  const adapter = workflow.meta.adapter ?? 'claude-code';
+  const gatewaySelection = workflowDefaultGatewaySelection(
+    workflow,
+    state.composer.model,
+  );
+  const adapter = gatewaySelection.adapter;
   const runStartedAt = Date.now();
   const resumeFromNodeId = resume ? findResumeNodeId(state) : null;
   if (resume && !resumeFromNodeId) {
-    pushRunLog('没有可继续的失败节点。', 'system');
+    pushRunLog(null, '没有可继续的失败节点。', 'system');
     return;
   }
 
@@ -2173,10 +3147,35 @@ function startWorkflowRun(resume: boolean): void {
   // Capture the run's workspace + permission (from the AIDock controls) so each
   // node's CLI agent runs in the right dir with enough access to act without
   // stalling on permission prompts.
-  activeRunConfig = {
+  const config: RunConfig = {
     cwd: state.composer.workspace || undefined,
     permission: state.composer.permission || 'full',
+    model: gatewaySelection.modelClass,
+    gatewaySelection,
   };
+
+  // Bind this run to the session that started it. The channel — not the active
+  // view — is the run's source of truth from here on, so switching sessions
+  // leaves it running in the background (writes route to its owning session).
+  const ctx = getRunLaunchContext(state);
+  const key = runKey(ctx.workspaceId, ctx.sessionId);
+  const ch: RunChannel = {
+    key,
+    workspaceId: ctx.workspaceId,
+    sessionId: ctx.sessionId,
+    cancelled: false,
+    workflow,
+    config,
+    cliRunIds: new Set<string>(),
+    messages: [...state.messages],
+    runState: { ...initialRunState },
+    runOutputs: { ...seedOutputs },
+    failedNodeId: null,
+    error: null,
+  };
+
+  activeRuns.set(key, ch);
+  syncRunningSessions();
 
   useStore.setState({
     mode: 'running',
@@ -2184,7 +3183,6 @@ function startWorkflowRun(resume: boolean): void {
     runOutputs: seedOutputs,
     lastRunFailedNodeId: null,
   });
-  persistCurrentRunSnapshot('running');
 
   const action = resume ? '继续工作流' : '运行工作流';
   const from = resumeNode
@@ -2193,29 +3191,28 @@ function startWorkflowRun(resume: boolean): void {
   const runMsg: Message = {
     id: shortId('m'),
     role: 'system',
-    text: `▶ ${action} "${name}"${from} · 开始 ${formatClock(runStartedAt)} · 运行时 ${adapter} · 权限 ${activeRunConfig.permission}${activeRunConfig.cwd ? ` · 工作区 ${activeRunConfig.cwd}` : ''}`,
+    text: `▶ ${action} "${name}"${from} · 开始 ${formatClock(runStartedAt)} · 运行时 ${adapter} · 模型 ${gatewaySelection.modelClass} · 权限 ${ch.config.permission}${ch.config.cwd ? ` · 工作区 ${ch.config.cwd}` : ''}`,
     createdAt: runStartedAt,
   };
-  useStore.setState((s) => ({
-    messages: [...s.messages, runMsg],
-  }));
-  void persistMessage(runMsg);
+  ch.messages = [...ch.messages, runMsg];
+  channelCommit(ch, 'running', true);
 
-  if (isTauri()) {
-    void executeViaCliInterpreter(workflow, adapter, runStartedAt, {
+  if (isTauri() || workflowHasDirectGatewayRoute(workflow, gatewaySelection)) {
+    void executeViaCliInterpreter(ch, workflow, adapter, runStartedAt, {
       resumeFromNodeId,
       seedOutputs,
     });
   } else {
-    void executeViaSimulator(workflow, { resumeFromNodeId, seedOutputs });
+    void executeViaSimulator(ch, workflow, { resumeFromNodeId, seedOutputs });
   }
 }
 
 function stopWorkflowRun(): void {
   const state = useStore.getState();
-  if (state.mode !== 'running') return;
+  const ch = getRunChannel(state.activeWorkspaceId ?? null, state.activeSessionId);
+  if (!ch) return;
 
-  const runningNodeIds = Object.entries(state.runState)
+  const runningNodeIds = Object.entries(ch.runState)
     .filter(([, status]) => status === 'running')
     .map(([nodeId]) => nodeId);
   const interruptedNodeId = runningNodeIds[0] ?? null;
@@ -2229,54 +3226,130 @@ function stopWorkflowRun(): void {
       }
     : null;
 
-  useStore.setState((s) => ({
-    mode: 'design',
-    runState: {
-      ...s.runState,
-      ...Object.fromEntries(
-        runningNodeIds.map((nodeId) => [nodeId, 'interrupted' as const]),
-      ),
-    },
-    lastRunFailedNodeId: interruptedNodeId,
-  }));
+  // Flip the channel to cancelled FIRST so the run loop's `stillRunning()` short-
+  // circuits, then record the interrupted state.
+  ch.cancelled = true;
+  ch.runState = {
+    ...ch.runState,
+    ...Object.fromEntries(
+      runningNodeIds.map((nodeId) => [nodeId, 'interrupted' as const]),
+    ),
+  };
+  ch.failedNodeId = interruptedNodeId;
+  ch.error = runError;
 
-  resolveAllPendingInteractions();
-  void cancelActiveCliRuns();
+  resolvePendingInteractions(ch);
+  void cancelActiveCliRuns(ch);
   pushRunLog(
+    ch,
     interruptedNodeId
       ? `⏹ 运行已中断 · ${formatClock(stoppedAt)} · 可从当前节点继续。`
       : `⏹ 运行已中断 · ${formatClock(stoppedAt)}。`,
     'assistant',
   );
-  persistCurrentRunSnapshot('interrupted', runError);
+  channelCommit(ch, 'interrupted', true);
+  // The stop button only exists on the live run view, so drop back to design.
+  if (runViewActive(ch)) useStore.getState().setMode('design');
+  finishRun(ch);
 }
 
 function makeCliRunId(): string {
   return `cli_${Date.now()}_${shortId('run')}`;
 }
 
-async function cancelActiveCliRuns(): Promise<void> {
-  const runIds = [...activeCliRunIds];
+async function cancelActiveCliRuns(ch: RunChannel | null): Promise<void> {
+  const runIds = ch ? [...ch.cliRunIds] : [];
   await Promise.all(runIds.map((runId) => cancelAiCli(runId).catch(() => {})));
 }
 
 async function invokeAgentCli(
+  ch: RunChannel,
   prompt: string,
   adapter: string,
   opts: {
     model?: string;
+    cliCommand?: string;
+    env?: Record<string, string>;
     cwd?: string;
     permission?: string;
     onProgress?: (text: string) => void;
+    sessionId?: string;
+    resume?: boolean;
   } = {},
 ): Promise<string> {
   const runId = makeCliRunId();
-  activeCliRunIds.add(runId);
+  ch.cliRunIds.add(runId);
   try {
-    return await aiEditViaCli(prompt, adapter, { ...opts, runId });
+    return await aiEditViaCli(prompt, adapter, {
+      ...opts,
+      cliCommand: opts.cliCommand ?? ch.config.cliCommand,
+      env: opts.env,
+      runId,
+    });
   } finally {
-    activeCliRunIds.delete(runId);
+    ch.cliRunIds.delete(runId);
   }
+}
+
+async function invokeGatewayAgent(
+  ch: RunChannel,
+  prompt: string,
+  selection: GatewaySelection,
+  opts: {
+    model?: string;
+    omitModel?: boolean;
+    cliCommand?: string;
+    cwd?: string;
+    permission?: string;
+    onProgress?: (text: string) => void;
+    sessionId?: string;
+    resume?: boolean;
+  } = {},
+): Promise<{ text: string; adapter: string }> {
+  const direct = resolveDirectGatewayRoute(selection);
+  if (direct) {
+    const text = await completeGatewayText({
+      route: {
+        ...direct,
+        model: opts.omitModel ? undefined : opts.model ?? direct.model,
+      },
+      system: '',
+      userContent: prompt,
+      maxTokens: 8192,
+      onDelta: opts.onProgress,
+    });
+    return { text, adapter: direct.adapter };
+  }
+
+  const cli = await resolveCliGatewayRoute(selection);
+  const text = await invokeAgentCli(ch, prompt, cli.adapter, {
+    model: opts.omitModel ? undefined : opts.model ?? cli.model,
+    env: cli.env,
+    cwd: opts.cwd,
+    permission: opts.permission,
+    cliCommand: opts.cliCommand ?? cli.cliCommand,
+    onProgress: opts.onProgress,
+    sessionId: opts.sessionId,
+    resume: opts.resume,
+  });
+  return { text, adapter: cli.adapter };
+}
+
+/** A fresh Claude session id (uuid) for chaining warm context across steps. */
+function newSessionId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* fall through */
+  }
+  // Deterministic-enough fallback uuid v4 shape.
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 function withNodeExecutionContract(prompt: string): string {
@@ -2313,6 +3386,7 @@ interface RunSpec {
   label?: string;
   agentType?: string;
   model?: string;
+  gateway?: NodeGatewayOverride;
 }
 
 type RunFailureCode =
@@ -2497,8 +3571,40 @@ function specList(value: unknown): RunSpec[] {
       label: typeof o.label === 'string' ? o.label : undefined,
       agentType: typeof o.agentType === 'string' ? o.agentType : undefined,
       model: typeof o.model === 'string' ? o.model : undefined,
+      gateway: nodeGatewayOverride(o),
     };
   });
+}
+
+function runSpecGatewayOverride(spec: RunSpec): NodeGatewayOverride | undefined {
+  const gateway = spec.gateway ? { ...spec.gateway } : undefined;
+  if (gateway?.modelClass) return gateway;
+  if (!spec.model) return gateway;
+  return {
+    ...(gateway ?? {}),
+    modelClass: modelClassFromModelId(spec.model),
+  };
+}
+
+function runGlobalGatewaySelection(
+  ch: RunChannel,
+  workflow: IRGraph,
+): GatewaySelection {
+  return (
+    ch.config.gatewaySelection ??
+    workflowDefaultGatewaySelection(workflow, ch.config.model)
+  );
+}
+
+function runNodeGatewaySelection(
+  ch: RunChannel,
+  workflow: IRGraph,
+  node: IRNode,
+): GatewaySelection {
+  return applyGatewayOverride(
+    runGlobalGatewaySelection(ch, workflow),
+    nodeGatewayOverride(node.params) ?? undefined,
+  );
 }
 
 /**
@@ -2506,7 +3612,10 @@ function specList(value: unknown): RunSpec[] {
  * replace it (finalize). Used so each node/branch shows its CLI output streaming
  * in rather than appearing all at once when the step finishes.
  */
-function createStreamMessage(header: string): {
+function createStreamMessage(
+  ch: RunChannel,
+  header: string,
+): {
   append: (chunk: string) => void;
   finalize: (text: string) => void;
   fail: (text: string) => void;
@@ -2521,21 +3630,20 @@ function createStreamMessage(header: string): {
     return `${prefix}\n${text}`;
   };
   const replace = (text: string, persist = false, endedAt?: number, failed = false) => {
+    if (!stillRunning(ch) && !persist) return;
     currentText = text;
-    useStore.setState((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === id ? { ...m, text: decorate(text, endedAt, failed) } : m,
-      ),
-    }));
-    if (persist) void persistCurrentMessages();
+    const decorated = decorate(text, endedAt, failed);
+    const map = (m: Message): Message =>
+      m.id === id ? { ...m, text: decorated } : m;
+    ch.messages = ch.messages.map(map);
+    channelCommitMessages(ch, persist);
   };
 
-  useStore.setState((s) => ({
-    messages: [
-      ...s.messages,
-      { id, role: 'assistant', text: decorate(header), createdAt: startedAt },
-    ],
-  }));
+  pushChannelMessage(
+    ch,
+    { id, role: 'assistant', text: decorate(header), createdAt: startedAt },
+    false,
+  );
   return {
     append: (chunk) => replace(currentText + chunk),
     finalize: (text) => replace(text, true, Date.now(), false),
@@ -2549,11 +3657,6 @@ function createStreamMessage(header: string): {
         true,
       ),
   };
-}
-
-/** The model tier configured on a node's params (for `--model`), if any. */
-function nodeModel(params: Record<string, unknown>): string | undefined {
-  return typeof params.model === 'string' ? params.model : undefined;
 }
 
 /** The "上游输出" context block for a node, or '' when it has no data inputs. */
@@ -2570,9 +3673,13 @@ function dataContextString(
   return `\n\n---\n以下是上游步骤的输出，供你参考：\n\n${ctx}`;
 }
 
-/** Is the run still active? (false once the user hits 停止.) */
-function stillRunning(): boolean {
-  return useStore.getState().mode === 'running';
+/**
+ * Is the run still active? (false once the user hits 停止 or the run ends.)
+ * Keyed on the run channel — NOT the global `mode` — so the loop keeps executing
+ * while the user views a different session (the run is backgrounded, not killed).
+ */
+function stillRunning(ch: RunChannel): boolean {
+  return runActive(ch);
 }
 
 /**
@@ -2585,20 +3692,37 @@ function stillRunning(): boolean {
  * the node errored.
  */
 async function runCliWithInteraction(opts: {
+  ch: RunChannel;
   /** Streaming header, e.g. `【label】\n`. */
   head: string;
   /** Bracket label for the streamed finalize/failure line (no ✓ prefix). */
   label: string;
   /** Prompt base — already includes upstream data context / stage feed. */
   basePrompt: string;
-  adapter: string;
-  cli: { model?: string; cwd?: string; permission?: string };
+  selection: GatewaySelection;
+  cli: {
+    model?: string;
+    omitModel?: boolean;
+    cliCommand?: string;
+    cwd?: string;
+    permission?: string;
+  };
+  /**
+   * Optional Claude session continuity. `id` is the shared session; `resume`
+   * marks whether the *first* attempt continues an existing session (a later
+   * pipeline stage) or creates it (the first stage). Interaction re-invokes
+   * always resume, so a clarifying round keeps the same warm context instead of
+   * recreating the id (which would error).
+   */
+  session?: { id: string; resume: boolean };
 }): Promise<string> {
+  const { ch } = opts;
   let appendix = '';
   let lastClean = '';
   for (let round = 0; round < MAX_INTERACTION_ROUNDS; round += 1) {
-    if (!stillRunning()) return lastClean;
+    if (!stillRunning(ch)) return lastClean;
     const sm = createStreamMessage(
+      ch,
       round === 0 ? opts.head : `${opts.head}（已根据你的回答继续）\n`,
     );
     const prompt = `${withNodeExecutionContract(opts.basePrompt)}\n\n${INTERACTION_PROTOCOL}${appendix}`;
@@ -2606,16 +3730,22 @@ async function runCliWithInteraction(opts: {
     let raw: string;
     try {
       raw = (
-        await invokeAgentCli(prompt, opts.adapter, {
+        await invokeGatewayAgent(ch, prompt, opts.selection, {
           model: opts.cli.model,
+          omitModel: opts.cli.omitModel,
+          cliCommand: opts.cli.cliCommand,
           cwd: opts.cli.cwd,
           permission: opts.cli.permission,
           onProgress: sm.append,
+          sessionId: opts.session?.id,
+          // First attempt uses the caller's resume intent; any re-ask continues
+          // the now-existing session.
+          resume: opts.session ? opts.session.resume || round > 0 : undefined,
         })
-      ).trim();
+      ).text.trim();
     } catch (err) {
       const failure = describeRunFailure(err);
-      sm.fail(formatFailureLine(opts.label, failure));
+      if (stillRunning(ch)) sm.fail(formatFailureLine(opts.label, failure));
       throw err;
     }
 
@@ -2623,8 +3753,9 @@ async function runCliWithInteraction(opts: {
     lastClean = clean;
 
     // Stopped during the call, or the node produced a plain result → done.
-    const req = stillRunning() ? parseInteraction(raw) : null;
+    const req = stillRunning(ch) ? parseInteraction(raw) : null;
     if (!req) {
+      if (!stillRunning(ch)) return clean;
       sm.finalize(`【✓ ${opts.label}】\n${clean || '(无输出)'}`);
       return clean;
     }
@@ -2636,12 +3767,13 @@ async function runCliWithInteraction(opts: {
         ? `【${opts.label}】\n${clean}`
         : `【${opts.label}】\n（已向你提出一个问题，请在下方作答）`,
     );
-    const answer = await awaitInteraction(req);
-    if (!answer || !stillRunning()) return clean; // dismissed or run stopped
+    const answer = await awaitInteraction(ch, req);
+    if (!answer || !stillRunning(ch)) return clean; // dismissed or run stopped
     appendix += `\n\n${formatAnswerForPrompt(req, answer)}`;
   }
 
   pushRunLog(
+    ch,
     `⚠ ${opts.label}：交互轮数已达上限（${MAX_INTERACTION_ROUNDS}），停止追问。`,
     'system',
   );
@@ -2655,30 +3787,35 @@ async function runCliWithInteraction(opts: {
  * threaded to downstream nodes. Throws only if every branch fails.
  */
 async function runParallel(
+  ch: RunChannel,
   node: IRNode,
   workflow: IRGraph,
   results: Map<string, string>,
-  adapter: string,
 ): Promise<string> {
   const branches = specList(node.params.branches);
   if (branches.length === 0) return '';
   const upstream = dataContextString(node, workflow, results);
+  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
 
   const settled = await Promise.all(
     branches.map(async (b, i) => {
       const label = b.label || b.agentType || b.prompt.slice(0, 16) || `分支${i + 1}`;
       const stepLabel = `并行分支 ${i + 1}/${branches.length} · ${label}`;
+      const branchSelection = applyGatewayOverride(
+        baseSelection,
+        runSpecGatewayOverride(b),
+      );
       try {
         const out = (
           await runCliWithInteraction({
+            ch,
             head: `【${stepLabel}】\n`,
             label: stepLabel,
             basePrompt: b.prompt + upstream,
-            adapter,
+            selection: branchSelection,
             cli: {
-              model: b.model,
-              cwd: activeRunConfig.cwd,
-              permission: activeRunConfig.permission,
+              cwd: ch.config.cwd,
+              permission: ch.config.permission,
             },
           })
         ).trim();
@@ -2710,18 +3847,27 @@ async function runParallel(
  * expression). Returns the final stage's output.
  */
 async function runPipeline(
+  ch: RunChannel,
   node: IRNode,
   workflow: IRGraph,
   results: Map<string, string>,
-  adapter: string,
 ): Promise<string> {
   const stages = specList(node.params.stages);
   if (stages.length === 0) return '';
   const items = String(node.params.items ?? '').trim();
   let prev = '';
+  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
+
+  // A pipeline is one agent working through sequential stages, so share a single
+  // Claude session across the stages (claude adapter only): each stage continues
+  // the previous stage's warm context instead of cold-starting and re-exploring
+  // the project — the dominant per-node cost. Other adapters ignore the flags.
+  const isClaude =
+    baseSelection.adapter === 'claude-code' || baseSelection.adapter === 'claude';
+  const sessionId = isClaude ? newSessionId() : undefined;
 
   for (let i = 0; i < stages.length; i += 1) {
-    if (!stillRunning()) break;
+    if (!stillRunning(ch)) break;
     const s = stages[i];
     const label = s.label || s.prompt.slice(0, 16) || `阶段${i + 1}`;
     const stepLabel = `流水线阶段 ${i + 1}/${stages.length} · ${label}`;
@@ -2730,17 +3876,26 @@ async function runPipeline(
         ? dataContextString(node, workflow, results) +
           (items ? `\n\n输入数据: ${items}` : '')
         : `\n\n---\n上一步输出：\n${prev}`;
+    const stageSelection = applyGatewayOverride(
+      baseSelection,
+      runSpecGatewayOverride(s),
+    );
     prev = (
       await runCliWithInteraction({
+        ch,
         head: `【${stepLabel}】\n`,
         label: stepLabel,
         basePrompt: s.prompt + feed,
-        adapter,
+        selection: stageSelection,
         cli: {
-          model: s.model,
-          cwd: activeRunConfig.cwd,
-          permission: activeRunConfig.permission,
+          // On a resumed stage the session already carries its model; passing a
+          // different --model alongside --resume can conflict, so only set it
+          // through the gateway route when creating the session.
+          omitModel: !!(sessionId && i > 0),
+          cwd: ch.config.cwd,
+          permission: ch.config.permission,
         },
+        session: sessionId ? { id: sessionId, resume: i > 0 } : undefined,
       })
     ).trim();
   }
@@ -2753,48 +3908,50 @@ async function runPipeline(
  * codeblock). Streams sub-results for parallel/pipeline. Throws on hard error.
  */
 async function runNode(
+  ch: RunChannel,
   node: IRNode,
   workflow: IRGraph,
   results: Map<string, string>,
-  adapter: string,
 ): Promise<string | null> {
   const label = node.label ?? node.type;
+  const nodeSelection = runNodeGatewaySelection(ch, workflow, node);
   switch (node.type) {
     case 'agent': {
       const base = String(node.params.prompt ?? node.label ?? '').trim();
       if (!base) return '';
       return runCliWithInteraction({
+        ch,
         head: `【${label}】\n`,
         label,
         basePrompt: base + dataContextString(node, workflow, results),
-        adapter,
+        selection: nodeSelection,
         cli: {
-          model: nodeModel(node.params),
-          cwd: activeRunConfig.cwd,
-          permission: activeRunConfig.permission,
+          cwd: ch.config.cwd,
+          permission: ch.config.permission,
         },
       });
     }
     case 'workflow': {
       const base = `运行子工作流 "${String(node.params.name ?? node.label ?? 'sub')}" 并返回结果。`;
       return runCliWithInteraction({
+        ch,
         head: `【${label}】\n`,
         label,
         basePrompt: base + dataContextString(node, workflow, results),
-        adapter,
+        selection: nodeSelection,
         cli: {
-          cwd: activeRunConfig.cwd,
-          permission: activeRunConfig.permission,
+          cwd: ch.config.cwd,
+          permission: ch.config.permission,
         },
       });
     }
     case 'parallel':
-      return runParallel(node, workflow, results, adapter);
+      return runParallel(ch, node, workflow, results);
     case 'pipeline':
-      return runPipeline(node, workflow, results, adapter);
+      return runPipeline(ch, node, workflow, results);
     case 'log': {
       const msg = String(node.params.message ?? node.params.msg ?? '').trim();
-      if (msg) pushRunLog(msg);
+      if (msg) pushRunLog(ch, msg);
       return null;
     }
     default:
@@ -2802,14 +3959,113 @@ async function runNode(
   }
 }
 
+/** Default number of workflow nodes executed concurrently (see runConcurrency). */
+const DEFAULT_RUN_CONCURRENCY = 4;
+
 /**
- * Real run: interpret the IR along the exec spine through the local agent CLI.
- * Agent/workflow nodes are single `claude -p` calls; `parallel` fans each branch
- * out as a concurrent call; `pipeline` chains stages sequentially. Outputs stream
- * into the dock, thread to downstream nodes via data edges, and drive per-node
- * run badges. Aborts on 停止; returns to design mode when finished.
+ * How many runnable nodes may execute at once. Each node is a heavy `claude -p`
+ * process, so this is deliberately modest; tune it per machine via localStorage
+ * (`owf_run_concurrency`, clamped 1–16) or force the old strictly-sequential
+ * behaviour with `owf_sequential=1`. Linear chains stay sequential regardless
+ * (a node still waits for its predecessors); the cap only bounds how many
+ * *independent* nodes run together.
+ */
+function runConcurrency(): number {
+  try {
+    if (typeof window !== 'undefined') {
+      if (window.localStorage.getItem('owf_sequential') === '1') return 1;
+      const raw = window.localStorage.getItem('owf_run_concurrency');
+      if (raw) {
+        const n = Number.parseInt(raw, 10);
+        if (Number.isFinite(n)) return Math.min(16, Math.max(1, n));
+      }
+    }
+  } catch {
+    /* ignore — fall through to default */
+  }
+  return DEFAULT_RUN_CONCURRENCY;
+}
+
+/** Default number of automatic re-runs for a transient node failure. */
+const DEFAULT_RUN_MAX_RETRIES = 2;
+
+/**
+ * Failure codes worth re-attempting automatically. These are transient or
+ * non-deterministic: a CLI timeout / idle-timeout (the common case — the model
+ * was simply slow and a fresh attempt usually clears it), a non-zero exit, a
+ * wait error, or an unclassified failure. User interruptions (`interrupted`),
+ * a missing desktop backend (`backend`), and unresolvable launch errors
+ * (`spawn`, e.g. the binary isn't found) are NOT retried — re-running can't fix
+ * them and would only waste time.
+ */
+const RETRYABLE_FAILURE_CODES: ReadonlySet<RunFailureCode> = new Set([
+  'timeout',
+  'idle_timeout',
+  'exit',
+  'wait',
+  'unknown',
+]);
+
+/**
+ * How many times a failed node is automatically re-run before it is recorded as
+ * failed. Only transient failures (see RETRYABLE_FAILURE_CODES) are retried.
+ * Tune via localStorage (`owf_run_max_retries`, clamped 0–10); set 0 to disable
+ * auto-retry entirely.
+ */
+function runMaxRetries(): number {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = window.localStorage.getItem('owf_run_max_retries');
+      if (raw !== null) {
+        const n = Number.parseInt(raw, 10);
+        if (Number.isFinite(n)) return Math.min(10, Math.max(0, n));
+      }
+    }
+  } catch {
+    /* ignore — fall through to default */
+  }
+  return DEFAULT_RUN_MAX_RETRIES;
+}
+
+function isRetryableFailure(failure: RunFailure): boolean {
+  return RETRYABLE_FAILURE_CODES.has(failure.code);
+}
+
+/**
+ * Build the runtime dependency map: a node depends on every other *runnable*
+ * node that feeds it via an exec OR data edge. This is the true graph topology,
+ * so connected nodes never reorder (a step always waits for what flows into it),
+ * while independent nodes — multiple roots, exec forks, sibling branches — have
+ * disjoint dependency sets and are free to run concurrently.
+ */
+function buildRunDependencies(
+  order: IRNode[],
+  workflow: IRGraph,
+): Map<string, Set<string>> {
+  const idSet = new Set(order.map((n) => n.id));
+  const deps = new Map<string, Set<string>>();
+  for (const n of order) deps.set(n.id, new Set());
+  for (const e of workflow.edges) {
+    if (!idSet.has(e.from.node) || !idSet.has(e.to.node)) continue;
+    if (e.from.node === e.to.node) continue;
+    deps.get(e.to.node)!.add(e.from.node);
+  }
+  return deps;
+}
+
+/**
+ * Real run: interpret the IR as a dependency DAG, executing nodes through the
+ * local agent CLI. A node runs as soon as every node feeding it (exec/data edge)
+ * has completed, so independent nodes run concurrently (bounded by
+ * runConcurrency) instead of being flattened to a single serial line — a big win
+ * over re-paying each node's cold start one-after-another. Agent/workflow nodes
+ * are single `claude -p` calls; `parallel` fans each branch out concurrently;
+ * `pipeline` chains stages sequentially. Outputs stream into the dock, thread to
+ * downstream nodes via data edges, and drive per-node run badges. Aborts on 停止;
+ * returns to design mode when finished.
  */
 async function executeViaCliInterpreter(
+  ch: RunChannel,
   workflow: IRGraph,
   adapter: string,
   runStartedAt: number,
@@ -2818,95 +4074,213 @@ async function executeViaCliInterpreter(
     seedOutputs?: Record<string, string>;
   } = {},
 ): Promise<void> {
+  const launchSelection =
+    ch.config.gatewaySelection ??
+    workflowDefaultGatewaySelection(workflow, ch.config.model);
+  if (!resolveDirectGatewayRoute(launchSelection)) {
+    try {
+      const cli = await resolveCliGatewayRoute(launchSelection);
+      if (!stillRunning(ch)) return;
+      ch.config.cliCommand = cli.cliCommand;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ch.error = {
+        code: 'cli_config',
+        message,
+        adapter,
+        occurredAt: Date.now(),
+      };
+      pushRunLog(ch, `✗ CLI 配置不可用: ${message}`, 'assistant');
+      channelCommit(ch, 'error', true);
+      if (runViewActive(ch)) useStore.getState().setMode('design');
+      finishRun(ch);
+      return;
+    }
+  }
+  if (!stillRunning(ch)) return;
+
   const order = runnableOrder(workflow);
   const resumeFromNodeId =
     options.resumeFromNodeId && order.some((node) => node.id === options.resumeFromNodeId)
       ? options.resumeFromNodeId
       : null;
-  let resumePending = !!resumeFromNodeId;
-  const results = new Map<string, string>(
-    Object.entries(options.seedOutputs ?? {}),
-  );
+  const results = new Map<string, string>(Object.entries(options.seedOutputs ?? {}));
+  const deps = buildRunDependencies(order, workflow);
+
+  // Seed completed nodes so they are never re-run: prior outputs / successes,
+  // and — when resuming from a node — everything topologically before it (those
+  // steps already ran; resume re-executes only the failed node onward).
+  const liveRunState = ch.runState;
+  const resumeIdx = resumeFromNodeId
+    ? order.findIndex((n) => n.id === resumeFromNodeId)
+    : -1;
+  const done = new Set<string>();
+  order.forEach((node, i) => {
+    if (results.has(node.id) || liveRunState[node.id] === 'success') {
+      done.add(node.id);
+    } else if (resumeIdx >= 0 && i < resumeIdx) {
+      done.add(node.id);
+    }
+  });
+  if (resumeFromNodeId) done.delete(resumeFromNodeId); // force the target to re-run
+
   let errored = false;
   let runError: Record<string, unknown> | null = null;
 
-  for (const node of order) {
-    if (!stillRunning()) return; // stopped between steps
-
-    if (resumePending && node.id !== resumeFromNodeId) {
-      if (
-        node.type === 'start' ||
-        node.type === 'end' ||
-        results.has(node.id) ||
-        useStore.getState().runState[node.id] === 'success'
-      ) {
-        useStore.getState().setRunState(node.id, 'success');
-      }
-      continue;
-    }
-    if (resumePending && node.id === resumeFromNodeId) {
-      resumePending = false;
-    }
-
+  // Execute one node: trivial sentinels resolve immediately; real nodes stream
+  // their own labelled message(s) and store the result for downstream data
+  // edges. Returns true on success (node may be marked done).
+  const processNode = async (node: IRNode): Promise<boolean> => {
     if (node.type === 'start' || node.type === 'end') {
-      useStore.getState().setRunState(node.id, 'success');
-      continue;
+      markRunNode(ch, node.id, 'success');
+      return true;
     }
 
     const nodeStartedAt = Date.now();
-    useStore.getState().setRunState(node.id, 'running');
-    pushRunLog(`▸ ${node.label ?? node.type} · 开始 ${formatClock(nodeStartedAt)}`);
+    markRunNode(ch, node.id, 'running');
+    pushRunLog(ch, `▸ ${node.label ?? node.type} · 开始 ${formatClock(nodeStartedAt)}`);
 
-    try {
-      // runNode streams its own labeled message(s) live; we just store the
-      // result for downstream data edges.
-      const out = await runNode(node, workflow, results, adapter);
-      if (!stillRunning()) return; // stopped during the call(s)
-      if (out !== null) {
-        results.set(node.id, out);
-        useStore.setState((state) => ({
-          runOutputs: { ...state.runOutputs, [node.id]: out },
-          lastRunFailedNodeId: null,
-        }));
-      }
-      useStore.getState().setRunState(node.id, 'success');
-      const nodeFinishedAt = Date.now();
-      pushRunLog(
-        `✓ ${node.label ?? node.type} · 完成 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
-          nodeFinishedAt - nodeStartedAt,
-        )}`,
-        'assistant',
-      );
-    } catch (err) {
-      const failure = describeRunFailure(err);
-      if (!stillRunning()) return;
-      const nodeFinishedAt = Date.now();
-      pushRunLog(
-        `✗ ${node.label ?? node.type} · 失败 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
-          nodeFinishedAt - nodeStartedAt,
-        )}: ${failure.message}`,
-        'assistant',
-      );
-      useStore.setState({ lastRunFailedNodeId: node.id });
-      runError = runFailureMeta(node, adapter, failure);
-      useStore
-        .getState()
-        .setRunState(
-          node.id,
-          failure.code === 'interrupted' ? 'interrupted' : 'error',
+    const maxRetries = runMaxRetries();
+    let attempt = 0; // how many retries have been consumed so far
+
+    // Attempt loop: transient failures (timeouts, idle-timeouts, non-deterministic
+    // CLI exits) are re-run up to maxRetries times before the node is recorded as
+    // failed. A genuine success or a non-retryable failure exits immediately.
+    for (;;) {
+      try {
+        const out = await runNode(ch, node, workflow, results);
+        if (!stillRunning(ch)) return false; // stopped during the call(s)
+        if (out !== null) {
+          results.set(node.id, out);
+          ch.runOutputs = { ...ch.runOutputs, [node.id]: out };
+          if (!errored) ch.failedNodeId = null;
+        }
+        markRunNode(ch, node.id, 'success');
+        const nodeFinishedAt = Date.now();
+        pushRunLog(
+          ch,
+          `✓ ${node.label ?? node.type} · 完成 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
+            nodeFinishedAt - nodeStartedAt,
+          )}${attempt > 0 ? ` · 重试 ${attempt} 次后成功` : ''}`,
+          'assistant',
         );
-      persistCurrentRunSnapshot(
-        failure.code === 'interrupted' ? 'interrupted' : 'error',
-        runError,
-      );
-      errored = true;
-      break;
-    }
-  }
+        return true;
+      } catch (err) {
+        const failure = describeRunFailure(err);
+        if (!stillRunning(ch)) return false;
 
-  if (stillRunning()) {
+        // Auto-retry transient failures (e.g. a CLI timeout) before recording the
+        // node as failed. Back off a little between attempts; bail if the run was
+        // stopped while waiting.
+        if (attempt < maxRetries && isRetryableFailure(failure)) {
+          attempt += 1;
+          const backoffMs = Math.min(15000, 1500 * attempt);
+          pushRunLog(
+            ch,
+            `⟳ ${node.label ?? node.type} · ${failureTitle(
+              failure,
+            )}，正在自动重试（第 ${attempt}/${maxRetries} 次，${Math.round(
+              backoffMs / 1000,
+            )}s 后重试）：${failure.message}`,
+            'assistant',
+          );
+          markRunNode(ch, node.id, 'running');
+          await delay(backoffMs);
+          if (!stillRunning(ch)) return false;
+          continue;
+        }
+
+        const nodeFinishedAt = Date.now();
+        const retriedNote = attempt > 0 ? `（已自动重试 ${attempt} 次仍失败）` : '';
+        pushRunLog(
+          ch,
+          `✗ ${node.label ?? node.type} · 失败 ${formatClock(nodeFinishedAt)} · 耗时 ${formatDuration(
+            nodeFinishedAt - nodeStartedAt,
+          )}${retriedNote}: ${failure.message}`,
+          'assistant',
+        );
+        const state = failure.code === 'interrupted' ? 'interrupted' : 'error';
+        // Only the first failure becomes the run's recorded error / resume point;
+        // any still-in-flight siblings that also fail don't clobber it.
+        if (!errored) {
+          errored = true;
+          runError = runFailureMeta(node, adapter, failure);
+          ch.runState = { ...ch.runState, [node.id]: state };
+          ch.failedNodeId = node.id;
+          ch.error = runError;
+          channelCommit(ch, state, true);
+        } else {
+          markRunNode(ch, node.id, state);
+        }
+        return false;
+      }
+    }
+  };
+
+  const concurrency = runConcurrency();
+  const claimed = new Set<string>(done); // nodes already picked or completed
+
+  // Bounded-concurrency pump over the dependency DAG.
+  await new Promise<void>((resolve) => {
+    let active = 0;
+    let finished = false;
+    const finish = () => {
+      if (!finished) {
+        finished = true;
+        resolve();
+      }
+    };
+
+    // The next node whose dependencies are all satisfied, or — to stay robust
+    // against cycles / unsatisfiable deps when nothing is in flight — the
+    // earliest unclaimed node (mirrors topoOrderExec's cycle tolerance).
+    const pickReady = (): IRNode | null => {
+      for (const node of order) {
+        if (claimed.has(node.id)) continue;
+        let ready = true;
+        for (const dep of deps.get(node.id)!) {
+          if (!done.has(dep)) {
+            ready = false;
+            break;
+          }
+        }
+        if (ready) return node;
+      }
+      if (active === 0) {
+        for (const node of order) if (!claimed.has(node.id)) return node;
+      }
+      return null;
+    };
+
+    const pump = (): void => {
+      if (finished) return;
+      if (!stillRunning(ch)) {
+        if (active === 0) finish();
+        return;
+      }
+      while (active < concurrency && !errored && stillRunning(ch)) {
+        const next = pickReady();
+        if (!next) break;
+        claimed.add(next.id);
+        active += 1;
+        void processNode(next).then((ok) => {
+          active -= 1;
+          if (ok) done.add(next.id);
+          pump();
+        });
+      }
+      if (active === 0 && (errored || !stillRunning(ch) || !pickReady())) {
+        finish();
+      }
+    };
+
+    pump();
+  });
+
+  if (runActive(ch)) {
     const runFinishedAt = Date.now();
     pushRunLog(
+      ch,
       errored
         ? `✗ 运行中断 · 完成 ${formatClock(runFinishedAt)} · 总耗时 ${formatDuration(
             runFinishedAt - runStartedAt,
@@ -2916,8 +4290,13 @@ async function executeViaCliInterpreter(
           )}`,
       'assistant',
     );
-    persistCurrentRunSnapshot(errored ? 'error' : 'success', errored ? runError : null);
-    useStore.getState().setMode('design'); // clear the "运行中" state
+    if (errored) ch.error = runError;
+    channelCommit(ch, errored ? 'error' : 'success', true);
+    // Only the live view should drop back to design mode; a backgrounded run's
+    // owning session reverts when the user next opens it (its persisted snapshot
+    // is already terminal).
+    if (runViewActive(ch)) useStore.getState().setMode('design');
+    finishRun(ch);
   }
 }
 
@@ -2927,6 +4306,7 @@ async function executeViaCliInterpreter(
  * step. Aborted gracefully when the user clicks "停止" (mode flips to design).
  */
 async function executeViaSimulator(
+  ch: RunChannel,
   workflow: IRGraph,
   options: {
     resumeFromNodeId?: string | null;
@@ -2942,52 +4322,44 @@ async function executeViaSimulator(
   let resumePending = !!resumeFromNodeId;
 
   for (const node of order) {
-    if (useStore.getState().mode !== 'running') return; // user stopped
+    if (!stillRunning(ch)) return; // user stopped
     if (resumePending && node.id !== resumeFromNodeId) {
       if (
         node.type === 'start' ||
         node.type === 'end' ||
         options.seedOutputs?.[node.id] != null ||
-        useStore.getState().runState[node.id] === 'success'
+        ch.runState[node.id] === 'success'
       ) {
-        useStore.getState().setRunState(node.id, 'success');
+        markRunNode(ch, node.id, 'success');
       }
       continue;
     }
     if (resumePending && node.id === resumeFromNodeId) {
       resumePending = false;
     }
-    useStore.getState().setRunState(node.id, 'running');
-    const startLog: Message = {
-      id: shortId('m'),
-      role: 'system',
-      text: `▸ ${node.label ?? node.type} (${node.id})`,
-      createdAt: Date.now(),
-    };
-    useStore.setState((s) => ({ messages: [...s.messages, startLog] }));
-    void persistMessage(startLog);
+    markRunNode(ch, node.id, 'running');
+    pushRunLog(ch, `▸ ${node.label ?? node.type} (${node.id})`);
 
     await delay(stepDelay);
-    if (useStore.getState().mode !== 'running') return;
+    if (!stillRunning(ch)) return;
 
-    useStore.setState((state) => ({
-      runOutputs: { ...state.runOutputs, [node.id]: `模拟完成: ${node.label ?? node.type}` },
-      lastRunFailedNodeId: null,
-    }));
-    useStore.getState().setRunState(node.id, 'success');
+    ch.runOutputs = {
+      ...ch.runOutputs,
+      [node.id]: `模拟完成: ${node.label ?? node.type}`,
+    };
+    ch.failedNodeId = null;
+    markRunNode(ch, node.id, 'success');
   }
 
-  if (useStore.getState().mode === 'running') {
-    const done: Message = {
-      id: shortId('m'),
-      role: 'assistant',
-      text: `✓ 模拟运行完成 · ${order.length} 个节点（浏览器无命令行，未真正执行）`,
-      createdAt: Date.now(),
-    };
-    useStore.setState((s) => ({ messages: [...s.messages, done] }));
-    void persistMessage(done);
-    persistCurrentRunSnapshot('success');
-    useStore.getState().setMode('design'); // clear the "运行中" state
+  if (runActive(ch)) {
+    pushRunLog(
+      ch,
+      `✓ 模拟运行完成 · ${order.length} 个节点（浏览器无命令行，未真正执行）`,
+      'assistant',
+    );
+    channelCommit(ch, 'success', true);
+    if (runViewActive(ch)) useStore.getState().setMode('design');
+    finishRun(ch);
   }
 }
 

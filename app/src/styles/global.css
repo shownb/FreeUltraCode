@@ -17,6 +17,15 @@
   --accent-2: #37c2a8;
   --accent-3: #e3a008;
   --accent-4: #f778ba;
+  --status-ai-edit: #4da3ff;
+  --status-ai-edit-border: #2c6fb3;
+  --status-success: var(--accent-2);
+  --status-success-border: #1f8f7b;
+  --status-error: #f78b8b;
+  --status-error-border: #b94a4a;
+  --status-interrupted: var(--accent-3);
+  --status-interrupted-border: #9b6a05;
+  --status-running-track: var(--border);
 
   color-scheme: dark;
 }
@@ -61,6 +70,12 @@ pre,
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-faint);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omc-pulse-dot {
+    animation: none !important;
+  }
 }
 
 /* React Flow dark theme overrides */

@@ -1,8 +1,26 @@
-import { useMemo } from 'react';
-import { useStore } from '@/store/useStore';
+import { useEffect, useMemo, useState } from 'react';
+import { isWorkflowReadOnly, useStore } from '@/store/useStore';
 import AutoTextarea from '@/components/AutoTextarea';
-import type { IRAgentSpec, IRNode, NodeType } from '@/core/ir';
+import type {
+  GatewaySelection,
+  IRAgentSpec,
+  IRNode,
+  NodeGatewayOverride,
+  NodeType,
+} from '@/core/ir';
+import { readStartUserInputs } from '@/core/startInputs';
+import { primeCliRuntime, subscribeCliRuntime } from '@/lib/cliConfig';
 import { t, type Locale } from '@/lib/i18n';
+import { nodeGatewayOverride } from '@/lib/modelGateway/modelGateway';
+import {
+  listGatewayRunOptions,
+  mergeGatewaySelection,
+  selectionFromKey,
+  selectionKey,
+  workflowDefaultGatewaySelection,
+  workflowGatewaySelection,
+} from '@/lib/modelGateway/resolver';
+import type { GatewayRunOption } from '@/lib/modelGateway/types';
 
 /**
  * CONTRACT: default export, no props. Node-properties editor surfaced by
@@ -14,7 +32,7 @@ import { t, type Locale } from '@/lib/i18n';
  *
  * Per-type field schema (lightweight, matches the params shapes in
  * NODE_DEFAULTS):
- *   agent:     prompt (textarea) · model (haiku|sonnet|opus) · schema
+ *   agent:     prompt (textarea) · node model/channel override · schema
  *   parallel:  over · prompt
  *   pipeline:  stages (comma list of agent ids — read-only hint)
  *   phase:     title
@@ -24,7 +42,8 @@ import { t, type Locale } from '@/lib/i18n';
  *   log:       message (msg alias)
  *   variable:  value (json)
  *   codeblock: code (textarea)
- *   start/end: no params
+ *   start:    user input / requirement history (read-only)
+ *   end:      no params
  */
 
 const NODE_TYPE_OPTIONS: { id: NodeType; label: string }[] = [
@@ -42,20 +61,17 @@ const NODE_TYPE_OPTIONS: { id: NodeType; label: string }[] = [
   { id: 'codeblock', label: 'CodeBlock' },
 ];
 
-const MODEL_OPTIONS = [
-  { id: 'haiku', label: 'haiku' },
-  { id: 'sonnet', label: 'sonnet' },
-  { id: 'opus', label: 'opus' },
-];
-
 const fieldLabelClass =
   'mb-1 block text-[10px] font-medium uppercase tracking-wider text-fg-faint';
 const textInputClass =
-  'w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-fg outline-none transition-colors placeholder:text-fg-faint focus:border-accent';
+  'w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-fg outline-none transition-colors placeholder:text-fg-faint focus:border-accent disabled:cursor-not-allowed disabled:opacity-60';
 /** Class for AutoTextarea — height is managed by the component, not CSS. */
 const autoTextareaClass = textInputClass + ' font-mono leading-relaxed';
 const selectClass =
-  'w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-fg outline-none transition-colors focus:border-accent';
+  'w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-fg outline-none transition-colors focus:border-accent disabled:cursor-not-allowed disabled:opacity-60';
+
+const INHERIT_WORKFLOW_SELECTION_ID = '';
+const INHERIT_GLOBAL_SELECTION_ID = '__inherit_global__';
 
 /** Coerce arbitrary IRNode.params[key] into a string for an <input>/<textarea>. */
 function asString(v: unknown): string {
@@ -67,6 +83,106 @@ function asString(v: unknown): string {
   } catch {
     return '';
   }
+}
+
+function gatewayOptionText(option: { label: string; hint?: string }): string {
+  return option.hint ? `${option.label} · ${option.hint}` : option.label;
+}
+
+function selectableNodeGatewayOptions(
+  options: GatewayRunOption[],
+  workflowSelection: GatewaySelection,
+): GatewayRunOption[] {
+  return options.filter(
+    (option) => option.selection.adapter === workflowSelection.adapter,
+  );
+}
+
+function optionMatchesOverride(
+  option: GatewayRunOption,
+  workflowSelection: GatewaySelection,
+  override: NodeGatewayOverride,
+): boolean {
+  return (
+    option.id === selectionKey(mergeGatewaySelection(workflowSelection, override))
+  );
+}
+
+function currentOverrideOption(
+  options: GatewayRunOption[],
+  workflowSelection: GatewaySelection,
+  override: NodeGatewayOverride,
+): GatewayRunOption | undefined {
+  return options.find((option) =>
+    optionMatchesOverride(option, workflowSelection, override),
+  );
+}
+
+function fallbackOverrideOption(
+  selection: GatewaySelection,
+  locale: Locale,
+): GatewayRunOption {
+  const route = [
+    selection.providerId ? `provider=${selection.providerId}` : '',
+    selection.channelId ? `channel=${selection.channelId}` : '',
+    `model=${selection.modelClass}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  return {
+    id: selectionKey(selection),
+    label: `${t(locale, 'inspector.modelUnavailable')} · ${route}`,
+    hint: selection.adapter,
+    selection,
+    transport: 'simulator',
+  };
+}
+
+function selectionOptionHint(
+  selection: GatewaySelection,
+  options: GatewayRunOption[],
+  locale: Locale,
+): string {
+  const option = options.find((candidate) => candidate.id === selectionKey(selection));
+  if (option) return gatewayOptionText(option);
+  return fallbackOverrideOption(selection, locale).label;
+}
+
+function nodeOverrideFromSelection(
+  selection: GatewaySelection,
+): NodeGatewayOverride {
+  return {
+    modelClass: selection.modelClass,
+    ...(selection.providerId ? { providerId: selection.providerId } : {}),
+    ...(selection.channelId ? { channelId: selection.channelId } : {}),
+  };
+}
+
+function useGatewayRunOptions(): GatewayRunOption[] {
+  const [, setGatewayRevision] = useState(0);
+
+  useEffect(() => {
+    let mounted = true;
+    void primeCliRuntime().finally(() => {
+      if (mounted) setGatewayRevision((revision) => revision + 1);
+    });
+    const unsubscribeCli = subscribeCliRuntime(() =>
+      setGatewayRevision((revision) => revision + 1),
+    );
+    const onGatewayConfigChanged = () =>
+      setGatewayRevision((revision) => revision + 1);
+    window.addEventListener('owf:gateway-config-changed', onGatewayConfigChanged);
+    return () => {
+      mounted = false;
+      unsubscribeCli();
+      window.removeEventListener(
+        'owf:gateway-config-changed',
+        onGatewayConfigChanged,
+      );
+    };
+  }, []);
+
+  return listGatewayRunOptions();
 }
 
 /** Coerce a params value into IRAgentSpec[] (tolerating the legacy string[] form). */
@@ -83,6 +199,7 @@ interface SpecListFieldProps {
   onChange: (specs: IRAgentSpec[]) => void;
   addLabel: string;
   locale: Locale;
+  disabled?: boolean;
 }
 
 /** Editor for a list of agent specs (parallel branches / pipeline stages). */
@@ -92,6 +209,7 @@ function SpecListField({
   onChange,
   addLabel,
   locale,
+  disabled = false,
 }: SpecListFieldProps) {
   const update = (i: number, patch: Partial<IRAgentSpec>) => {
     const next = specs.map((s, idx) => (idx === i ? { ...s, ...patch } : s));
@@ -113,7 +231,8 @@ function SpecListField({
               <button
                 type="button"
                 onClick={() => remove(i)}
-                className="text-[11px] text-fg-faint hover:text-accent-4"
+                disabled={disabled}
+                className="text-[11px] text-fg-faint hover:text-accent-4 disabled:cursor-not-allowed disabled:opacity-40"
                 title={t(locale, 'inspector.removeSpec')}
               >
                 ×
@@ -124,6 +243,7 @@ function SpecListField({
               value={asString(s.prompt)}
               onChange={(v) => update(i, { prompt: v })}
               placeholder={t(locale, 'inspector.subtaskPrompt')}
+              disabled={disabled}
               minHeight={56}
             />
             <div className="flex gap-1">
@@ -132,12 +252,14 @@ function SpecListField({
                 value={asString(s.agentType)}
                 onChange={(e) => update(i, { agentType: e.target.value })}
                 placeholder="agentType"
+                disabled={disabled}
               />
               <input
                 className={textInputClass}
                 value={asString(s.schema)}
                 onChange={(e) => update(i, { schema: e.target.value })}
                 placeholder="schema"
+                disabled={disabled}
               />
             </div>
           </div>
@@ -145,12 +267,47 @@ function SpecListField({
         <button
           type="button"
           onClick={add}
-          className="rounded-md border border-border bg-panel-2 px-2 py-1 text-[11px] text-fg-dim transition-colors hover:border-accent hover:text-fg"
+          disabled={disabled}
+          className="rounded-md border border-border bg-panel-2 px-2 py-1 text-[11px] text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-60"
         >
           {addLabel}
         </button>
       </div>
     </Field>
+  );
+}
+
+function StartInputsDetails({
+  inputs,
+  locale,
+}: {
+  inputs: string[];
+  locale: Locale;
+}) {
+  if (inputs.length === 0) {
+    return (
+      <div className="rounded-md border border-border-soft bg-panel-2 p-2 text-[11px] leading-relaxed text-fg-faint">
+        {t(locale, 'inspector.startInputsEmpty')}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {inputs.map((input, index) => (
+        <div
+          key={`${index}-${input.slice(0, 24)}`}
+          className="rounded-md border border-border-soft bg-panel-2 p-2"
+        >
+          <div className="font-mono text-[10px] text-fg-faint">
+            #{index + 1}
+          </div>
+          <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-fg-dim">
+            {input}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -171,12 +328,78 @@ function Field({ label, children }: FieldProps) {
 interface ParamFieldsProps {
   node: IRNode;
   onParam: (patch: Record<string, unknown>) => void;
+  onGatewayOverride: (override: NodeGatewayOverride | null) => void;
+  workflowSelection: GatewaySelection;
+  globalRunSelection: GatewaySelection;
+  gatewayOptions: GatewayRunOption[];
   locale: Locale;
+  disabled?: boolean;
 }
 
 /** Render the type-specific params editor for a single node. */
-function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
+function ParamFields({
+  node,
+  onParam,
+  onGatewayOverride,
+  workflowSelection,
+  globalRunSelection,
+  gatewayOptions,
+  locale,
+  disabled = false,
+}: ParamFieldsProps) {
   const p = node.params ?? {};
+  const override = nodeGatewayOverride(p);
+  const workflowSelectionKey = selectionKey(workflowSelection);
+  const globalSelectionKey = selectionKey(globalRunSelection);
+  const showGlobalInherit = globalSelectionKey !== workflowSelectionKey;
+  const selectableGatewayOptions = selectableNodeGatewayOptions(
+    gatewayOptions,
+    workflowSelection,
+  );
+  const selectedGatewayOption = override
+    ? currentOverrideOption(
+        selectableGatewayOptions,
+        workflowSelection,
+        override,
+      )
+    : undefined;
+  const selectedGatewaySelection =
+    selectedGatewayOption?.selection ??
+    (override ? mergeGatewaySelection(workflowSelection, override) : null);
+  const selectedSelectionKey = selectedGatewaySelection
+    ? selectionKey(selectedGatewaySelection)
+    : workflowSelectionKey;
+  const selectedGatewayValue = !override
+    ? INHERIT_WORKFLOW_SELECTION_ID
+    : showGlobalInherit && selectedSelectionKey === globalSelectionKey
+      ? INHERIT_GLOBAL_SELECTION_ID
+      : selectedSelectionKey;
+  const actualModelSelectOptions =
+    override &&
+    selectedGatewaySelection &&
+    !selectableGatewayOptions.some((option) => option.id === selectedSelectionKey)
+      ? [
+          fallbackOverrideOption(selectedGatewaySelection, locale),
+          ...selectableGatewayOptions,
+        ]
+      : selectableGatewayOptions;
+  const modelSelectOptions = [
+    {
+      id: INHERIT_WORKFLOW_SELECTION_ID,
+      label: t(locale, 'inspector.modelInheritWorkflow'),
+      hint: selectionOptionHint(workflowSelection, gatewayOptions, locale),
+    },
+    ...(showGlobalInherit
+      ? [
+          {
+            id: INHERIT_GLOBAL_SELECTION_ID,
+            label: t(locale, 'inspector.modelInheritGlobal'),
+            hint: selectionOptionHint(globalRunSelection, gatewayOptions, locale),
+          },
+        ]
+      : []),
+    ...actualModelSelectOptions,
+  ];
 
   switch (node.type) {
     case 'agent':
@@ -188,6 +411,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.prompt)}
               onChange={(v) => onParam({ prompt: v })}
               placeholder={t(locale, 'inspector.agentPromptPlaceholder')}
+              disabled={disabled}
             />
           </Field>
           <Field label="Agent Type">
@@ -196,20 +420,38 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.agentType ?? p.agent)}
               onChange={(e) => onParam({ agentType: e.target.value })}
               placeholder={t(locale, 'inspector.agentTypePlaceholder')}
+              disabled={disabled}
             />
           </Field>
-          <Field label="Model">
+          <Field label={t(locale, 'inspector.modelField')}>
             <select
               className={selectClass}
-              value={asString(p.model) || 'sonnet'}
-              onChange={(e) => onParam({ model: e.target.value })}
+              value={selectedGatewayValue}
+              onChange={(e) => {
+                if (e.target.value === INHERIT_WORKFLOW_SELECTION_ID) {
+                  onGatewayOverride(null);
+                  return;
+                }
+                if (e.target.value === INHERIT_GLOBAL_SELECTION_ID) {
+                  onGatewayOverride(nodeOverrideFromSelection(globalRunSelection));
+                  return;
+                }
+                const selection = selectionFromKey(e.target.value);
+                if (selection) {
+                  onGatewayOverride(nodeOverrideFromSelection(selection));
+                }
+              }}
+              disabled={disabled}
             >
-              {MODEL_OPTIONS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
+              {modelSelectOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {gatewayOptionText(option)}
                 </option>
               ))}
             </select>
+            <div className="mt-1 text-[10px] leading-relaxed text-fg-faint">
+              {t(locale, 'inspector.modelInheritHelp')}
+            </div>
           </Field>
           <Field label={t(locale, 'inspector.schemaLabel')}>
             <input
@@ -217,6 +459,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.schema)}
               onChange={(e) => onParam({ schema: e.target.value })}
               placeholder={t(locale, 'inspector.schemaPlaceholder')}
+              disabled={disabled}
             />
           </Field>
         </>
@@ -230,6 +473,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
           onChange={(branches) => onParam({ branches })}
           addLabel={t(locale, 'inspector.addBranch')}
           locale={locale}
+          disabled={disabled}
         />
       );
 
@@ -242,6 +486,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.items) || 'args'}
               onChange={(e) => onParam({ items: e.target.value })}
               placeholder={t(locale, 'inspector.itemsPlaceholder')}
+              disabled={disabled}
             />
           </Field>
           <SpecListField
@@ -250,6 +495,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
             onChange={(stages) => onParam({ stages })}
             addLabel={t(locale, 'inspector.addStage')}
             locale={locale}
+            disabled={disabled}
           />
         </>
       );
@@ -262,6 +508,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
             value={asString(p.title)}
             onChange={(e) => onParam({ title: e.target.value })}
             placeholder={t(locale, 'inspector.phaseName')}
+            disabled={disabled}
           />
         </Field>
       );
@@ -275,6 +522,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.condition)}
               onChange={(e) => onParam({ condition: e.target.value })}
               placeholder={t(locale, 'inspector.conditionPlaceholder')}
+              disabled={disabled}
             />
           </Field>
           <div className="text-[11px] text-fg-faint">
@@ -292,6 +540,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               value={asString(p.condition ?? p.until)}
               onChange={(e) => onParam({ condition: e.target.value })}
               placeholder={t(locale, 'inspector.loopPlaceholder')}
+              disabled={disabled}
             />
           </Field>
           <div className="text-[11px] text-fg-faint">
@@ -308,6 +557,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
             value={asString(p.name)}
             onChange={(e) => onParam({ name: e.target.value })}
             placeholder={t(locale, 'inspector.workflowName')}
+            disabled={disabled}
           />
         </Field>
       );
@@ -322,6 +572,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
             value={asString(p[key])}
             onChange={(e) => onParam({ [key]: e.target.value })}
             placeholder={t(locale, 'inspector.logMessage')}
+            disabled={disabled}
           />
         </Field>
       );
@@ -343,6 +594,7 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
               }
             }}
             placeholder='"hello" / 42 / { "k": 1 }'
+            disabled={disabled}
           />
         </Field>
       );
@@ -355,12 +607,30 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
             value={asString(p.code)}
             onChange={(v) => onParam({ code: v })}
             placeholder="// code"
+            disabled={disabled}
             maxHeight={360}
           />
         </Field>
       );
 
-    case 'start':
+    case 'start': {
+      const inputs = readStartUserInputs(p);
+      const label =
+        inputs.length > 0
+          ? `${t(locale, 'inspector.startInputsLabel')} (${inputs.length})`
+          : t(locale, 'inspector.startInputsLabel');
+      return (
+        <>
+          <Field label={label}>
+            <StartInputsDetails inputs={inputs} locale={locale} />
+          </Field>
+          <div className="text-[11px] text-fg-faint">
+            {t(locale, 'inspector.startInputsHelp')}
+          </div>
+        </>
+      );
+    }
+
     case 'end':
     default:
       return (
@@ -374,12 +644,18 @@ function ParamFields({ node, onParam, locale }: ParamFieldsProps) {
 export default function NodeInspector() {
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const locale = useStore((s) => s.locale);
-  const nodes = useStore((s) => s.workflow.nodes);
+  const workflow = useStore((s) => s.workflow);
+  const nodes = workflow.nodes;
+  const workflowSelection = workflowDefaultGatewaySelection(workflow);
+  const globalRunSelection = workflowGatewaySelection(workflow);
   const updateNodeLabel = useStore((s) => s.updateNodeLabel);
   const updateNodeParams = useStore((s) => s.updateNodeParams);
+  const updateNodeGatewayOverride = useStore((s) => s.updateNodeGatewayOverride);
   const removeNode = useStore((s) => s.removeNode);
   const addNode = useStore((s) => s.addNode);
   const selectNode = useStore((s) => s.selectNode);
+  const readOnly = useStore((s) => isWorkflowReadOnly(s));
+  const gatewayOptions = useGatewayRunOptions();
 
   const node = useMemo(
     () => nodes.find((n) => n.id === selectedNodeId) ?? null,
@@ -404,11 +680,13 @@ export default function NodeInspector() {
    * adding a fresh one of the new type, preserving the label.
    */
   const handleTypeChange = (nextType: NodeType) => {
+    if (readOnly) return;
     if (nextType === node.type) return;
     const label = node.label;
     const parent = node.parent;
     removeNode(node.id);
     const newId = addNode(nextType, undefined, parent);
+    if (!newId) return;
     if (label) updateNodeLabel(newId, label);
     selectNode(newId);
   };
@@ -425,6 +703,7 @@ export default function NodeInspector() {
           value={node.label ?? ''}
           onChange={(e) => updateNodeLabel(node.id, e.target.value)}
           placeholder={t(locale, 'inspector.nodeLabel')}
+          disabled={readOnly}
         />
       </Field>
 
@@ -433,6 +712,7 @@ export default function NodeInspector() {
           className={selectClass}
           value={node.type}
           onChange={(e) => handleTypeChange(e.target.value as NodeType)}
+          disabled={readOnly}
         >
           {NODE_TYPE_OPTIONS.map((t) => (
             <option key={t.id} value={t.id}>
@@ -449,6 +729,13 @@ export default function NodeInspector() {
           node={node}
           locale={locale}
           onParam={(patch) => updateNodeParams(node.id, patch)}
+          onGatewayOverride={(override) =>
+            updateNodeGatewayOverride(node.id, override)
+          }
+          workflowSelection={workflowSelection}
+          globalRunSelection={globalRunSelection}
+          gatewayOptions={gatewayOptions}
+          disabled={readOnly}
         />
       </div>
 
@@ -456,7 +743,8 @@ export default function NodeInspector() {
         <button
           type="button"
           onClick={() => removeNode(node.id)}
-          className="w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-accent-4 transition-colors hover:border-accent-4 hover:bg-border-soft"
+          disabled={readOnly}
+          className="w-full rounded-md border border-border bg-panel-2 px-2 py-1.5 text-xs text-accent-4 transition-colors hover:border-accent-4 hover:bg-border-soft disabled:cursor-not-allowed disabled:opacity-60"
         >
           {t(locale, 'inspector.deleteNode')}
         </button>

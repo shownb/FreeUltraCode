@@ -3,6 +3,7 @@ import { useStore } from '@/store/useStore';
 import AutoTextarea from '@/components/AutoTextarea';
 import NodeInspector from './NodeInspector';
 import { useResizableWidth } from '@/lib/useResizableWidth';
+import { isPromptEntryDisabled } from '@/lib/composerEntryPolicy';
 import {
   localizePromptGroup,
   localizePromptItem,
@@ -40,6 +41,7 @@ export default function PromptPanel() {
   const locale = useStore((s) => s.locale);
   const autoTranslate = useStore((s) => s.promptAutoTranslate);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
+  const mode = useStore((s) => s.mode);
   const appendComposerDraft = useStore((s) => s.appendComposerDraft);
   const addPromptItem = useStore((s) => s.addPromptItem);
   const updatePromptItemLocalized = useStore(
@@ -265,6 +267,7 @@ export default function PromptPanel() {
                     <ul className="flex flex-col gap-0.5">
                       {group.items.map((item) => {
                         const localizedItem = localizePromptItem(item, locale);
+                        const promptEntryDisabled = isPromptEntryDisabled(mode);
                         return editMode && editingItemId === item.id ? (
                           <li key={item.id}>
                             <ItemEditor
@@ -280,15 +283,34 @@ export default function PromptPanel() {
                             <div className="group flex w-full items-start gap-1">
                               <button
                                 type="button"
-                                onClick={() =>
-                                  editMode
-                                    ? setEditingItemId(item.id)
-                                    : appendComposerDraft(localizedItem.text)
+                                disabled={promptEntryDisabled}
+                                onClick={() => {
+                                  if (editMode) {
+                                    setEditingItemId(item.id);
+                                    return;
+                                  }
+                                  appendComposerDraft(localizedItem.text);
+                                }}
+                                title={
+                                  promptEntryDisabled
+                                    ? t(locale, 'dock.inputLockedTitle')
+                                    : localizedItem.text
                                 }
-                                title={localizedItem.text}
-                                className="flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-fg-dim transition-colors hover:bg-border-soft hover:text-fg"
+                                className={
+                                  'flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-fg-dim transition-colors ' +
+                                  (promptEntryDisabled
+                                    ? 'cursor-not-allowed text-fg-faint opacity-50'
+                                    : 'hover:bg-border-soft hover:text-fg')
+                                }
                               >
-                                <span className="mt-0.5 text-accent transition-colors group-hover:text-accent-2">
+                                <span
+                                  className={
+                                    'mt-0.5 transition-colors ' +
+                                    (promptEntryDisabled
+                                      ? 'text-fg-faint'
+                                      : 'text-accent group-hover:text-accent-2')
+                                  }
+                                >
                                   {editMode ? '✎' : '▷'}
                                 </span>
                                 <span className="min-w-0 flex-1">

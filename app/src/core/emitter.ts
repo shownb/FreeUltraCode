@@ -139,27 +139,36 @@ function emitScope(
         break;
       case 'agent': {
         const v = assign(ctx, node.id);
-        const call = emitAgentCall(nodeToSpec(node), ctxVars(ctx, node.id));
-        out.push(`${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}`);
+        const spec = nodeToSpec(node);
+        const call = emitAgentCall(spec, ctxVars(ctx, node.id));
+        out.push(
+          `${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}${routeAnnotation(spec)}`,
+        );
         break;
       }
       case 'parallel': {
         const v = assign(ctx, node.id);
+        const spec = nodeToSpec(node);
         const call = emitParallel(node, indent);
-        out.push(`${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}`);
+        out.push(
+          `${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}${routeAnnotation(spec)}`,
+        );
         break;
       }
       case 'pipeline': {
         const v = assign(ctx, node.id);
+        const spec = nodeToSpec(node);
         const call = emitPipeline(node, indent);
-        out.push(`${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}`);
+        out.push(
+          `${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}${routeAnnotation(spec)}`,
+        );
         break;
       }
       case 'workflow': {
         const v = assign(ctx, node.id);
         const name = str(String(node.params.name ?? node.label ?? 'sub'));
         out.push(
-          `${pad}${decl(ctx, node.id, v)}await workflow(${name}) // @node ${node.id}`,
+          `${pad}${decl(ctx, node.id, v)}await workflow(${name}) // @node ${node.id}${routeAnnotation(nodeToSpec(node))}`,
         );
         break;
       }
@@ -215,11 +224,13 @@ function assign(ctx: EmitCtx, nodeId: string): string {
 /** Read an agent node's params as an IRAgentSpec (tolerating the legacy `agent:` key). */
 function nodeToSpec(node: IRNode): IRAgentSpec {
   const p = node.params ?? {};
+  const gateway = readGatewayOverride(p.gateway);
   return {
     prompt: String(p.prompt ?? node.label ?? ''),
     label: optStr(p.label),
     agentType: optStr(p.agentType ?? p.agent),
-    model: optStr(p.model),
+    model: optStr(p.model) ?? gateway?.modelClass,
+    gateway,
     schema: optStr(p.schema),
     isolation: p.isolation === 'worktree' ? 'worktree' : undefined,
     phase: optStr(p.phase),
@@ -243,6 +254,7 @@ function emitAgentOpts(spec: IRAgentSpec): string {
   if (spec.phase) opts.push(`phase: ${str(spec.phase)}`);
   if (spec.agentType) opts.push(`agentType: ${str(spec.agentType)}`);
   if (spec.model) opts.push(`model: ${str(spec.model)}`);
+  if (spec.gateway) opts.push(`gateway: ${emitGatewaySelection(spec.gateway)}`);
   if (spec.schema) opts.push(`schema: ${ident(spec.schema)}`); // bare identifier
   if (spec.isolation) opts.push(`isolation: ${str(spec.isolation)}`);
   if (opts.length === 0) return '';
@@ -289,11 +301,13 @@ function readSpecs(value: unknown): IRAgentSpec[] {
   return value.map((v): IRAgentSpec => {
     if (typeof v === 'string') return { prompt: v };
     const o = (v ?? {}) as Record<string, unknown>;
+    const gateway = readGatewayOverride(o.gateway);
     return {
       prompt: String(o.prompt ?? o.label ?? ''),
       label: optStr(o.label),
       agentType: optStr(o.agentType ?? o.agent),
-      model: optStr(o.model),
+      model: optStr(o.model) ?? gateway?.modelClass,
+      gateway,
       schema: optStr(o.schema),
       isolation: o.isolation === 'worktree' ? 'worktree' : undefined,
       phase: optStr(o.phase),
@@ -310,11 +324,48 @@ function emitMeta(ir: IRGraph): string {
   parts.push(`name: ${str(ir.meta.name ?? 'workflow')}`);
   if (ir.meta.description != null) parts.push(`description: ${str(ir.meta.description)}`);
   if (ir.meta.adapter != null) parts.push(`adapter: ${str(ir.meta.adapter)}`);
+  if (ir.meta.gateway?.defaults) {
+    parts.push(`gateway: { defaults: ${emitGatewaySelection(ir.meta.gateway.defaults)} }`);
+  }
   const phases = ir.nodes
     .filter((n) => n.type === 'phase')
     .map((n) => `{ title: ${str(phaseTitle(n))} }`);
   if (phases.length > 0) parts.push(`phases: [${phases.join(', ')}]`);
   return `export const meta = { ${parts.join(', ')} }`;
+}
+
+function emitGatewaySelection(selection: {
+  adapter?: string;
+  modelClass?: string;
+  providerId?: string;
+  channelId?: string;
+}): string {
+  const parts: string[] = [];
+  if (selection.adapter) parts.push(`adapter: ${str(selection.adapter)}`);
+  if (selection.modelClass) parts.push(`modelClass: ${str(selection.modelClass)}`);
+  if (selection.providerId) parts.push(`providerId: ${str(selection.providerId)}`);
+  if (selection.channelId) parts.push(`channelId: ${str(selection.channelId)}`);
+  return `{ ${parts.join(', ')} }`;
+}
+
+function readGatewayOverride(value: unknown): IRAgentSpec['gateway'] {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const raw = value as Record<string, unknown>;
+  const gateway: NonNullable<IRAgentSpec['gateway']> = {};
+  if (typeof raw.modelClass === 'string') gateway.modelClass = raw.modelClass;
+  if (typeof raw.providerId === 'string') gateway.providerId = raw.providerId;
+  if (typeof raw.channelId === 'string') gateway.channelId = raw.channelId;
+  return Object.keys(gateway).length > 0 ? gateway : undefined;
+}
+
+function routeAnnotation(spec: IRAgentSpec): string {
+  const gateway = spec.gateway;
+  if (!gateway) return '';
+  const parts: string[] = [];
+  if (gateway.providerId) parts.push(`provider=${gateway.providerId}`);
+  if (gateway.channelId) parts.push(`channel=${gateway.channelId}`);
+  if (gateway.modelClass) parts.push(`modelClass=${gateway.modelClass}`);
+  return parts.length > 0 ? ` // @route ${parts.join(' ')}` : '';
 }
 
 /** Emit `const NAME = <body> // @schema NAME` for every referenced schema id. */

@@ -8,7 +8,7 @@ import { BADGE_BASE_STYLE, runStateVisual } from './runStateStyles';
  * Agent node — an `agent(prompt, opts)` invocation.
  *
  * Pins (matching the IR sample / design doc):
- *   exec in/out (▶), data in (prompt/model/schema ●), data out (result ●).
+ *   exec in/out (▶), data in (prompt/model/channel/schema ●), data out (result ●).
  *
  * Accent token: `--accent` (agent).
  *
@@ -25,7 +25,16 @@ function AgentNodeImpl({ data, selected }: NodeProps) {
       : typeof params.agent === 'string'
         ? params.agent
         : undefined;
-  const model = typeof params.model === 'string' ? params.model : undefined;
+  const gateway =
+    typeof params.gateway === 'object' && params.gateway !== null
+      ? (params.gateway as Record<string, unknown>)
+      : null;
+  const model =
+    typeof gateway?.modelClass === 'string'
+      ? gateway.modelClass
+      : typeof params.model === 'string'
+        ? params.model
+        : undefined;
 
   const run = runStateVisual(d.runState);
   // Run state border wins over selection accent so users can see status while
@@ -60,7 +69,7 @@ function AgentNodeImpl({ data, selected }: NodeProps) {
           </div>
         )}
         <div className="mt-2 flex flex-col gap-1 text-[10px] text-fg-faint">
-          <span>● prompt / model / schema</span>
+          <span>● prompt / model / channel / schema</span>
           <span>● result</span>
         </div>
       </div>

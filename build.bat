@@ -41,7 +41,7 @@ echo   BUILD COMPLETE
 echo ============================================================
 set "REL=%~dp0app\src-tauri\target\release"
 echo   Standalone app : !REL!\OpenWorkflow.exe
-echo   Installer (exe): !REL!\bundle\nsis\OpenWorkflow_0.1.0_x64-setup.exe
+echo   Installer (exe): !REL!\bundle\nsis\OpenWorkflow_0.1.2_x64-setup.exe
 echo ------------------------------------------------------------
 echo   - Double-click OpenWorkflow.exe to run directly (needs WebView2,
 echo     which ships with Windows 10/11).

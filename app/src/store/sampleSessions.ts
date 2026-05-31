@@ -96,8 +96,8 @@ export const sampleMessages: Message[] = [
 /**
  * Prompt-suggestion groups (the default prompt library).
  *
- * Categories: 清晰度 / 完整性 / 成本 / 结构 / 可靠性 / 性能与并行 /
- * 验证与测试 / 可观测性 / 安全与权限 / 界面与体验. Every item is phrased as a concrete,
+ * Categories: 互动澄清 / 清晰度 / 完整性 / 成本 / 结构 / 可靠性 / 性能与并行 /
+ * 验证与测试 / 可观测性 / 安全与权限 / 界面与体验 / 版本控制. Every item is phrased as a concrete,
  * imperative instruction to MODIFY the blueprint — clicking it appends
  * `item.text` to the AI input box for review before sending.
  *
@@ -111,9 +111,10 @@ export const sampleMessages: Message[] = [
  * user's persisted library (one-time per version bump), so newly-shipped
  * default groups appear automatically without discarding the user's edits.
  * Bump history: v1 = 9 groups (clarity…security); v2 = +界面与体验 (ui-ux);
- * v4 = +互动澄清 (interactive: grill-me + clarify).
+ * v4 = +互动澄清 (interactive: grill-me + clarify); v5 = +版本控制
+ * (version-control).
  */
-export const PROMPT_DEFAULTS_VERSION = 4;
+export const PROMPT_DEFAULTS_VERSION = 5;
 
 const basePromptGroups: PromptGroup[] = [
   {
@@ -131,7 +132,7 @@ const basePromptGroups: PromptGroup[] = [
       {
         id: 'interactive-clarify',
         label: '澄清需求',
-        text: '在动手改图前，先用交互（select / input）逐个向我确认蓝图中含糊或缺失的关键决策，问清后再给出优化方案。',
+        text: '在动手改图前，先用交互（select / input）向我确认蓝图中最关键的一个含糊或缺失决策；我回答后，必须立刻把回答写入 workflow 蓝图并输出更新后的 IRGraph。',
       },
     ],
   },
@@ -410,6 +411,47 @@ const basePromptGroups: PromptGroup[] = [
       },
     ],
   },
+  {
+    id: 'version-control',
+    label: '版本控制 / VCS Safety',
+    items: [
+      {
+        id: 'vcs-isolated-workspace',
+        label: '隔离运行',
+        text: '在执行会修改文件或版本库状态的步骤前，先要求使用独立工作副本隔离运行（例如 Git worktree、P4 workspace-client、SVN checkout），避免影响用户当前工作区。',
+      },
+      {
+        id: 'vcs-status-check',
+        label: '状态检查',
+        text: '先识别当前项目使用的版本控制系统（Git、Perforce/P4、SVN 或其他），只读检查未提交改动、冲突、未跟踪项和待提交文件，并在继续前汇总风险。',
+      },
+      {
+        id: 'vcs-protect-changes',
+        label: '保护改动',
+        text: '保护用户已有的未提交改动；不得覆盖、回滚、重置、删除或替换未确认属于本次任务的文件内容，遇到冲突时先报告并等待确认。',
+      },
+      {
+        id: 'vcs-no-auto-submit',
+        label: '禁止自动提交',
+        text: '不得自动提交、签入、submit 或 push，也不得自动写入远端或共享版本库；任何进入版本库的动作都必须先等待用户明确确认。',
+      },
+      {
+        id: 'vcs-pre-submit-confirm',
+        label: '提交前确认',
+        text: '在提交、签入或 submit 前，先汇总本次变更、影响文件、已运行验证、潜在风险和回退方式，等待用户确认后再执行版本库写入动作。',
+      },
+      {
+        id: 'vcs-high-risk-confirm',
+        label: '高风险确认',
+        text: '执行删除、覆盖、回滚、同步、更新、切换分支/工作副本、大批量重命名等高风险版本控制或文件操作前，必须先说明影响范围并等待用户确认。',
+      },
+      {
+        id: 'vcs-unknown-conservative',
+        label: '未知 VCS 保守处理',
+        text: '如果无法确认当前项目的版本控制系统或工作区状态，只进行只读分析和建议；不得执行会修改文件、工作副本或版本库状态的动作。',
+      },
+    ],
+  },
 ];
 
 const EN_LOCALE: Locale = 'en-US';
@@ -426,7 +468,7 @@ const englishPromptTranslations: Record<string, EnglishPromptGroup> = {
       'interactive-grill': { label: 'Grill me (grill-me)', text: 'grill-me' },
       'interactive-clarify': {
         label: 'Clarify needs',
-        text: 'Before editing the blueprint, use interactions (select / input) to confirm ambiguous or missing key decisions with me one at a time, then propose the optimization.',
+        text: 'Before editing the blueprint, use an interaction (select / input) to confirm the most important ambiguous or missing decision. After I answer, immediately fold the answer into the workflow blueprint and output the updated IRGraph.',
       },
     },
   },
@@ -652,6 +694,39 @@ const englishPromptTranslations: Record<string, EnglishPromptGroup> = {
       },
     },
   },
+  'version-control': {
+    label: 'VCS Safety',
+    items: {
+      'vcs-isolated-workspace': {
+        label: 'Isolated workspace',
+        text: 'Before steps that modify files or VCS state, require an isolated workspace / working copy such as a Git worktree, P4 workspace-client, or SVN checkout so the user\'s current workspace is not affected.',
+      },
+      'vcs-status-check': {
+        label: 'Status check',
+        text: 'First identify the version control system in use (Git, Perforce/P4, SVN, or another system). Perform only read-only checks for uncommitted changes, conflicts, untracked items, and pending files, then summarize risks before continuing.',
+      },
+      'vcs-protect-changes': {
+        label: 'Protect changes',
+        text: 'Protect the user\'s existing uncommitted changes. Do not automatically overwrite, revert, restore, reset, delete, or replace file contents unless they are confirmed to belong to this task; report conflicts and wait for confirmation.',
+      },
+      'vcs-no-auto-submit': {
+        label: 'No auto-submit',
+        text: 'Do not automatically commit, check in, submit, or push, and do not automatically write to a remote or shared repository. Any action that records changes in version control must wait for explicit user confirmation.',
+      },
+      'vcs-pre-submit-confirm': {
+        label: 'Confirm before submit',
+        text: 'Before any commit, check in, or submit, summarize the changes, affected files, verification performed, potential risks, and rollback method. Wait for user confirmation before any VCS write action.',
+      },
+      'vcs-high-risk-confirm': {
+        label: 'High-risk confirmation',
+        text: 'Before delete, overwrite, revert, restore, sync, update, switch, checkout, or bulk rename operations, explain the impact scope and wait for user confirmation. Do not automatically run these high-risk VCS or file operations.',
+      },
+      'vcs-unknown-conservative': {
+        label: 'Unknown VCS fallback',
+        text: 'If the version control system or working copy state cannot be confirmed, perform only read-only analysis and recommendations. Do not run actions that modify files, the workspace / working copy, or version control state.',
+      },
+    },
+  },
 };
 
 function withDefaultTranslations(groups: PromptGroup[]): PromptGroup[] {
@@ -762,4 +837,5 @@ export const defaultComposer: ComposerSettings = {
   permission: permissionOptions[0].id,
   model: modelOptions[0].id,
   workspace: '',
+  modelStrategy: 'inherit',
 };

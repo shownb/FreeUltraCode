@@ -13,6 +13,13 @@ app/*.tsbuildinfo
 app/.gstack/
 app/src-tauri/.gstack/
 
+# Published docs and notes
+/docs/
+/pencil/
+/tasks/
+/AGENTS.md
+/CLAUDE.md
+
 # Environment and local secrets
 .env
 .env.*

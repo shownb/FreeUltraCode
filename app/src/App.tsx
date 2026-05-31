@@ -3,6 +3,7 @@ import BlueprintCanvas from '@/canvas/BlueprintCanvas';
 import Sidebar from '@/panels/Sidebar';
 import PromptPanel from '@/panels/PromptPanel';
 import AIDock from '@/panels/AIDock';
+import { primeCliRuntime } from '@/lib/cliConfig';
 import { useStore } from '@/store/useStore';
 
 /**
@@ -18,6 +19,7 @@ export default function App() {
 
   useEffect(() => {
     initHistory();
+    void primeCliRuntime();
   }, [initHistory]);
 
   return (

@@ -57,10 +57,26 @@ export interface IRAgentSpec {
   /** Custom sub-agent type, emitted as the real `agentType:` option. */
   agentType?: string;
   model?: string;
+  gateway?: NodeGatewayOverride;
   /** Schema identifier name (bare), e.g. "REVIEW". */
   schema?: string;
   isolation?: 'worktree';
   phase?: string;
+}
+
+export type ModelClass = 'haiku' | 'sonnet' | 'opus' | string;
+
+export interface GatewaySelection {
+  adapter: 'claude-code' | 'codex' | 'gemini' | string;
+  modelClass: ModelClass;
+  providerId?: string;
+  channelId?: string;
+}
+
+export interface NodeGatewayOverride {
+  modelClass?: ModelClass;
+  providerId?: string;
+  channelId?: string;
 }
 
 /** A node in the workflow graph. */
@@ -87,7 +103,8 @@ export interface IRNode {
   binding?: string;
   /**
    * Arbitrary, type-specific parameters. Notable shapes:
-   *   agent:    { prompt, label?, agentType?, model?, schema?, isolation?, phase? }
+   *   start:    { userInputs?: string[] }        — source requirements shown on the Start node
+   *   agent:    { prompt, label?, agentType?, model?, gateway?, schema?, isolation?, phase? }
    *   parallel: { branches: IRAgentSpec[] }       — emitted as a thunk array
    *   pipeline: { items: string, stages: IRAgentSpec[] } — items is an expr ref
    *   branch:   { condition: string }             — children carry parent=this.id
@@ -132,6 +149,8 @@ export interface IRRunSnapshot {
   outputs?: Record<string, string>;
   failedNodeId?: string | null;
   error?: Record<string, unknown> | null;
+  route?: GatewaySelection;
+  usage?: Record<string, unknown> | null;
   updatedAt?: number;
 }
 
@@ -141,6 +160,9 @@ export interface IRMeta {
   description?: string;
   /** Target adapter id, e.g. "claude-code". */
   adapter?: string;
+  gateway?: {
+    defaults?: GatewaySelection;
+  };
   /** Last known runtime progress; ignored by emit/parse. */
   run?: IRRunSnapshot;
   /**

@@ -258,6 +258,7 @@ function workspaceSummary(record: WorkspaceRecord): WorkspaceSummary {
 }
 
 function sessionSummary(record: SessionRecord): SessionSummary {
+  const runStatus = record.meta?.runStatus;
   return {
     id: record.id,
     workspaceId: record.workspaceId,
@@ -267,6 +268,7 @@ function sessionSummary(record: SessionRecord): SessionSummary {
     updatedAt: record.updatedAt,
     preview: preview(record.messages),
     messageCount: record.messages.length,
+    ...(runStatus ? { runStatus } : {}),
   };
 }
 
@@ -519,7 +521,10 @@ export const historyStore: HistoryStore = {
     await enqueue(async () => {
       const config = await getConfigInternal();
       if (!config.schemaVersion) {
-        await writeConfigInternal({ schemaVersion: HISTORY_SCHEMA_VERSION });
+        await writeConfigInternal({
+          ...config,
+          schemaVersion: HISTORY_SCHEMA_VERSION,
+        });
       }
       if (!(await readJson<WorkspaceSummary[]>(WORKSPACES_INDEX))) {
         await writeWorkspaceIndexInternal([]);

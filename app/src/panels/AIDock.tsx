@@ -1,7 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Plus } from 'lucide-react';
 import Select from '@/components/Select';
 import WorkspaceSelect from '@/components/WorkspaceSelect';
 import { summarizeAnswer, type InteractionAnswer } from '@/core/interaction';
+import {
+  bestAvailableSelection,
+  listGatewayRunOptions,
+  selectionFromKey,
+  selectionKey,
+  workflowGatewaySelection,
+} from '@/lib/modelGateway/resolver';
+import type { GatewayRunOption } from '@/lib/modelGateway/types';
+import {
+  RUNTIME_ADAPTERS,
+  runtimeAdapterLabel,
+  type RuntimeAdapterId,
+} from '@/lib/adapters';
+import { hasExplicitGatewayPin } from '@/lib/gatewayConfig';
+import type { ModelStrategy, SelectOption } from '@/store/types';
 import { localizeSelectOption, t, type Locale } from '@/lib/i18n';
 import type { Message } from '@/store/types';
 import {
@@ -10,41 +26,35 @@ import {
   saveDockHeight,
   savePaneWidth,
 } from '@/lib/composerStorage';
+import { shouldRefocusComposerAfterAppend } from '@/lib/composerEntryPolicy';
+import { tauriAvailable } from '@/lib/tauri';
 import { useStore } from '@/store/useStore';
+import { primeCliRuntime, subscribeCliRuntime } from '@/lib/cliConfig';
 
 const DEFAULT_DOCK_HEIGHT = 208; // matches the former h-52
 const MIN_DOCK_HEIGHT = 120;
+
+/**
+ * Order in which the model dropdown groups channels by runtime adapter. Each
+ * group gets a divider + header (Claude Code / Codex / Gemini) in the menu.
+ */
+const ADAPTER_GROUP_ORDER: RuntimeAdapterId[] = RUNTIME_ADAPTERS.map(
+  (adapter) => adapter.id,
+);
+
+function adapterGroupRank(adapter: string): number {
+  const index = ADAPTER_GROUP_ORDER.indexOf(adapter as RuntimeAdapterId);
+  return index === -1 ? ADAPTER_GROUP_ORDER.length : index;
+}
+
+/** Sentinel id for the "inherit global selection" option in the model dropdown. */
+const INHERIT_SELECTION_ID = '__inherit__';
 
 /** localStorage key + bounds for the AI-input pane width (right column). */
 const INPUT_WIDTH_KEY = 'openworkflow.aiInputWidth.v1';
 const DEFAULT_INPUT_WIDTH = 384; // matches the former w-96
 const MIN_INPUT_WIDTH = 280;
 const MIN_RETURN_WIDTH = 240; // keep the AI-return pane usable
-
-/** localStorage key holding the user's Anthropic API key. */
-const API_KEY_STORAGE = 'owf_anthropic_key';
-
-/** Safely read the persisted API key from localStorage. */
-function readApiKey(): string {
-  try {
-    if (typeof window === 'undefined') return '';
-    return window.localStorage.getItem(API_KEY_STORAGE) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-/** Safely write the API key to localStorage; empty string removes it. */
-function writeApiKey(value: string): void {
-  try {
-    if (typeof window === 'undefined') return;
-    const v = value.trim();
-    if (v) window.localStorage.setItem(API_KEY_STORAGE, v);
-    else window.localStorage.removeItem(API_KEY_STORAGE);
-  } catch {
-    /* ignore */
-  }
-}
 
 function clampHeight(h: number): number {
   const max =
@@ -59,6 +69,52 @@ function formatMessageTime(ts: number): string {
     minute: '2-digit',
     second: '2-digit',
   }).format(new Date(ts));
+}
+
+interface TextSelection {
+  start: number;
+  end: number;
+}
+
+function clampSelection(value: number, max: number): number {
+  return Math.min(Math.max(value, 0), max);
+}
+
+function formatFilePathInsertion(paths: string[]): string {
+  return paths.map((path) => path.trim()).filter(Boolean).join('\n');
+}
+
+function pointInsideElement(
+  point: { x: number; y: number },
+  el: HTMLElement,
+): boolean {
+  const scale = window.devicePixelRatio || 1;
+  const x = point.x / scale;
+  const y = point.y / scale;
+  const rect = el.getBoundingClientRect();
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+async function pickComposerFiles(title: string): Promise<string[] | null> {
+  if (!tauriAvailable()) return null;
+
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  const picked = await open({
+    title,
+    directory: false,
+    multiple: true,
+  });
+  if (!picked) return null;
+  return Array.isArray(picked) ? picked.map(String) : [String(picked)];
+}
+
+function pathsFromDataTransfer(dataTransfer: DataTransfer): string[] {
+  return Array.from(dataTransfer.files)
+    .map((file) => {
+      const withPath = file as File & { path?: string };
+      return withPath.path || file.webkitRelativePath || file.name;
+    })
+    .filter(Boolean);
 }
 
 /**
@@ -273,6 +329,9 @@ function InteractionWidget({
 export default function AIDock() {
   const messages = useStore((s) => s.messages);
   const sendPrompt = useStore((s) => s.sendPrompt);
+  const runSelection = useStore((s) => workflowGatewaySelection(s.workflow));
+  const setGlobalRunSelection = useStore((s) => s.setGlobalRunSelection);
+  const clearGlobalRunSelection = useStore((s) => s.clearGlobalRunSelection);
   const composer = useStore((s) => s.composer);
   const draft = useStore((s) => s.composerDraft);
   const composerFocusVersion = useStore((s) => s.composerFocusVersion);
@@ -281,7 +340,6 @@ export default function AIDock() {
   const setComposerDraft = useStore((s) => s.setComposerDraft);
   const setWorkspace = useStore((s) => s.setWorkspace);
   const permissionOptions = useStore((s) => s.permissionOptions);
-  const modelOptions = useStore((s) => s.modelOptions);
   const workspaceHistory = useStore((s) => s.workspaceHistory);
   const mode = useStore((s) => s.mode);
   const aiStreaming = useStore((s) => s.aiStreaming);
@@ -289,16 +347,90 @@ export default function AIDock() {
   const dismissInteraction = useStore((s) => s.dismissInteraction);
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const draftRef = useRef(draft);
+  const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const lastComposerFocusVersion = useRef(composerFocusVersion);
 
-  // API-key settings popover state.
-  const [showKeySettings, setShowKeySettings] = useState(false);
-  const [apiKeyDraft, setApiKeyDraft] = useState<string>(() => readApiKey());
-  const [hasApiKey, setHasApiKey] = useState<boolean>(
-    () => readApiKey().length > 0,
+  const isReadOnly = mode === 'running';
+  const [dropActive, setDropActive] = useState(false);
+  const [gatewayRevision, setGatewayRevision] = useState(0);
+  const availableGatewayOptions = useMemo(() => {
+    void gatewayRevision;
+    return listGatewayRunOptions();
+  }, [gatewayRevision]);
+  const noGatewayOptions = availableGatewayOptions.length === 0;
+  const gatewayOptions = useMemo<GatewayRunOption[]>(
+    () =>
+      noGatewayOptions
+        ? [
+            {
+              id: selectionKey(runSelection),
+              label: t(locale, 'settings.models.noRuntimeTitle'),
+              hint: t(locale, 'settings.tabs.models'),
+              selection: runSelection,
+              transport: 'simulator' as const,
+            },
+          ]
+        : availableGatewayOptions,
+    [noGatewayOptions, availableGatewayOptions, runSelection, locale],
+  );
+  const displayedRunSelection = bestAvailableSelection(
+    runSelection,
+    gatewayOptions,
   );
 
-  const isReadOnly = mode === 'running';
+  // Split the flat channel list into the three runtime categories (Claude Code
+  // / Codex / Gemini) so the dropdown renders a divider + header per group. The
+  // synthetic "no runtime" fallback stays ungrouped.
+  const groupedGatewayOptions = useMemo(() => {
+    if (noGatewayOptions) return gatewayOptions;
+    return [...gatewayOptions]
+      .sort(
+        (a, b) =>
+          adapterGroupRank(a.selection.adapter) -
+          adapterGroupRank(b.selection.adapter),
+      )
+      .map((option) => ({
+        ...option,
+        group: runtimeAdapterLabel(option.selection.adapter),
+      }));
+  }, [gatewayOptions, noGatewayOptions]);
+
+  // "Inherit global selection": when no explicit pin is stored, the composer
+  // follows the Settings-active provider. A sentinel option at the top of the
+  // dropdown represents this default state; picking a concrete channel pins it.
+  const isInheriting = useMemo(() => {
+    void gatewayRevision;
+    return !hasExplicitGatewayPin();
+  }, [gatewayRevision]);
+
+  const modelSelectOptions = useMemo<SelectOption[]>(() => {
+    if (noGatewayOptions) return groupedGatewayOptions;
+    const resolvedLabel = groupedGatewayOptions.find(
+      (option) => option.id === selectionKey(displayedRunSelection),
+    )?.label;
+    const inheritOption: SelectOption = {
+      id: INHERIT_SELECTION_ID,
+      label: t(locale, 'dock.inheritGlobal'),
+      hint: resolvedLabel,
+    };
+    return [inheritOption, ...groupedGatewayOptions];
+  }, [groupedGatewayOptions, noGatewayOptions, displayedRunSelection, locale]);
+
+  const modelSelectValue =
+    isInheriting && !noGatewayOptions
+      ? INHERIT_SELECTION_ID
+      : selectionKey(displayedRunSelection);
+
+  const modelStrategyOptions = useMemo<SelectOption[]>(
+    () => [
+      { id: 'inherit', label: t(locale, 'dock.modelStrategy.inherit') },
+      { id: 'smart', label: t(locale, 'dock.modelStrategy.smart') },
+      { id: 'prefer-better', label: t(locale, 'dock.modelStrategy.better') },
+      { id: 'prefer-cheaper', label: t(locale, 'dock.modelStrategy.cheaper') },
+    ],
+    [locale],
+  );
 
   const [height, setHeight] = useState<number>(
     () => loadDockHeight() ?? DEFAULT_DOCK_HEIGHT,
@@ -310,6 +442,73 @@ export default function AIDock() {
     () => loadPaneWidth(INPUT_WIDTH_KEY) ?? DEFAULT_INPUT_WIDTH,
   );
   const dockRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  useEffect(() => {
+    void primeCliRuntime().finally(() =>
+      setGatewayRevision((revision) => revision + 1),
+    );
+    const unsubscribeCli = subscribeCliRuntime(() =>
+      setGatewayRevision((revision) => revision + 1),
+    );
+    const onGatewayConfigChanged = () =>
+      setGatewayRevision((revision) => revision + 1);
+    window.addEventListener('owf:gateway-config-changed', onGatewayConfigChanged);
+    return () =>
+      {
+        unsubscribeCli();
+        window.removeEventListener(
+        'owf:gateway-config-changed',
+        onGatewayConfigChanged,
+        );
+      };
+  }, []);
+
+  const rememberSelection = useCallback(
+    (target: HTMLTextAreaElement | null = inputRef.current) => {
+      if (!target) return;
+      const max = draftRef.current.length;
+      selectionRef.current = {
+        start: clampSelection(target.selectionStart, max),
+        end: clampSelection(target.selectionEnd, max),
+      };
+    },
+    [],
+  );
+
+  const insertComposerText = useCallback(
+    (text: string, selection = selectionRef.current) => {
+      if (isReadOnly || !text) return;
+
+      const current = draftRef.current;
+      const start = clampSelection(selection.start, current.length);
+      const end = clampSelection(selection.end, current.length);
+      const next = current.slice(0, start) + text + current.slice(end);
+      const caret = start + text.length;
+
+      draftRef.current = next;
+      selectionRef.current = { start: caret, end: caret };
+      setComposerDraft(next);
+
+      window.requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
+    },
+    [isReadOnly, setComposerDraft],
+  );
+
+  const insertFilePaths = useCallback(
+    (paths: string[], selection = selectionRef.current) => {
+      insertComposerText(formatFilePathInsertion(paths), selection);
+    },
+    [insertComposerText],
+  );
 
   /** Clamp the input width to keep both panes usable within the dock. */
   const clampInputWidth = useCallback((w: number): number => {
@@ -330,11 +529,64 @@ export default function AIDock() {
     if (composerFocusVersion === lastComposerFocusVersion.current) return;
     lastComposerFocusVersion.current = composerFocusVersion;
     const el = inputRef.current;
-    if (!el || isReadOnly) return;
+    if (!el || !shouldRefocusComposerAfterAppend(mode)) return;
     el.focus();
     const end = el.value.length;
     el.setSelectionRange(end, end);
-  }, [composerFocusVersion, isReadOnly]);
+    selectionRef.current = { start: end, end };
+  }, [composerFocusVersion, mode]);
+
+  useEffect(() => {
+    if (!tauriAvailable()) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    const setup = async () => {
+      const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+      const dispose = await getCurrentWebview().onDragDropEvent((event) => {
+        if (disposed) return;
+        const payload = event.payload;
+        const el = inputRef.current;
+
+        if (payload.type === 'leave') {
+          setDropActive(false);
+          return;
+        }
+        if (!el || isReadOnly) {
+          setDropActive(false);
+          return;
+        }
+        if (payload.type === 'enter') {
+          setDropActive(pointInsideElement(payload.position, el));
+          return;
+        }
+        if (payload.type === 'over') {
+          setDropActive(pointInsideElement(payload.position, el));
+          return;
+        }
+        if (payload.type === 'drop') {
+          const inside = pointInsideElement(payload.position, el);
+          setDropActive(false);
+          if (inside) insertFilePaths(payload.paths);
+        }
+      });
+      if (disposed) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    };
+
+    void setup().catch(() => {
+      if (!disposed) setDropActive(false);
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [insertFilePaths, isReadOnly]);
 
   // Re-clamp the input width when the window (and thus the dock) resizes so
   // neither pane collapses below its minimum.
@@ -412,12 +664,15 @@ export default function AIDock() {
     if (!text) return;
     sendPrompt(text);
     setComposerDraft('');
+    draftRef.current = '';
+    selectionRef.current = { start: 0, end: 0 };
   };
 
-  const saveApiKey = () => {
-    writeApiKey(apiKeyDraft);
-    setHasApiKey(apiKeyDraft.trim().length > 0);
-    setShowKeySettings(false);
+  const addFiles = async () => {
+    if (isReadOnly) return;
+    rememberSelection();
+    const paths = await pickComposerFiles(t(locale, 'dock.addFileDialogTitle'));
+    if (paths?.length) insertFilePaths(paths);
   };
 
   return (
@@ -527,91 +782,39 @@ export default function AIDock() {
             {t(locale, 'dock.aiInput')}
             {isReadOnly ? t(locale, 'dock.readonlySuffix') : ''}
           </span>
-          <button
-            type="button"
-            onClick={() => {
-              setApiKeyDraft(readApiKey());
-              setShowKeySettings((v) => !v);
-            }}
-            title={
-              hasApiKey
-                ? t(locale, 'dock.apiKeyConfigured')
-                : t(locale, 'dock.apiKeyMissing')
-            }
-            className={
-              'rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider transition-colors ' +
-              (hasApiKey
-                ? 'border-accent-2/60 text-accent-2 hover:bg-accent-2/10'
-                : 'border-border text-fg-faint hover:border-accent/50 hover:text-accent')
-            }
-          >
-            {hasApiKey ? '⚙ key ✓' : '⚙ set key'}
-          </button>
         </header>
-
-        {/* API-key settings popover. Anchored to the input panel; only visible
-            when toggled. Keeps the key local to this device (localStorage). */}
-        {showKeySettings && (
-          <div className="absolute right-2 top-9 z-30 w-80 rounded-md border border-border bg-panel-2 p-3 shadow-lg">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="font-mono text-[10px] uppercase tracking-wider text-accent">
-                Anthropic API Key
-              </span>
-              <button
-                type="button"
-                onClick={() => setShowKeySettings(false)}
-                className="text-fg-faint hover:text-fg"
-                title={t(locale, 'common.close')}
-              >
-                ×
-              </button>
-            </div>
-            <input
-              type="password"
-              value={apiKeyDraft}
-              onChange={(e) => setApiKeyDraft(e.target.value)}
-              placeholder="sk-ant-..."
-              autoComplete="off"
-              spellCheck={false}
-              className="w-full rounded border border-border bg-bg px-2 py-1.5 font-mono text-xs text-fg outline-none focus:border-accent"
-            />
-            <p className="mt-2 text-[10px] leading-relaxed text-fg-faint">
-              {t(locale, 'dock.apiKeyHelp')} <code>{API_KEY_STORAGE}</code>
-            </p>
-            <div className="mt-2 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setApiKeyDraft('');
-                  writeApiKey('');
-                  setHasApiKey(false);
-                  setShowKeySettings(false);
-                }}
-                className="rounded border border-border px-2 py-1 text-[11px] text-fg-faint hover:border-accent-3/60 hover:text-accent-3"
-              >
-                {t(locale, 'common.clear')}
-              </button>
-              <button
-                type="button"
-                onClick={saveApiKey}
-                className="rounded bg-accent px-2.5 py-1 text-[11px] font-medium text-bg hover:opacity-90"
-              >
-                {t(locale, 'common.save')}
-              </button>
-            </div>
-          </div>
-        )}
 
         <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
           <textarea
             ref={inputRef}
             value={draft}
-            onChange={(e) => setComposerDraft(e.target.value)}
+            onChange={(e) => {
+              draftRef.current = e.target.value;
+              setComposerDraft(e.target.value);
+              rememberSelection(e.currentTarget);
+            }}
+            onClick={(e) => rememberSelection(e.currentTarget)}
+            onKeyUp={(e) => rememberSelection(e.currentTarget)}
+            onSelect={(e) => rememberSelection(e.currentTarget)}
+            onFocus={(e) => rememberSelection(e.currentTarget)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && e.ctrlKey) {
                 e.preventDefault();
                 submit();
               }
+            }}
+            onDragOver={(e) => {
+              if (isReadOnly || tauriAvailable()) return;
+              e.preventDefault();
+              setDropActive(true);
+            }}
+            onDragLeave={() => setDropActive(false)}
+            onDrop={(e) => {
+              if (isReadOnly || tauriAvailable()) return;
+              e.preventDefault();
+              setDropActive(false);
+              rememberSelection(e.currentTarget);
+              insertFilePaths(pathsFromDataTransfer(e.dataTransfer));
             }}
             readOnly={isReadOnly}
             disabled={isReadOnly}
@@ -621,27 +824,65 @@ export default function AIDock() {
                 : t(locale, 'dock.placeholder')
             }
             className={
-              'min-h-0 flex-1 resize-none rounded-md border border-border bg-bg p-2.5 text-sm leading-relaxed text-fg outline-none transition-colors placeholder:text-fg-faint focus:border-accent ' +
+              'min-h-0 flex-1 resize-none rounded-md border p-2.5 text-sm leading-relaxed text-fg outline-none transition-colors placeholder:text-fg-faint focus:border-accent ' +
+              (dropActive ? 'border-accent bg-accent/5 ' : 'border-border bg-bg ') +
               (isReadOnly ? 'cursor-not-allowed opacity-60' : '')
             }
           />
 
-          {/* Tool row: permission · (spacer) · model · send */}
-          <div className="flex items-center gap-2">
+          {/* Tool row: add file · permission · global run selection · send */}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                void addFiles();
+              }}
+              disabled={isReadOnly}
+              title={
+                isReadOnly
+                  ? t(locale, 'dock.inputLockedTitle')
+                  : t(locale, 'dock.addFileTitle')
+              }
+              aria-label={t(locale, 'dock.addFileTitle')}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Plus size={15} strokeWidth={2} />
+            </button>
             <Select
               title={t(locale, 'dock.permissionTitle')}
               options={permissionOptions.map((opt) => localizeSelectOption(opt, locale))}
               value={composer.permission}
               onChange={(id) => setComposer({ permission: id })}
+              disabled={isReadOnly}
               icon="⚠"
             />
-            <div className="min-w-0 flex-1" />
             <Select
               title={t(locale, 'dock.modelTitle')}
-              options={modelOptions.map((opt) => localizeSelectOption(opt, locale))}
-              value={composer.model}
-              onChange={(id) => setComposer({ model: id })}
+              options={modelSelectOptions}
+              value={modelSelectValue}
+              onChange={(id) => {
+                if (id === INHERIT_SELECTION_ID) {
+                  clearGlobalRunSelection();
+                  return;
+                }
+                const selection = selectionFromKey(id);
+                if (selection) setGlobalRunSelection(selection);
+              }}
+              disabled={isReadOnly || noGatewayOptions}
+              className="min-w-0"
+              icon="▣"
             />
+            <Select
+              title={t(locale, 'dock.modelStrategyTitle')}
+              options={modelStrategyOptions}
+              value={composer.modelStrategy}
+              onChange={(id) => setComposer({ modelStrategy: id as ModelStrategy })}
+              disabled={isReadOnly}
+              className="min-w-0"
+              icon="🧠"
+            />
+            <div className="min-w-0 flex-1" />
             <button
               type="button"
               onClick={submit}

@@ -4,6 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
 
+mod cc_switch_import;
+mod cli_runtime;
 mod history;
 
 /// Windows CreateProcess flag: don't allocate a console window for the child.
@@ -112,15 +114,6 @@ fn unregister_ai_cli(run_id: &str) {
 ///
 /// Unknown adapters fall back to the literal id so a custom CLI on PATH can
 /// still be targeted.
-fn adapter_binary(adapter: &str) -> &str {
-    match adapter {
-        "claude-code" | "claude" => "claude",
-        "codex" => "codex",
-        "gemini" => "gemini",
-        other => other,
-    }
-}
-
 /// Best-effort self-heal for a bun-installed `claude` whose binary an
 /// interrupted auto-update renamed to `claude.exe.old.<timestamp>` (leaving the
 /// CLI broken: "bin executable does not exist on disk / corrupted node_modules").
@@ -197,6 +190,164 @@ fn temp_output_path(prefix: &str, ext: &str) -> std::path::PathBuf {
     path
 }
 
+fn spawn_cli_command(binary: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let path = std::path::Path::new(binary);
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("cmd" | "bat")) {
+            let mut cmd = Command::new("cmd");
+            hide_console(&mut cmd);
+            cmd.arg("/C").arg(binary);
+            return cmd;
+        }
+    }
+
+    let mut cmd = Command::new(binary);
+    hide_console(&mut cmd);
+    cmd
+}
+
+/// Optional launch shell that wraps an AI CLI invocation (see `shellConfig.ts`).
+/// `kind` is one of `direct` | `cmd` | `powershell` | `custom`; `path` is the
+/// shell executable for `custom` (and optionally `powershell`).
+#[derive(serde::Deserialize)]
+pub struct ShellSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// PowerShell single-quoted literal (double any embedded single quotes).
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Direct spawn: the historical behaviour (auto `cmd /C` for `.cmd/.bat`).
+fn direct_command(binary: &str, args: &[String]) -> Command {
+    let mut cmd = spawn_cli_command(binary);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd
+}
+
+/// Build the command that launches `binary` with `args`, optionally wrapped in
+/// a user-selected launch shell so the AI CLI inherits that shell's
+/// environment/PATH. `None`/`direct` preserves the historical direct spawn.
+///
+/// POSIX shells pass argv natively via `-lc 'exec "$@"'` (no re-quoting, so
+/// spaces/special chars are safe). Windows cmd/PowerShell quoting is
+/// best-effort. Env vars / working dir / stdio are applied by the caller to the
+/// returned (outer) command and inherited by the wrapped child.
+fn build_launch_command(binary: &str, args: &[String], shell: &Option<ShellSpec>) -> Command {
+    let kind = shell.as_ref().map(|s| s.kind.as_str()).unwrap_or("direct");
+    match kind {
+        "cmd" => {
+            let mut cmd = Command::new("cmd");
+            hide_console(&mut cmd);
+            cmd.arg("/C").arg(binary);
+            for a in args {
+                cmd.arg(a);
+            }
+            cmd
+        }
+        "powershell" => {
+            let exe = shell
+                .as_ref()
+                .and_then(|s| s.path.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .unwrap_or("powershell");
+            powershell_command(exe, binary, args)
+        }
+        "custom" => {
+            let path = shell
+                .as_ref()
+                .and_then(|s| s.path.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            match path {
+                None => direct_command(binary, args),
+                Some(path) => {
+                    let lower = path.to_ascii_lowercase();
+                    if lower.ends_with("powershell.exe")
+                        || lower.ends_with("pwsh.exe")
+                        || lower.ends_with("powershell")
+                        || lower.ends_with("pwsh")
+                    {
+                        powershell_command(path, binary, args)
+                    } else if lower.ends_with("cmd.exe") || lower.ends_with("cmd") {
+                        let mut cmd = Command::new(path);
+                        hide_console(&mut cmd);
+                        cmd.arg("/C").arg(binary);
+                        for a in args {
+                            cmd.arg(a);
+                        }
+                        cmd
+                    } else {
+                        // Treat as a POSIX login shell: pass argv natively.
+                        let mut cmd = Command::new(path);
+                        hide_console(&mut cmd);
+                        cmd.arg("-lc")
+                            .arg(r#"exec "$@""#)
+                            .arg("owf-shell")
+                            .arg(binary);
+                        for a in args {
+                            cmd.arg(a);
+                        }
+                        cmd
+                    }
+                }
+            }
+        }
+        _ => direct_command(binary, args),
+    }
+}
+
+fn powershell_command(exe: &str, binary: &str, args: &[String]) -> Command {
+    let mut cmd = Command::new(exe);
+    hide_console(&mut cmd);
+    let mut script = String::from("& ");
+    script.push_str(&ps_quote(binary));
+    for a in args {
+        script.push(' ');
+        script.push_str(&ps_quote(a));
+    }
+    cmd.arg("-NoProfile").arg("-Command").arg(script);
+    cmd
+}
+
+/// Validate a user-selected *launch shell* path. Unlike `validate_cli_path`
+/// this intentionally allows shells. Returns the normalized absolute path.
+#[tauri::command]
+fn validate_shell_path(path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("请选择 Shell 可执行文件。".to_string());
+    }
+    let p = std::path::Path::new(trimmed);
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|_| "找不到该文件，请重新选择。".to_string())?;
+    if !canonical.is_file() {
+        return Err("请选择一个可执行文件。".to_string());
+    }
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn scan_model_clis() -> cli_runtime::CliScanResult {
+    cli_runtime::scan_model_clis()
+}
+
+#[tauri::command]
+fn validate_cli_path(path: String) -> Result<cli_runtime::CliPathValidation, String> {
+    cli_runtime::validate_cli_path(&path)
+}
+
 /// Run an emitted workflow script through the mapped local CLI.
 ///
 /// Async: the blocking process spawn/wait runs on a blocking thread via
@@ -205,16 +356,29 @@ fn temp_output_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 /// binary (`claude` / `codex` / `gemini`), waits for it, and returns a combined
 /// stdout/stderr summary. The script is materialised to a temp file.
 #[tauri::command]
-async fn run_workflow(script: String, adapter: String) -> Result<String, String> {
+async fn run_workflow(
+    script: String,
+    adapter: String,
+    cli_command: Option<String>,
+    shell: Option<ShellSpec>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let binary = adapter_binary(&adapter);
+        let binary = match cli_command
+            .as_deref()
+            .map(cli_runtime::normalize_cli_command_override)
+            .transpose()?
+        {
+            Some(binary) => binary,
+            None => cli_runtime::adapter_binary(&adapter).to_string(),
+        };
         let script_path = write_temp_script(&script)?;
 
-        let mut cmd = Command::new(binary);
-        hide_console(&mut cmd); // no popup terminal window on Windows
-        let output = cmd.arg(&script_path).output().map_err(|e| {
-            format!("启动 CLI \"{binary}\" 失败: {e}（请确认它已安装并在 PATH 中）")
-        })?;
+        // no popup terminal window on Windows; optionally wrapped in a shell.
+        let args = vec![script_path.to_string_lossy().to_string()];
+        let mut cmd = build_launch_command(&binary, &args, &shell);
+        let output = cmd
+            .output()
+            .map_err(|e| format!("无法启动 CLI \"{binary}\"：请确认它已安装并在 PATH 中。({e})"))?;
 
         // Best-effort cleanup; ignore failures.
         let _ = std::fs::remove_file(&script_path);
@@ -252,13 +416,15 @@ const AI_EDIT_SYSTEM: &str = "You are a workflow graph editor for OpenWorkflow. 
 
 The IRGraph compiles to a real Claude Code workflow script, so use these exact node shapes:
 - Envelope: {version, meta, nodes, edges, layout?}.
-- meta: {name, description?, adapter?, schemaDefs?}. schemaDefs maps a schema identifier name to its JS object source, e.g. {\"REVIEW\":\"{ findings: [] }\"}.
+- meta: {name, description?, adapter?, gateway?:{defaults?:{adapter, modelClass, providerId?, channelId?}}, schemaDefs?}. schemaDefs maps a schema identifier name to its JS object source, e.g. {\"REVIEW\":\"{ findings: [] }\"}.
 - Each node: {id, type, parent?, label?, binding?, params}. type is one of start|end|agent|parallel|pipeline|phase|branch|loop|workflow|log|variable|codeblock. `parent` is the id of a containing branch/loop node (omit for the top level). `binding` is the JS variable name (optional).
-- agent.params: {prompt, label?, agentType?, model?, schema?, isolation?, phase?}. Use `agentType` (NOT `agent`) for a sub-agent type like 'explore'/'verifier'. `schema` is a bare identifier NAME (a key of meta.schemaDefs), e.g. \"REVIEW\". model is haiku|sonnet|opus.
+- agent.params: {prompt, label?, agentType?, model?, gateway?, schema?, isolation?, phase?}. Use `agentType` (NOT `agent`) for a sub-agent type like 'explore'/'verifier'. `schema` is a bare identifier NAME (a key of meta.schemaDefs), e.g. \"REVIEW\". model is haiku|sonnet|opus. New nodes should inherit meta.gateway.defaults instead of writing model:'sonnet'.
 - parallel.params: {branches: [{prompt, agentType?, model?, schema?, label?}]} — each branch becomes a () => agent(...) thunk.
 - pipeline.params: {items, stages: [{prompt, agentType?, schema?}]} — items is a JS expression naming the input array (e.g. \"files\"); each stage becomes a (prev, item, i) => agent(...) callback.
 - branch.params: {condition} and loop.params: {condition} (a JS boolean expression). Their child nodes are separate nodes carrying parent = the branch/loop id.
 - variable.params: {name, value, raw?}. log.params: {message}. workflow.params: {name}. codeblock.params: {code}.
+
+Before drafting, estimate the task's complexity from the instruction and the current graph. Match graph granularity to task complexity: use the smallest workflow that fully covers the request, keep simple edits minimal, and only expand into branches, pipelines, verification, fallback, or extra coordination when there are real dependencies, independent subproblems, or meaningful risk. Treat completeness as proportional to risk and ambiguity, not maximal by default.
 
 Edges: {id, from:{node,port}, to:{node,port}, kind} where kind is 'exec' or 'data'. Wire an exec spine start -> ... -> end among top-level siblings; a branch/loop connects to its first child via an exec edge (kind 'exec') and children chain child->child. Express data flow as 'data'-kind edges from a producer node to a consumer node — do NOT inline ${...} yourself; the emitter does that. Keep node ids stable when editing existing nodes.";
 
@@ -360,6 +526,19 @@ fn ai_cli_timeout_secs() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|secs| *secs >= 60)
         .unwrap_or(DEFAULT_AI_CLI_TIMEOUT_SECS)
+}
+
+/// Whether to load the machine's global MCP servers for each workflow node.
+/// Off by default (each cold `claude -p` spawn skips MCP init, saving ~2-4s of
+/// startup per node); set OPENWORKFLOW_ENABLE_MCP=1 to opt back in for
+/// workflows whose nodes actually call an MCP tool.
+fn mcp_enabled() -> bool {
+    std::env::var("OPENWORKFLOW_ENABLE_MCP")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 /// Read the no-progress timeout override. Set to 0 to disable idle detection.
@@ -564,20 +743,6 @@ fn codex_last_message_ready(path: &std::path::Path) -> bool {
 
 /// The UI currently exposes Claude model tiers (`haiku` / `sonnet` / `opus`).
 /// Passing those through to Codex would fail, so only forward explicit non-
-/// Claude model ids to adapters that can reasonably understand them.
-fn should_pass_model(binary: &str, model: &str) -> bool {
-    let m = model.trim();
-    if m.is_empty() {
-        return false;
-    }
-    if binary == "codex" || binary == "gemini" {
-        let lower = m.to_ascii_lowercase();
-        return !matches!(lower.as_str(), "haiku" | "sonnet" | "opus")
-            && !lower.starts_with("claude-");
-    }
-    true
-}
-
 #[tauri::command]
 fn cancel_ai_cli(run_id: String) -> Result<(), String> {
     if let Some(pid) = mark_ai_cli_cancelled(&run_id) {
@@ -601,15 +766,33 @@ fn cancel_ai_cli(run_id: String) -> Result<(), String> {
 async fn ai_cli(
     prompt: String,
     adapter: String,
+    cli_command: Option<String>,
     model: Option<String>,
     cwd: Option<String>,
     permission: Option<String>,
+    env_vars: Option<HashMap<String, String>>,
     run_id: String,
+    // Optional Claude session continuity (claude only): when `session_id` is set
+    // and `resume` is false the run *creates* that session (`--session-id`); when
+    // `resume` is true it *continues* it (`--resume`), inheriting the prior
+    // call's full context so a downstream step needn't re-explore the project.
+    session_id: Option<String>,
+    resume: Option<bool>,
+    // Optional launch shell wrapping (from the General settings "启动 Shell").
+    shell: Option<ShellSpec>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let binary = adapter_binary(&adapter);
-        let is_codex = binary == "codex";
+        let binary = match cli_command
+            .as_deref()
+            .map(cli_runtime::normalize_cli_command_override)
+            .transpose()?
+        {
+            Some(binary) => binary,
+            None => cli_runtime::adapter_binary(&adapter).to_string(),
+        };
+        let protocol = cli_runtime::adapter_protocol(&adapter);
+        let is_codex = protocol == "codex";
         let codex_last_message_path = if is_codex {
             Some(temp_output_path("openworkflow-codex-last", "txt"))
         } else {
@@ -617,12 +800,17 @@ async fn ai_cli(
         };
 
         // Self-heal a claude binary that an interrupted auto-update corrupted.
-        if binary == "claude" {
+        if protocol == "claude" {
             repair_claude_binary();
         }
 
-        let mut cmd = Command::new(binary);
-        hide_console(&mut cmd); // no popup terminal window on Windows
+        // Collect the program arguments first so the whole invocation can be
+        // optionally wrapped in a launch shell (see build_launch_command). Env
+        // vars and the working directory are applied to the final (outer)
+        // command below and inherited by any wrapped child.
+        let mut args: Vec<String> = Vec::new();
+        let mut workdir: Option<std::path::PathBuf> = None;
+        let mut disable_autoupdater = false;
 
         if is_codex {
             // Codex's non-interactive surface is `codex exec`, and its JSON
@@ -630,58 +818,92 @@ async fn ai_cli(
             // `--output-format`, which was the source of the reported failure.
             match permission.as_deref().unwrap_or("full") {
                 "readonly" => {
-                    cmd.arg("-a").arg("never");
+                    args.push("-a".into());
+                    args.push("never".into());
                 }
                 "ask" => {
-                    cmd.arg("-a").arg("on-request");
+                    args.push("-a".into());
+                    args.push("on-request".into());
                 }
                 _ => {}
             }
 
-            cmd.arg("exec").arg("--json").arg("--skip-git-repo-check");
+            args.push("exec".into());
+            args.push("--json".into());
+            args.push("--skip-git-repo-check".into());
 
             match permission.as_deref().unwrap_or("full") {
                 "readonly" => {
-                    cmd.arg("--sandbox").arg("read-only");
+                    args.push("--sandbox".into());
+                    args.push("read-only".into());
                 }
                 "ask" => {
-                    cmd.arg("--sandbox").arg("workspace-write");
+                    args.push("--sandbox".into());
+                    args.push("workspace-write".into());
                 }
                 _ => {
-                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                    args.push("--dangerously-bypass-approvals-and-sandbox".into());
                 }
             }
 
-            if let Some(m) = model.as_deref().filter(|m| should_pass_model(binary, m)) {
-                cmd.arg("--model").arg(m);
+            if let Some(m) = model.as_deref().filter(|m| cli_runtime::should_pass_model(&adapter, m)) {
+                args.push("--model".into());
+                args.push(m.to_string());
             }
 
             if let Some(dir) = cwd.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
                 let p = std::path::Path::new(dir);
                 if p.is_dir() {
-                    cmd.current_dir(p);
-                    cmd.arg("-C").arg(dir);
+                    workdir = Some(p.to_path_buf());
+                    args.push("-C".into());
+                    args.push(dir.to_string());
                 }
             }
 
             if let Some(path) = codex_last_message_path.as_ref() {
-                cmd.arg("-o").arg(path);
+                args.push("-o".into());
+                args.push(path.to_string_lossy().to_string());
             }
-            cmd.arg("-");
+            args.push("-".into());
         } else {
             // The prompt is fed via stdin (not a positional arg) so large
             // aggregation prompts can't hit the OS command-line length limit
             // (~32KB on Windows), which would stall the final "summary" node.
-            cmd.arg("-p")
-                .arg("--output-format")
-                .arg("stream-json")
-                .arg("--verbose")
-                // Don't let the CLI auto-update mid-run: an interrupted update
-                // can leave the binary corrupted ("bin executable does not
-                // exist").
-                .env("DISABLE_AUTOUPDATER", "1");
-            if let Some(m) = model.as_deref().filter(|m| should_pass_model(binary, m)) {
-                cmd.arg("--model").arg(m);
+            args.push("-p".into());
+            args.push("--output-format".into());
+            args.push("stream-json".into());
+            args.push("--verbose".into());
+            // Don't let the CLI auto-update mid-run: an interrupted update can
+            // leave the binary corrupted ("bin executable does not exist").
+            disable_autoupdater = true;
+
+            // Skip loading the machine's global MCP servers for each node. A
+            // workflow node is a short, bounded task that almost never needs
+            // pencil/lark/etc., yet initialising every configured MCP server
+            // costs ~2-4s of cold-start *per node* (measured) — paid N times
+            // for an N-node run, while a single interactive session pays it
+            // once. `--strict-mcp-config` with no `--mcp-config` means "use
+            // only servers from the (absent) config", i.e. none. Opt back in
+            // with OPENWORKFLOW_ENABLE_MCP=1 for workflows that genuinely call
+            // an MCP tool.
+            if !mcp_enabled() {
+                args.push("--strict-mcp-config".into());
+            }
+
+            // Session continuity: continue a prior session (warm context) or
+            // create a known one so a later step can continue it.
+            if let Some(sid) = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if resume.unwrap_or(false) {
+                    args.push("--resume".into());
+                    args.push(sid.to_string());
+                } else {
+                    args.push("--session-id".into());
+                    args.push(sid.to_string());
+                }
+            }
+            if let Some(m) = model.as_deref().filter(|m| cli_runtime::should_pass_model(&adapter, m)) {
+                args.push("--model".into());
+                args.push(m.to_string());
             }
 
             // Permission mode (from the AIDock dropdown) so a headless run can
@@ -691,11 +913,12 @@ async fn ai_cli(
             //   ask       -> default (may print a permission question)
             match permission.as_deref().unwrap_or("full") {
                 "readonly" => {
-                    cmd.arg("--permission-mode").arg("plan");
+                    args.push("--permission-mode".into());
+                    args.push("plan".into());
                 }
                 "ask" => {}
                 _ => {
-                    cmd.arg("--dangerously-skip-permissions");
+                    args.push("--dangerously-skip-permissions".into());
                 }
             }
 
@@ -704,10 +927,26 @@ async fn ai_cli(
             if let Some(dir) = cwd.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
                 let p = std::path::Path::new(dir);
                 if p.is_dir() {
-                    cmd.current_dir(p);
-                    cmd.arg("--add-dir").arg(dir);
+                    workdir = Some(p.to_path_buf());
+                    args.push("--add-dir".into());
+                    args.push(dir.to_string());
                 }
             }
+        }
+
+        let mut cmd = build_launch_command(&binary, &args, &shell);
+        if let Some(env_vars) = env_vars.as_ref() {
+            for (key, value) in env_vars {
+                if !key.trim().is_empty() {
+                    cmd.env(key, value);
+                }
+            }
+        }
+        if disable_autoupdater {
+            cmd.env("DISABLE_AUTOUPDATER", "1");
+        }
+        if let Some(dir) = workdir.as_ref() {
+            cmd.current_dir(dir);
         }
 
         let mut child = cmd
@@ -716,7 +955,7 @@ async fn ai_cli(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                format!("启动 CLI \"{binary}\" 失败: {e}（请确认它已安装并在 PATH 中）")
+                format!("无法启动 CLI \"{binary}\"：请确认它已安装并在 PATH 中。({e})")
             })?;
         register_ai_cli(&run_id, child.id());
         let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
@@ -1049,11 +1288,15 @@ pub fn run() {
             run_workflow,
             ai_cli,
             cancel_ai_cli,
+            scan_model_clis,
+            validate_cli_path,
+            validate_shell_path,
             history::history_root,
             history::history_read_json,
             history::history_write_json,
             history::history_remove,
-            history::history_list_dir
+            history::history_list_dir,
+            cc_switch_import::import_cc_switch_claude
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

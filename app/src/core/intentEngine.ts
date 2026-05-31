@@ -36,7 +36,7 @@ const NODE_DEFAULTS: Record<
 > = {
   start: { label: 'Start', params: {} },
   end: { label: 'End', params: {} },
-  agent: { label: '新 Agent', params: { model: 'sonnet', prompt: '' } },
+  agent: { label: '新 Agent', params: { prompt: '' } },
   parallel: { label: '并行', params: { branches: [] } },
   pipeline: { label: '流水线', params: { items: 'args', stages: [] } },
   phase: { label: '阶段', params: { title: '阶段' } },

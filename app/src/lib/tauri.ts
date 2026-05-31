@@ -1,4 +1,5 @@
 import type { IRGraph } from '@/core/ir';
+import { runShellPayload } from '@/lib/shellConfig';
 
 /**
  * CONTRACT: thin, browser-safe bridge to the Tauri Rust backend.
@@ -26,6 +27,34 @@ export type WorkflowNodeState = 'idle' | 'running' | 'success' | 'error';
 export interface WorkflowNodeEvent {
   nodeId: string;
   state: WorkflowNodeState;
+}
+
+export type CliPlatform = 'windows' | 'macos' | 'linux';
+
+export interface ModelCliCandidate {
+  adapter: string;
+  command: string;
+  path?: string | null;
+  source: string;
+  available: boolean;
+  status: string;
+  hint?: string | null;
+  error?: string | null;
+  platform: CliPlatform;
+}
+
+export interface ModelCliScanResult {
+  scannedAtMs: number;
+  platform: CliPlatform;
+  candidates: ModelCliCandidate[];
+  error?: string | null;
+}
+
+export interface CliPathValidation {
+  path: string;
+  normalizedPath: string;
+  platform: CliPlatform;
+  fileName: string;
 }
 
 /** Disposer returned by the event listeners. */
@@ -99,14 +128,26 @@ export async function aiEditGraph(
 export interface CliOpts {
   /** Model tier for the CLI (`--model`), e.g. 'haiku' | 'sonnet' | 'opus'. */
   model?: string;
+  /** Resolved CLI executable/path selected in Settings. Omit for adapter default. */
+  cliCommand?: string;
   /** Working directory for the agent (the run's workspace). */
   cwd?: string;
   /** Permission mode: 'full' | 'readonly' | 'ask' (from the AIDock dropdown). */
   permission?: string;
+  /** Per-call environment overrides used by the model gateway route. */
+  env?: Record<string, string>;
   /** Stable id used to stream progress and cancel the process from the UI. */
   runId?: string;
   /** Live progress callback — receives streamed text/tool-use chunks. */
   onProgress?: (text: string) => void;
+  /**
+   * Claude session id for context continuity (claude adapter only). With
+   * `resume: false` the call creates this session; with `resume: true` it
+   * continues it, inheriting the earlier call's warm context.
+   */
+  sessionId?: string;
+  /** Continue `sessionId` instead of creating it. */
+  resume?: boolean;
 }
 
 let __cliSeq = 0;
@@ -140,10 +181,15 @@ export async function aiEditViaCli(
     return await invoke<string>('ai_cli', {
       prompt,
       adapter,
+      cliCommand: opts.cliCommand ?? null,
       model: opts.model ?? null,
       cwd: opts.cwd ?? null,
       permission: opts.permission ?? null,
+      envVars: opts.env ?? null,
       runId,
+      sessionId: opts.sessionId ?? null,
+      resume: opts.resume ?? null,
+      shell: runShellPayload(),
     });
   } finally {
     unlisten?.();
@@ -165,12 +211,93 @@ export async function cancelAiCli(runId: string): Promise<void> {
 export async function runWorkflow(
   script: string,
   adapter: string,
+  cliCommand?: string,
 ): Promise<string> {
   if (!tauriAvailable()) {
     throw new Error('NO_BACKEND');
   }
   const invoke = await getInvoke();
-  return invoke<string>('run_workflow', { script, adapter });
+  return invoke<string>('run_workflow', {
+    script,
+    adapter,
+    cliCommand: cliCommand ?? null,
+    shell: runShellPayload(),
+  });
+}
+
+/** Scan PATH for supported local model CLIs. Desktop-only. */
+export async function scanModelClis(): Promise<ModelCliScanResult> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<ModelCliScanResult>('scan_model_clis');
+}
+
+/** Validate a user-selected CLI executable path. Desktop-only. */
+export async function validateCliPath(path: string): Promise<CliPathValidation> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<CliPathValidation>('validate_cli_path', { path });
+}
+
+/**
+ * Validate a user-selected *launch shell* executable path. Unlike
+ * {@link validateCliPath} this intentionally ALLOWS shells (cmd/powershell/
+ * sh/zsh/...), which the model-CLI validator rejects. Returns the normalized
+ * absolute path. Desktop-only.
+ */
+export async function validateShellPath(path: string): Promise<string> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<string>('validate_shell_path', { path });
+}
+
+/** Provider runtime family recovered from cc-switch (maps to ProviderKind). */
+export type ImportedProviderKind = 'anthropic' | 'codex' | 'gemini';
+
+/** One provider recovered from the local cc-switch database. */
+export interface ImportedProvider {
+  /** Runtime family: claude rows → 'anthropic', plus 'codex' / 'gemini'. */
+  kind: ImportedProviderKind;
+  name: string;
+  apiKey: string;
+  baseUrl: string;
+  model?: string;
+  /** The cc-switch row id (used to match the active one). */
+  ccId: string;
+}
+
+/** Currently-active cc-switch provider id per runtime family. */
+export interface CcSwitchActivePointers {
+  anthropic?: string;
+  codex?: string;
+  gemini?: string;
+}
+
+/** Result of importing providers from cc-switch. */
+export interface CcSwitchImportResult {
+  providers: ImportedProvider[];
+  /** cc-switch row ids that are currently active there, per family. */
+  active?: CcSwitchActivePointers;
+}
+
+/**
+ * Import all supported providers (Claude / Codex / Gemini) from the local
+ * cc-switch SQLite database.
+ * Desktop-only: throws Error('NO_BACKEND') outside the Tauri shell.
+ */
+export async function importCcSwitchClaude(): Promise<CcSwitchImportResult> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  const json = await invoke<string>('import_cc_switch_claude');
+  return JSON.parse(json) as CcSwitchImportResult;
 }
 
 /**

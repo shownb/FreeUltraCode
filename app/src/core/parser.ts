@@ -9,11 +9,13 @@ import type {
 import {
   DATA,
   EXEC,
+  type GatewaySelection,
   type IRAgentSpec,
   type IREdge,
   type IRGraph,
   type IRNode,
   type IRMeta,
+  type NodeGatewayOverride,
   type NodeType,
 } from './ir';
 import { CTX_OPEN, CTX_CLOSE } from './emitter';
@@ -371,10 +373,12 @@ function handleCall(
 function finalizeCallNode(
   node: IRNode,
   call: CallExpression,
-  _stmt: BabelNode,
+  stmt: BabelNode,
   bindName: string | null,
   ctx: ParseContext,
 ): void {
+  const gateway = readRouteAnnotation(ctx.src, stmt);
+  if (gateway) node.params = { ...node.params, gateway };
   if (bindName) node.binding = bindName;
   ctx.addNode(node, { executable: true });
   ctx.bind(bindName, node.id);
@@ -395,6 +399,10 @@ function extractAgentSpec(call: CallExpression): IRAgentSpec {
       if (prop.type !== 'ObjectProperty' || prop.key.type !== 'Identifier') continue;
       const key = prop.key.name;
       if (key === 'from') continue;
+      if (key === 'gateway' && prop.value.type === 'ObjectExpression') {
+        spec.gateway = readGatewayOverrideObject(prop.value);
+        continue;
+      }
       const value = readOptValue(prop.value);
       if (value == null) continue;
       switch (key) {
@@ -441,6 +449,7 @@ function specToParams(spec: IRAgentSpec): Record<string, unknown> {
   const params: Record<string, unknown> = { prompt: spec.prompt };
   if (spec.agentType) params.agentType = spec.agentType;
   if (spec.model) params.model = spec.model;
+  if (spec.gateway) params.gateway = spec.gateway;
   if (spec.schema) params.schema = spec.schema;
   if (spec.label) params.label = spec.label;
   if (spec.isolation) params.isolation = spec.isolation;
@@ -528,8 +537,60 @@ function applyMeta(obj: ObjectExpression, ctx: ParseContext): void {
       ctx.meta.description = prop.value.value;
     else if (key === 'adapter' && isStringLiteral(prop.value))
       ctx.meta.adapter = prop.value.value;
+    else if (key === 'gateway' && prop.value.type === 'ObjectExpression') {
+      const defaults = readGatewayDefaults(prop.value);
+      if (defaults) {
+        ctx.meta.gateway = { ...(ctx.meta.gateway ?? {}), defaults };
+        if (!ctx.meta.adapter && defaults.adapter) ctx.meta.adapter = defaults.adapter;
+      }
+    }
     // `phases` is reconstructed from phase() calls, so it is ignored here.
   }
+}
+
+function readGatewayDefaults(obj: ObjectExpression): GatewaySelection | null {
+  for (const prop of obj.properties) {
+    if (
+      prop.type === 'ObjectProperty' &&
+      prop.key.type === 'Identifier' &&
+      prop.key.name === 'defaults' &&
+      prop.value.type === 'ObjectExpression'
+    ) {
+      const selection = readGatewaySelectionObject(prop.value);
+      return selection.modelClass ? selection : null;
+    }
+  }
+  return null;
+}
+
+function readGatewaySelectionObject(obj: ObjectExpression): GatewaySelection {
+  const out: GatewaySelection = {
+    adapter: 'claude-code',
+    modelClass: 'sonnet',
+  };
+  for (const prop of obj.properties) {
+    if (prop.type !== 'ObjectProperty' || prop.key.type !== 'Identifier') continue;
+    const value = readOptValue(prop.value);
+    if (!value) continue;
+    if (prop.key.name === 'adapter') out.adapter = value;
+    else if (prop.key.name === 'modelClass') out.modelClass = value;
+    else if (prop.key.name === 'providerId') out.providerId = value;
+    else if (prop.key.name === 'channelId') out.channelId = value;
+  }
+  return out;
+}
+
+function readGatewayOverrideObject(obj: ObjectExpression): NodeGatewayOverride {
+  const out: NodeGatewayOverride = {};
+  for (const prop of obj.properties) {
+    if (prop.type !== 'ObjectProperty' || prop.key.type !== 'Identifier') continue;
+    const value = readOptValue(prop.value);
+    if (!value) continue;
+    if (prop.key.name === 'modelClass') out.modelClass = value;
+    else if (prop.key.name === 'providerId') out.providerId = value;
+    else if (prop.key.name === 'channelId') out.channelId = value;
+  }
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -692,6 +753,37 @@ function readAnnotation(src: string, node: BabelNode, tag: string): string | nul
   for (const line of [endLine, startLine]) {
     const m = re.exec(line);
     if (m) return m[1];
+  }
+  return null;
+}
+
+function readRouteAnnotation(
+  src: string,
+  node: BabelNode,
+): NodeGatewayOverride | null {
+  const lineAt = (pos: number): string => {
+    const lineStart = src.lastIndexOf('\n', pos - 1) + 1;
+    const lineEnd = src.indexOf('\n', pos);
+    return src.slice(lineStart, lineEnd === -1 ? undefined : lineEnd);
+  };
+  const lines = [lineAt(node.end ?? 0), lineAt(node.start ?? 0)];
+  for (const line of lines) {
+    const match = /\/\/ @route\s+(.+)$/u.exec(line);
+    if (!match) continue;
+    const out: NodeGatewayOverride = {};
+    for (const token of match[1].trim().split(/\s+/)) {
+      const [rawKey, ...valueParts] = token.split('=');
+      const value = valueParts.join('=').trim();
+      if (!value) continue;
+      if (rawKey === 'provider' || rawKey === 'providerId') {
+        out.providerId = value;
+      } else if (rawKey === 'channel' || rawKey === 'channelId') {
+        out.channelId = value;
+      } else if (rawKey === 'modelClass') {
+        out.modelClass = value;
+      }
+    }
+    return Object.keys(out).length > 0 ? out : null;
   }
   return null;
 }

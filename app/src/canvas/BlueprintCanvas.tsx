@@ -17,8 +17,10 @@ import {
   type OnNodeDrag,
   type OnNodesDelete,
   type OnEdgesDelete,
+  type Viewport,
 } from '@xyflow/react';
-import { useStore } from '@/store/useStore';
+import { useStore, workflowReadOnlyReason } from '@/store/useStore';
+import type { CanvasViewport } from '@/store/types';
 import { DATA, EXEC, type NodeType, type PinKind } from '@/core/ir';
 import { irToFlow, type FlowEdge, type FlowNodeData } from './irToFlow';
 import AgentNode from './nodes/AgentNode';
@@ -43,11 +45,11 @@ import { t, type Locale } from '@/lib/i18n';
  * Semantic branch/loop children are rendered as independent nodes rather than
  * React Flow sub-flow children, so they can be inspected and dragged freely.
  *
- * Mode policy (design vs running):
- *   - design  → fully editable: connect, delete, drag, context-menu add.
- *   - running → read-only: connections, deletions, drags, and add-actions are
- *               disabled (selection + pan/zoom remain available so users can
- *               still inspect the live graph while it executes).
+ * Read-only policy:
+ *   - editable when the workflow is idle.
+ *   - read-only while running or while AI is producing a replacement blueprint:
+ *     connections, deletions, drags, and add-actions are disabled (selection +
+ *     pan/zoom remain available for inspection).
  */
 
 const nodeTypes: NodeTypes = {
@@ -57,6 +59,8 @@ const nodeTypes: NodeTypes = {
   container: ContainerNode,
   control: ControlNode,
 };
+
+const DEFAULT_CANVAS_VIEWPORT: CanvasViewport = { x: 0, y: 0, zoom: 1 };
 
 /** Default port id picked when React Flow doesn't supply one on a connection. */
 const DEFAULT_EXEC_OUT = 'exec_out';
@@ -193,9 +197,10 @@ function BlueprintCanvasInner() {
   const workflow = useStore((s) => s.workflow);
   const locale = useStore((s) => s.locale);
   const runState = useStore((s) => s.runState);
-  const mode = useStore((s) => s.mode);
+  const readOnlyReason = useStore((s) => workflowReadOnlyReason(s));
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectNode = useStore((s) => s.selectNode);
+  const setCanvasViewport = useStore((s) => s.setCanvasViewport);
 
   const addNode = useStore((s) => s.addNode);
   const addEdge = useStore((s) => s.addEdge);
@@ -205,11 +210,14 @@ function BlueprintCanvasInner() {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<FlowNodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
+  const [initialCanvasViewport] = useState<CanvasViewport | null>(() =>
+    useStore.getState().canvasViewport,
+  );
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   const { screenToFlowPosition } = useReactFlow();
 
-  const isRunning = mode === 'running';
+  const isReadOnly = readOnlyReason !== null;
 
   // Re-project the IR onto the canvas whenever the workflow OR runState changes.
   // Layout coordinates are preserved by irToFlow, so a drag that wrote back via
@@ -248,38 +256,45 @@ function BlueprintCanvasInner() {
   /** Create an IR edge whenever the user finishes drawing a connection. */
   const onConnect = useCallback<OnConnect>(
     (connection) => {
-      if (isRunning) return; // hard block in running mode
+      if (isReadOnly) return;
       const ir = connectionToEdge(connection);
       if (!ir) return;
       addEdge(ir.from, ir.to, ir.kind);
     },
-    [addEdge, isRunning],
+    [addEdge, isReadOnly],
   );
 
   /** Persist drag-stop positions back to the IR layout. */
   const onNodeDragStop = useCallback<OnNodeDrag>(
     (_event, node) => {
-      if (isRunning) return;
+      if (isReadOnly) return;
       setNodePosition(node.id, node.position.x, node.position.y);
     },
-    [setNodePosition, isRunning],
+    [setNodePosition, isReadOnly],
   );
 
   /** Forward delete-key removals to the IR. */
   const onNodesDelete = useCallback<OnNodesDelete>(
     (deleted) => {
-      if (isRunning) return;
+      if (isReadOnly) return;
       for (const n of deleted) removeNode(n.id);
     },
-    [removeNode, isRunning],
+    [removeNode, isReadOnly],
   );
 
   const onEdgesDelete = useCallback<OnEdgesDelete>(
     (deleted: Edge[]) => {
-      if (isRunning) return;
+      if (isReadOnly) return;
       for (const e of deleted) removeEdge(e.id);
     },
-    [removeEdge, isRunning],
+    [removeEdge, isReadOnly],
+  );
+
+  const onViewportChange = useCallback(
+    (viewport: Viewport) => {
+      setCanvasViewport(viewport);
+    },
+    [setCanvasViewport],
   );
 
   // ── Context menu (pane right-click → add node) ───────────────────────────
@@ -290,7 +305,7 @@ function BlueprintCanvasInner() {
   const onPaneContextMenu = useCallback(
     (event: React.MouseEvent | MouseEvent) => {
       event.preventDefault();
-      if (isRunning) return;
+      if (isReadOnly) return;
       const wrapper = wrapperRef.current;
       if (!wrapper) return;
       const rect = wrapper.getBoundingClientRect();
@@ -299,14 +314,16 @@ function BlueprintCanvasInner() {
       const flow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
       setMenu({ screenX, screenY, flowX: flow.x, flowY: flow.y });
     },
-    [isRunning, screenToFlowPosition],
+    [isReadOnly, screenToFlowPosition],
   );
 
   /** Add a node at the menu's flow-space coords, then close the menu. */
   const addNodeAtMenu = useCallback(
     (type: NodeType) => {
+      if (isReadOnly) return;
       if (!menu) return;
       const id = addNode(type);
+      if (!id) return;
       // Override the auto-placed coords with the right-click spot so the new
       // node materializes exactly where the user clicked. setNodePosition is
       // layout-only and doesn't dirty the workflow further.
@@ -314,7 +331,7 @@ function BlueprintCanvasInner() {
       selectNode(id);
       setMenu(null);
     },
-    [addNode, menu, selectNode, setNodePosition],
+    [addNode, isReadOnly, menu, selectNode, setNodePosition],
   );
 
   /** Close the context menu on Escape. */
@@ -330,26 +347,40 @@ function BlueprintCanvasInner() {
   // ── Render ───────────────────────────────────────────────────────────────
 
   // `nodesDraggable` / `nodesConnectable` toggle React Flow's built-in
-  // affordances; the per-handler `if (isRunning) return` guards are belt &
+  // affordances; the per-handler `if (isReadOnly) return` guards are belt &
   // braces for any synthetic events that slip through.
-  const interactive = !isRunning;
+  const interactive = !isReadOnly;
+  const defaultViewport = initialCanvasViewport ?? DEFAULT_CANVAS_VIEWPORT;
+  const fitInitialView = initialCanvasViewport == null;
 
-  const runningBadge = useMemo(() => {
-    if (!isRunning) return null;
+  const readonlyBadge = useMemo(() => {
+    if (!readOnlyReason) return null;
+    const label =
+      readOnlyReason === 'running'
+        ? t(locale, 'canvas.runningReadonly')
+        : t(locale, 'canvas.aiEditingReadonly');
+    const style =
+      readOnlyReason === 'running'
+        ? {
+            background: 'rgba(55, 194, 168, 0.12)',
+            borderColor: 'var(--accent-2)',
+            color: 'var(--accent-2)',
+          }
+        : {
+            background: 'rgba(77, 163, 255, 0.12)',
+            borderColor: 'var(--status-ai-edit)',
+            color: 'var(--status-ai-edit)',
+          };
     return (
       <div
         className="pointer-events-none absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[11px]"
-        style={{
-          background: 'rgba(227, 160, 8, 0.12)',
-          borderColor: 'var(--accent-3)',
-          color: 'var(--accent-3)',
-        }}
+        style={style}
       >
         <span className="omc-pulse-dot" />
-        <span>{t(locale, 'canvas.runningReadonly')}</span>
+        <span>{label}</span>
       </div>
     );
-  }, [isRunning, locale]);
+  }, [readOnlyReason, locale]);
 
   return (
     <div className="flex h-full w-full flex-col bg-bg">
@@ -359,7 +390,7 @@ function BlueprintCanvasInner() {
       <CanvasToolbar />
 
       <div className="relative min-h-0 flex-1" ref={wrapperRef}>
-        {runningBadge}
+        {readonlyBadge}
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -372,12 +403,14 @@ function BlueprintCanvasInner() {
           onNodeDragStop={onNodeDragStop}
           onNodesDelete={onNodesDelete}
           onEdgesDelete={onEdgesDelete}
+          onViewportChange={onViewportChange}
           onPaneContextMenu={onPaneContextMenu}
           nodesDraggable={interactive}
           nodesConnectable={interactive}
           edgesFocusable={interactive}
           deleteKeyCode={interactive ? ['Delete', 'Backspace'] : null}
-          fitView
+          defaultViewport={defaultViewport}
+          fitView={fitInitialView}
           fitViewOptions={{ padding: 0.25 }}
           minZoom={0.25}
           maxZoom={2}
@@ -489,8 +522,11 @@ const KEYFRAME_CSS = `
 `;
 
 export default function BlueprintCanvas() {
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const activeSessionId = useStore((s) => s.activeSessionId);
+  const providerKey = `${activeWorkspaceId ?? 'workspace'}:${activeSessionId ?? 'session'}`;
   return (
-    <ReactFlowProvider>
+    <ReactFlowProvider key={providerKey}>
       <BlueprintCanvasInner />
     </ReactFlowProvider>
   );

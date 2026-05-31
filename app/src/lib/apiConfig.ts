@@ -1,0 +1,520 @@
+/**
+ * CONTRACT: single source of truth for the locally-stored set of model
+ * providers and which one is currently active.
+ *
+ * A Claude provider is one Anthropic-compatible endpoint: a name + API key +
+ * optional custom base URL + optional model. Codex/Gemini are local CLI
+ * runtimes today, but the stored shape is typed so older Claude entries keep
+ * their meaning and future non-Claude provider records do not get mistaken for
+ * Anthropic API endpoints. The list lives only in this device's `localStorage`.
+ * Exactly one provider may be "active"; direct API readers only expose the
+ * active provider when it is Anthropic-backed.
+ *
+ * Consumers:
+ *   - the store (`sendPrompt` / prompt translation) reads `readApiKey()` /
+ *     `readBaseUrl()` to decide between the direct browser->Anthropic API path
+ *     and the local CLI fallback. Those two functions now resolve to the ACTIVE
+ *     provider, so the store needs no changes.
+ *   - the Settings "Models" tab UI which lists / adds / edits / deletes /
+ *     selects providers and imports them from cc-switch.
+ *
+ * When no Anthropic provider is active, `readApiKey()` returns '' and the app
+ * falls back to the selected system CLI where available.
+ */
+
+export type ProviderKind = 'anthropic' | 'codex' | 'gemini';
+
+/** One locally stored provider configuration. */
+export interface Provider {
+  /** Stable local id (uuid). */
+  id: string;
+  /** Provider runtime family. Legacy records without this field are Anthropic. */
+  kind: ProviderKind;
+  /** User-facing label. */
+  name: string;
+  /** Anthropic API key / auth token. */
+  apiKey: string;
+  /** Optional custom base URL ('' = default api.anthropic.com). */
+  baseUrl: string;
+  /** Optional model override (informational; the app uses `composer.model`). */
+  model?: string;
+}
+
+export type ProviderRuntimeStatus = 'direct' | 'cli' | 'unavailable';
+
+export interface ProviderRuntimeInfo {
+  status: ProviderRuntimeStatus;
+  hasApiKey: boolean;
+  hasBaseUrl: boolean;
+  baseUrlValid: boolean;
+  baseUrlHost: string;
+  canUseCliFallback: boolean;
+}
+
+/** localStorage key holding the JSON array of providers. */
+export const PROVIDERS_STORAGE = 'owf_providers';
+/**
+ * @deprecated Legacy single-active-provider key. Still written as a mirror of
+ * the anthropic (Claude Code) default so the gateway's "inherit global"
+ * fallback keeps working; superseded by {@link ACTIVE_PROVIDER_BY_KIND_STORAGE}.
+ */
+export const ACTIVE_PROVIDER_STORAGE = 'owf_active_provider_id';
+/**
+ * localStorage key holding the active/default provider id PER category
+ * (`{ anthropic, codex, gemini }`). Each runtime family has its own default,
+ * so activating a Codex channel never changes the Claude Code default.
+ */
+export const ACTIVE_PROVIDER_BY_KIND_STORAGE = 'owf_active_provider_by_kind_v1';
+
+/* --- legacy single-key storage (read once for migration, never removed) --- */
+/** @deprecated legacy single-key storage; kept for migration + rollback. */
+export const API_KEY_STORAGE = 'owf_anthropic_key';
+/** @deprecated legacy single-base-url storage; kept for migration + rollback. */
+export const BASE_URL_STORAGE = 'owf_anthropic_base_url';
+
+const hasWindow = (): boolean => typeof window !== 'undefined';
+
+/** Generate a stable id; `crypto.randomUUID` with a best-effort fallback. */
+function genId(): string {
+  try {
+    if (hasWindow() && typeof window.crypto?.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+  } catch {
+    /* ignore */
+  }
+  return `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function rawGet(key: string): string | null {
+  try {
+    if (!hasWindow()) return null;
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function rawSet(key: string, value: string): void {
+  try {
+    if (!hasWindow()) return;
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* ignore */
+  }
+}
+
+function notifyProviderConfigChanged(): void {
+  try {
+    if (!hasWindow()) return;
+    window.dispatchEvent(new Event('owf:gateway-config-changed'));
+  } catch {
+    /* ignore */
+  }
+}
+
+const PROVIDER_KINDS: ProviderKind[] = ['anthropic', 'codex', 'gemini'];
+
+type ActiveByKind = Partial<Record<ProviderKind, string>>;
+
+/**
+ * Read the per-category active map, migrating once from the legacy single-id
+ * key. Migration assigns the legacy active id to its provider's own category.
+ */
+function loadActiveByKind(): ActiveByKind {
+  const stored = rawGet(ACTIVE_PROVIDER_BY_KIND_STORAGE);
+  if (stored !== null) {
+    try {
+      const parsed = JSON.parse(stored);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const out: ActiveByKind = {};
+        for (const kind of PROVIDER_KINDS) {
+          const value = (parsed as Record<string, unknown>)[kind];
+          if (typeof value === 'string' && value) out[kind] = value;
+        }
+        return out;
+      }
+    } catch {
+      /* corrupt — fall through to empty */
+    }
+    return {};
+  }
+
+  // Migration: seed from the legacy single active id (assigned to its kind).
+  const legacy = (rawGet(ACTIVE_PROVIDER_STORAGE) ?? '').trim();
+  const map: ActiveByKind = {};
+  if (legacy) {
+    const provider = loadProviders().find((p) => p.id === legacy);
+    if (provider) map[provider.kind] = legacy;
+  }
+  rawSet(ACTIVE_PROVIDER_BY_KIND_STORAGE, JSON.stringify(map));
+  return map;
+}
+
+/**
+ * Persist the per-category active map and mirror the anthropic default back to
+ * the legacy single-id key (the gateway's "inherit global" fallback reads it).
+ */
+function saveActiveByKind(map: ActiveByKind): void {
+  rawSet(ACTIVE_PROVIDER_BY_KIND_STORAGE, JSON.stringify(map));
+  const anthropic = (map.anthropic ?? '').trim();
+  if (anthropic) {
+    rawSet(ACTIVE_PROVIDER_STORAGE, anthropic);
+  } else {
+    try {
+      if (hasWindow()) window.localStorage.removeItem(ACTIVE_PROVIDER_STORAGE);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Resolve a category's active id, falling back to the first provider of it. */
+function resolveActiveForKind(
+  list: Provider[],
+  map: ActiveByKind,
+  kind: ProviderKind,
+): string {
+  const ofKind = list.filter((p) => p.kind === kind);
+  const stored = map[kind];
+  if (stored && ofKind.some((p) => p.id === stored)) return stored;
+  return ofKind[0]?.id ?? '';
+}
+
+/**
+ * Read the provider list, running a one-time migration from the legacy
+ * single-key storage when the new key is absent. The presence of
+ * `PROVIDERS_STORAGE` (even an empty array) is the migration sentinel, so this
+ * runs at most once per device.
+ */
+function loadProviders(): Provider[] {
+  const stored = rawGet(PROVIDERS_STORAGE);
+  if (stored !== null) {
+    try {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map(normalizeStoredProvider)
+          .filter((p): p is Provider => p !== null);
+      }
+    } catch {
+      /* corrupt — fall through to empty */
+    }
+    return [];
+  }
+
+  // Migration: synthesize a provider from the legacy single key (if any).
+  const legacyKey = (rawGet(API_KEY_STORAGE) ?? '').trim();
+  const legacyUrl = (rawGet(BASE_URL_STORAGE) ?? '').trim();
+  let migrated: Provider[] = [];
+  if (legacyKey) {
+    const p: Provider = {
+      id: genId(),
+      kind: 'anthropic',
+      name: 'Claude',
+      apiKey: legacyKey,
+      baseUrl: legacyUrl,
+    };
+    migrated = [p];
+    rawSet(ACTIVE_PROVIDER_STORAGE, p.id);
+  }
+  rawSet(PROVIDERS_STORAGE, JSON.stringify(migrated));
+  return migrated;
+}
+
+function normalizeStoredProvider(value: unknown): Provider | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.id !== 'string') {
+    return null;
+  }
+  return {
+    id: v.id,
+    kind: normalizeProviderKind(v.kind ?? v.adapter),
+    name: typeof v.name === 'string' ? v.name : 'Claude',
+    apiKey: typeof v.apiKey === 'string' ? v.apiKey : '',
+    baseUrl: typeof v.baseUrl === 'string' ? v.baseUrl : '',
+    model: typeof v.model === 'string' ? v.model : undefined,
+  };
+}
+
+function normalizeProviderKind(value: unknown): ProviderKind {
+  if (value === 'anthropic' || value === 'claude-code' || value === 'claude') {
+    return 'anthropic';
+  }
+  if (value === 'codex') return 'codex';
+  if (value === 'gemini') return 'gemini';
+  return 'anthropic';
+}
+
+function saveProviders(list: Provider[]): void {
+  rawSet(PROVIDERS_STORAGE, JSON.stringify(list));
+  notifyProviderConfigChanged();
+}
+
+export function isProviderBaseUrlValid(baseUrl: string): boolean {
+  const raw = baseUrl.trim();
+  if (!raw) return true;
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+export function providerBaseUrlHost(baseUrl: string): string {
+  const raw = baseUrl.trim();
+  if (!raw) return 'api.anthropic.com';
+  try {
+    return new URL(raw).host;
+  } catch {
+    return raw;
+  }
+}
+
+export function getProviderRuntimeInfo(
+  provider: Pick<Provider, 'apiKey' | 'baseUrl'> &
+    Partial<Pick<Provider, 'kind'>>,
+  options: { canUseCliFallback?: boolean } = {},
+): ProviderRuntimeInfo {
+  const kind = normalizeProviderKind(provider.kind);
+  const hasApiKey = provider.apiKey.trim().length > 0;
+  const hasBaseUrl = provider.baseUrl.trim().length > 0;
+  const baseUrlValid = isProviderBaseUrlValid(provider.baseUrl);
+  const canUseCliFallback = options.canUseCliFallback === true;
+  const status: ProviderRuntimeStatus =
+    kind === 'anthropic'
+      ? hasApiKey && baseUrlValid
+        ? 'direct'
+        : !hasApiKey && baseUrlValid && canUseCliFallback
+          ? 'cli'
+          : 'unavailable'
+      : canUseCliFallback
+        ? 'cli'
+        : 'unavailable';
+
+  return {
+    status,
+    hasApiKey,
+    hasBaseUrl,
+    baseUrlValid,
+    baseUrlHost: kind === 'anthropic' ? providerBaseUrlHost(provider.baseUrl) : '',
+    canUseCliFallback,
+  };
+}
+
+export function providerMetadataSignature(
+  p: Pick<Provider, 'name' | 'baseUrl' | 'model'> &
+    Partial<Pick<Provider, 'kind'>>,
+): string {
+  return [
+    normalizeProviderKind(p.kind),
+    p.name.trim().toLowerCase(),
+    p.baseUrl.trim().replace(/\/+$/, '').toLowerCase(),
+    (p.model ?? '').trim().toLowerCase(),
+  ].join('\0');
+}
+
+/** List all configured providers (browser-safe; '[]' when none / non-browser). */
+export function listProviders(): Provider[] {
+  return loadProviders();
+}
+
+/**
+ * Id of the active/default provider for a category, or '' when that category
+ * has none. With no `kind` it returns the anthropic (Claude Code) default,
+ * preserving the legacy single-active contract for direct-API callers.
+ */
+export function getActiveProviderId(kind: ProviderKind = 'anthropic'): string {
+  return resolveActiveForKind(loadProviders(), loadActiveByKind(), kind);
+}
+
+/** The active/default provider id for every category. */
+export function getActiveProviderIds(): Record<ProviderKind, string> {
+  const list = loadProviders();
+  const map = loadActiveByKind();
+  return {
+    anthropic: resolveActiveForKind(list, map, 'anthropic'),
+    codex: resolveActiveForKind(list, map, 'codex'),
+    gemini: resolveActiveForKind(list, map, 'gemini'),
+  };
+}
+
+/** Set the default provider for its own category. Unknown ids are ignored. */
+export function setActiveProviderId(id: string): void {
+  const trimmed = id.trim();
+  if (!trimmed) return;
+  const provider = loadProviders().find((p) => p.id === trimmed);
+  if (!provider) return;
+  const map = loadActiveByKind();
+  map[provider.kind] = trimmed;
+  saveActiveByKind(map);
+  notifyProviderConfigChanged();
+}
+
+/** The active anthropic (Claude Code) provider object, or null when none. */
+export function getActiveProvider(): Provider | null {
+  const list = loadProviders();
+  const id = resolveActiveForKind(list, loadActiveByKind(), 'anthropic');
+  if (!id) return null;
+  return list.find((p) => p.id === id) ?? null;
+}
+
+/**
+ * Add a provider; the first one of its category becomes that category's
+ * default. Returns the created provider.
+ */
+export function addProvider(p: Omit<Provider, 'id'>): Provider {
+  const list = loadProviders();
+  const map = loadActiveByKind();
+  const created: Provider = { ...p, id: genId() };
+  // Resolve the category's current default BEFORE adding: only promote the new
+  // provider when its category has no default yet (i.e. it is the first one).
+  const existingDefault = resolveActiveForKind(list, map, created.kind);
+  list.push(created);
+  saveProviders(list);
+  if (!existingDefault) {
+    map[created.kind] = created.id;
+    saveActiveByKind(map);
+    notifyProviderConfigChanged();
+  }
+  return created;
+}
+
+/** Patch a provider in place. */
+export function updateProvider(
+  id: string,
+  patch: Partial<Omit<Provider, 'id'>>,
+): void {
+  const list = loadProviders();
+  const idx = list.findIndex((p) => p.id === id);
+  if (idx === -1) return;
+  list[idx] = { ...list[idx], ...patch };
+  saveProviders(list);
+}
+
+/**
+ * Delete a provider; if it was its category's default, promote the first
+ * remaining provider of that same category (categories stay independent).
+ */
+export function deleteProvider(id: string): void {
+  const list = loadProviders();
+  const target = list.find((p) => p.id === id);
+  const next = list.filter((p) => p.id !== id);
+  saveProviders(next);
+  if (!target) return;
+  const map = loadActiveByKind();
+  if (map[target.kind] === id) {
+    const promote = next.find((p) => p.kind === target.kind);
+    if (promote) map[target.kind] = promote.id;
+    else delete map[target.kind];
+    saveActiveByKind(map);
+  }
+  notifyProviderConfigChanged();
+}
+
+/**
+ * Import a batch of providers (e.g. from cc-switch). Dedupes against existing
+ * entries by provider metadata (name + baseUrl + model), never by API key.
+ * `makeActiveMatch`, if given, marks the matching imported provider as the new
+ * active one.
+ */
+export function importProviders(
+  incoming: Array<Omit<Provider, 'id'>>,
+  makeActiveMatch?: (p: Omit<Provider, 'id'>) => boolean,
+): { imported: number; skipped: number } {
+  const list = loadProviders();
+  const seen = new Set(list.map(providerMetadataSignature));
+  let imported = 0;
+  let skipped = 0;
+  let activeTarget: string | null = null;
+
+  for (const p of incoming) {
+    const sig = providerMetadataSignature(p);
+    if (seen.has(sig)) {
+      // Already present — still let it be the active target if requested.
+      if (makeActiveMatch?.(p)) {
+        const existing = list.find((e) => providerMetadataSignature(e) === sig);
+        if (existing) activeTarget = existing.id;
+      }
+      skipped += 1;
+      continue;
+    }
+    seen.add(sig);
+    const created: Provider = { ...p, id: genId() };
+    list.push(created);
+    imported += 1;
+    if (makeActiveMatch?.(p)) activeTarget = created.id;
+  }
+
+  saveProviders(list);
+
+  // Ensure every category has a default (first of its kind when unset), then
+  // let an explicit active match override its own category's default.
+  const map = loadActiveByKind();
+  for (const kind of PROVIDER_KINDS) {
+    const valid =
+      !!map[kind] && list.some((p) => p.kind === kind && p.id === map[kind]);
+    if (!valid) {
+      const first = list.find((p) => p.kind === kind);
+      if (first) map[kind] = first.id;
+      else delete map[kind];
+    }
+  }
+  if (activeTarget) {
+    const target = list.find((p) => p.id === activeTarget);
+    if (target) map[target.kind] = activeTarget;
+  }
+  saveActiveByKind(map);
+  notifyProviderConfigChanged();
+
+  return { imported, skipped };
+}
+
+/**
+ * Read the ACTIVE provider's API key. Returns '' when none configured.
+ * Signature preserved for existing consumers (store / prompt translation).
+ */
+export function readApiKey(): string {
+  const provider = getActiveProvider();
+  return provider?.kind === 'anthropic' ? provider.apiKey.trim() : '';
+}
+
+/**
+ * Read the ACTIVE provider's custom base URL. Returns '' when none / default.
+ * Signature preserved for existing consumers.
+ */
+export function readBaseUrl(): string {
+  const provider = getActiveProvider();
+  return provider?.kind === 'anthropic' ? provider.baseUrl.trim() : '';
+}
+
+/**
+ * @deprecated Use {@link addProvider}/{@link updateProvider} instead. Repoints
+ * at the active provider so any stray caller stays coherent for one release.
+ */
+export function writeApiKey(value: string): void {
+  const v = value.trim();
+  const active = getActiveProvider();
+  if (active?.kind === 'anthropic') {
+    updateProvider(active.id, { apiKey: v });
+  } else if (v) {
+    const created = addProvider({
+      kind: 'anthropic',
+      name: 'Claude',
+      apiKey: v,
+      baseUrl: readBaseUrl(),
+    });
+    setActiveProviderId(created.id);
+  }
+}
+
+/**
+ * @deprecated Use {@link updateProvider} instead. Repoints at the active
+ * provider so any stray caller stays coherent for one release.
+ */
+export function writeBaseUrl(value: string): void {
+  const active = getActiveProvider();
+  if (active?.kind === 'anthropic') updateProvider(active.id, { baseUrl: value.trim() });
+}

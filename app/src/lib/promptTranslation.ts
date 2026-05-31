@@ -1,4 +1,11 @@
 import { extractJsonObject, streamAnthropic } from '@/lib/anthropic';
+import { resolveCliInvocation } from '@/lib/cliConfig';
+import type { GatewaySelection } from '@/core/ir';
+import {
+  completeGatewayText,
+  resolveCliGatewayRoute,
+  resolveDirectGatewayRoute,
+} from '@/lib/modelGateway/modelGateway';
 import { aiEditViaCli, isTauri } from '@/lib/tauri';
 import {
   localeAiName,
@@ -14,8 +21,10 @@ export type TranslationMap = Partial<Record<Locale, TranslationSource>>;
 
 export interface TranslatePromptOptions {
   apiKey?: string;
+  baseUrl?: string;
   model?: string;
   adapter?: string;
+  selection?: GatewaySelection;
 }
 
 interface TranslationResponse {
@@ -66,10 +75,33 @@ async function callTranslationModel(
   userContent: string,
   opts: TranslatePromptOptions,
 ): Promise<string> {
+  if (opts.selection) {
+    const direct = resolveDirectGatewayRoute(opts.selection);
+    if (direct) {
+      return completeGatewayText({
+        route: direct,
+        system,
+        userContent,
+        maxTokens: 2048,
+      });
+    }
+    if (isTauri()) {
+      const route = await resolveCliGatewayRoute(opts.selection);
+      return aiEditViaCli(`${system}\n\n${userContent}`, route.adapter, {
+        permission: 'full',
+        model: route.model,
+        cliCommand: route.cliCommand,
+        env: route.env,
+      });
+    }
+  }
+
   const apiKey = opts.apiKey?.trim();
-  if (apiKey) {
+  const adapter = opts.adapter ?? 'claude-code';
+  if (apiKey && adapter === 'claude-code') {
     return streamAnthropic({
       apiKey,
+      baseUrl: opts.baseUrl,
       model: opts.model,
       system,
       userContent,
@@ -78,9 +110,16 @@ async function callTranslationModel(
   }
 
   if (isTauri()) {
-    const adapter = opts.adapter ?? 'claude-code';
     const prompt = `${system}\n\n${userContent}`;
-    return aiEditViaCli(prompt, adapter, { permission: 'full', model: opts.model });
+    const cli = await resolveCliInvocation(adapter);
+    if (cli.status === 'invalid') {
+      throw new Error(cli.error ?? 'CLI 路径不可用，请重新选择。');
+    }
+    return aiEditViaCli(prompt, adapter, {
+      permission: 'full',
+      model: opts.model,
+      cliCommand: cli.command,
+    });
   }
 
   throw new Error('NO_TRANSLATION_BACKEND');

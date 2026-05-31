@@ -7,7 +7,8 @@
  */
 
 import type { IRGraph, IRRunStatus } from '@/core/ir';
-import type { Message } from '@/store/types';
+import type { RuntimeAdapterId } from '@/lib/adapters';
+import type { CanvasViewport, Message } from '@/store/types';
 import { HISTORY_ERROR_CODES } from './constants';
 
 export {
@@ -261,15 +262,70 @@ export interface SessionRecord {
 }
 
 export interface SessionMeta extends HistoryMetadata {
-  adapter?: 'claude-code' | 'codex' | 'gemini';
+  adapter?: RuntimeAdapterId;
   permission?: string;
   model?: string;
+  canvasViewport?: CanvasViewport | null;
   runStatus?: 'idle' | 'running' | 'success' | 'error' | 'interrupted';
   runState?: Record<string, IRRunStatus>;
   runOutputs?: Record<string, string>;
   failedNodeId?: string | null;
   runError?: Record<string, unknown> | null;
   migration?: HistoryMigrationRecord;
+}
+
+export type CliAdapter = RuntimeAdapterId;
+export type CliPlatform = 'windows' | 'macos' | 'linux';
+
+export interface CliLastError {
+  code: 'missing' | 'permission-denied' | 'not-executable' | 'spawn-failed';
+  message: string;
+  checkedAt: string;
+}
+
+export interface CliStoredCustomPath {
+  adapter: CliAdapter;
+  path: string;
+  normalizedPath: string;
+  platform: CliPlatform;
+  addedAt: string;
+  lastSeenAt?: string;
+  lastError?: CliLastError;
+}
+
+export type CliSelection =
+  | { kind: 'auto' }
+  | {
+      kind: 'known';
+      adapter: CliAdapter;
+      command: 'claude' | 'claude-code' | 'codex' | 'gemini' | string;
+      selectedAt: string;
+      pathHint?: string;
+      platform?: CliPlatform;
+    }
+  | {
+      kind: 'path';
+      adapter: CliAdapter;
+      path: string;
+      normalizedPath: string;
+      selectedAt: string;
+      platform: CliPlatform;
+    };
+
+export interface CliMigrationNotice {
+  code:
+    | 'legacy-shell-wrapper'
+    | 'legacy-unrecognized'
+    | 'legacy-path-unavailable';
+  raw: string;
+  createdAt: string;
+}
+
+export interface CliSelectionConfig {
+  schemaVersion: 1;
+  selected: CliSelection;
+  customPaths: CliStoredCustomPath[];
+  migrationNotice?: CliMigrationNotice;
 }
 
 /** Light shape stored in the legacy session index; no `messages` / `workflow`. */
@@ -280,6 +336,8 @@ export type SessionSummary = Pick<
   /** First 80 chars of the last message - sidebar two-line preview. */
   preview?: string;
   messageCount: number;
+  /** Derived from meta.runStatus for lightweight history status badges. */
+  runStatus?: SessionMeta['runStatus'];
 
   // Forward-compatible canonical fields.
   sessionId?: SessionId;
@@ -291,6 +349,13 @@ export interface HistoryConfig {
   schemaVersion: number;
   lastActiveWorkspaceId?: string;
   lastActiveSessionId?: string;
+  cli?: CliSelectionConfig;
+  /** Legacy CLI selection aliases; read-only compatibility path. */
+  selectedCli?: unknown;
+  cliPath?: unknown;
+  cliCommand?: unknown;
+  commandPath?: unknown;
+  cliAdapter?: unknown;
   /** Set true once the first-run localStorage migration has run. */
   migratedFromLocalStorage?: boolean;
   migrationVersion?: number;

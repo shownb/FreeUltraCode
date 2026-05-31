@@ -18,6 +18,16 @@ export type MessageRole = 'user' | 'assistant' | 'system';
 /** Per-node execution status while a workflow is running. */
 export type NodeRunState = IRRunStatus;
 
+/** Terminal run status shown in the history rail after a workflow run ends. */
+export type SessionRunStatus = Exclude<IRRunStatus, 'idle' | 'running'>;
+
+/** Canvas pan/zoom state for one history session. */
+export interface CanvasViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
 /** Lifecycle of an interactive message (a node asking the user to choose/type). */
 export type InteractionStatus = 'pending' | 'answered' | 'cancelled';
 
@@ -58,6 +68,8 @@ export interface Session {
   preview?: string;
   /** Persisted message count for lightweight history rendering. */
   messageCount?: number;
+  /** Last terminal workflow run status, used by the history status indicator. */
+  runStatus?: SessionRunStatus;
 }
 
 export interface PromptItem {
@@ -86,8 +98,20 @@ export interface SelectOption {
   id: string;
   label: string;
   hint?: string;
+  /**
+   * Optional category label. When consecutive options carry different `group`
+   * values, the dropdown renders a divider + header before the first option of
+   * each group (e.g. grouping models by runtime: Claude Code / Codex / Gemini).
+   */
+  group?: string;
   translations?: Partial<Record<Locale, { label: string; hint?: string }>>;
 }
+
+/**
+ * AI 改图时为每个节点自动选模型的策略。
+ * 'inherit' = 不自动指定，保持现状（不注入额外提示词）。
+ */
+export type ModelStrategy = 'inherit' | 'smart' | 'prefer-better' | 'prefer-cheaper';
 
 /**
  * AI-input composer settings. Pure UI state — never enters the IRGraph.
@@ -100,4 +124,6 @@ export interface ComposerSettings {
   model: string;
   /** absolute path of the selected workspace folder ('' = none chosen yet) */
   workspace: string;
+  /** AI 改图时为每个节点自动选模型的策略 */
+  modelStrategy: ModelStrategy;
 }

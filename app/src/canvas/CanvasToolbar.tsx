@@ -1,39 +1,32 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useReactFlow, useStore as useRFStore } from '@xyflow/react';
-import { useStore } from '@/store/useStore';
+import { isWorkflowReadOnly, useStore } from '@/store/useStore';
 import { emitClaudeScript } from '@/core/emitter';
-import { interactionSampleBlueprint } from '@/core/interactionSample';
+import { runtimeAdapterLabel } from '@/lib/adapters';
 import { t, type Locale } from '@/lib/i18n';
 
 /**
  * Canvas toolbar that sits above the blueprint graph (design doc section 6).
  *
  * Left:  workflow name + autosave hint · live run-progress badge when running.
- * Right: runtime-adapter switch · live zoom % (click to fit) · Script ·
- *        Run / Resume / Stop (mode-aware). While `mode === 'running'` the run
+ * Right: live zoom % (click to fit) · Script · Run / Resume / Stop
+ *        (mode-aware). While `mode === 'running'` the run
  *        button flips to a stop button that cancels active CLI invocations.
  *
  * MUST render inside a <ReactFlowProvider> — it reads the live viewport zoom
  * and drives zoomIn/zoomOut/fitView through the React Flow instance.
  */
 
-const ADAPTERS: { id: string; label: string }[] = [
-  { id: 'claude-code', label: 'Claude Code' },
-  { id: 'codex', label: 'Codex' },
-  { id: 'gemini', label: 'Gemini' },
-];
-
 export default function CanvasToolbar() {
   const workflow = useStore((s) => s.workflow);
   const locale = useStore((s) => s.locale);
-  const setAdapter = useStore((s) => s.setAdapter);
-  const setWorkflow = useStore((s) => s.setWorkflow);
   const runWorkflow = useStore((s) => s.runWorkflow);
   const resumeWorkflow = useStore((s) => s.resumeWorkflow);
   const stopWorkflow = useStore((s) => s.stopWorkflow);
   const dirty = useStore((s) => s.dirty);
   const currentFilePath = useStore((s) => s.currentFilePath);
   const mode = useStore((s) => s.mode);
+  const readOnly = useStore((s) => isWorkflowReadOnly(s));
   const runState = useStore((s) => s.runState);
   const lastRunFailedNodeId = useStore((s) => s.lastRunFailedNodeId);
 
@@ -43,10 +36,8 @@ export default function CanvasToolbar() {
   const zoomPct = Math.round((zoom ?? 1) * 100);
 
   const adapter = workflow.meta.adapter ?? 'claude-code';
-  const adapterLabel =
-    ADAPTERS.find((a) => a.id === adapter)?.label ?? adapter;
+  const adapterLabel = runtimeAdapterLabel(adapter);
 
-  const [adapterOpen, setAdapterOpen] = useState(false);
   const [scriptOpen, setScriptOpen] = useState(false);
 
   const script = useMemo(
@@ -73,7 +64,7 @@ export default function CanvasToolbar() {
 
   const running = mode === 'running';
   const canResume =
-    !running &&
+    !readOnly &&
     (!!lastRunFailedNodeId ||
       Object.values(runState).some(
         (state) => state === 'error' || state === 'interrupted',
@@ -118,40 +109,6 @@ export default function CanvasToolbar() {
         )}
       </div>
 
-      {/* Runtime adapter switch */}
-      <div className="relative">
-        <button
-          type="button"
-          onClick={() => setAdapterOpen((o) => !o)}
-          className="flex items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent-2 hover:text-fg"
-          title={t(locale, 'canvas.switchRuntime')}
-        >
-          <span className="text-accent-2">▣</span>
-          <span className="font-mono">{adapterLabel}</span>
-          <span className="text-fg-faint">▾</span>
-        </button>
-        {adapterOpen && (
-          <div className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-md border border-border bg-panel shadow-lg">
-            {ADAPTERS.map((a) => (
-              <button
-                key={a.id}
-                type="button"
-                onClick={() => {
-                  setAdapter(a.id);
-                  setAdapterOpen(false);
-                }}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-panel-2 ${
-                  a.id === adapter ? 'text-accent-2' : 'text-fg-dim'
-                }`}
-              >
-                <span className="w-3">{a.id === adapter ? '✓' : ''}</span>
-                <span className="font-mono">{a.label}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
       {/* Zoom control */}
       <div className="flex items-center rounded-md border border-border bg-panel-2 text-xs text-fg-dim">
         <button
@@ -179,18 +136,6 @@ export default function CanvasToolbar() {
           +
         </button>
       </div>
-
-      {/* Sample — load the interaction demo workflow for quick testing. */}
-      <button
-        type="button"
-        onClick={() => setWorkflow(interactionSampleBlueprint())}
-        disabled={running}
-        className="flex items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent-3 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-        title={t(locale, 'canvas.sampleTitle')}
-      >
-        <span className="text-accent-3">✦</span>
-        <span>{t(locale, 'canvas.sample')}</span>
-      </button>
 
       {/* Script */}
       <button
@@ -220,10 +165,11 @@ export default function CanvasToolbar() {
         <button
           type="button"
           onClick={() => (canResume ? resumeWorkflow() : runWorkflow())}
+          disabled={readOnly}
           className={
             canResume
               ? 'flex items-center gap-1.5 rounded-md border border-accent-3/50 bg-accent-3/15 px-3 py-1.5 text-xs font-semibold text-accent-3 transition-opacity hover:opacity-90'
-              : 'flex items-center gap-1.5 rounded-md bg-accent-2 px-3 py-1.5 text-xs font-semibold text-[#06231d] transition-opacity hover:opacity-90'
+              : 'flex items-center gap-1.5 rounded-md bg-accent-2 px-3 py-1.5 text-xs font-semibold text-[#06231d] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40'
           }
           title={canResume ? t(locale, 'canvas.resumeTitle') : t(locale, 'canvas.runTitle')}
         >
