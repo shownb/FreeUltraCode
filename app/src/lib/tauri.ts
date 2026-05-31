@@ -196,6 +196,16 @@ export async function aiEditViaCli(
   }
 }
 
+/** Open an external URL via the OS default browser (web: new tab). */
+export async function openExternal(url: string): Promise<void> {
+  if (!tauriAvailable()) {
+    if (typeof window !== 'undefined') window.open(url, '_blank', 'noopener');
+    return;
+  }
+  const invoke = await getInvoke();
+  await invoke('open_external', { url });
+}
+
 /** Best-effort cancellation for an in-flight local agent CLI invocation. */
 export async function cancelAiCli(runId: string): Promise<void> {
   if (!tauriAvailable()) return;

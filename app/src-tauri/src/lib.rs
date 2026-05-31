@@ -339,6 +339,35 @@ fn validate_shell_path(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return Err("invalid url".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", u]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(u);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(u);
+        c
+    };
+    hide_console(&mut cmd);
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn scan_model_clis() -> cli_runtime::CliScanResult {
     cli_runtime::scan_model_clis()
 }
@@ -1291,6 +1320,7 @@ pub fn run() {
             scan_model_clis,
             validate_cli_path,
             validate_shell_path,
+            open_external,
             history::history_root,
             history::history_read_json,
             history::history_write_json,

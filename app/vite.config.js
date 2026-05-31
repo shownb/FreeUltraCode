@@ -1,9 +1,12 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath, URL } from 'node:url';
+import { readFileSync } from 'node:fs';
+var pkg = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8'));
 export default defineConfig({
     // Relative base so the built assets load correctly inside the Tauri webview.
     base: './',
+    define: { __APP_VERSION__: JSON.stringify(pkg.version) },
     plugins: [react()],
     resolve: {
         alias: {

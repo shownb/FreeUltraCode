@@ -1,8 +1,10 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Download } from 'lucide-react';
 import { useReactFlow, useStore as useRFStore } from '@xyflow/react';
 import { isWorkflowReadOnly, useStore } from '@/store/useStore';
 import { emitClaudeScript } from '@/core/emitter';
 import { runtimeAdapterLabel } from '@/lib/adapters';
+import { checkForUpdate, openDownload, type UpdateStatus } from '@/lib/updateCheck';
 import { t, type Locale } from '@/lib/i18n';
 
 /**
@@ -39,6 +41,17 @@ export default function CanvasToolbar() {
   const adapterLabel = runtimeAdapterLabel(adapter);
 
   const [scriptOpen, setScriptOpen] = useState(false);
+
+  const [update, setUpdate] = useState<UpdateStatus | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void checkForUpdate().then((s) => {
+      if (alive) setUpdate(s);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const script = useMemo(
     () => (scriptOpen ? safeEmit(workflow, locale) : ''),
@@ -108,6 +121,18 @@ export default function CanvasToolbar() {
           </span>
         )}
       </div>
+
+      {update?.updateAvailable && update.manifest && (
+        <button
+          type="button"
+          onClick={() => void openDownload(update.manifest!.url)}
+          className="flex items-center gap-1 rounded-md border border-accent-2/50 bg-accent-2/15 px-2 py-1.5 text-xs font-semibold text-accent-2 transition-opacity hover:opacity-90"
+          title={t(locale, 'canvas.updateAvailable') + ' · v' + update.latest}
+        >
+          <Download size={14} strokeWidth={2.2} />
+          <span className="font-mono">v{update.latest}</span>
+        </button>
+      )}
 
       {/* Zoom control */}
       <div className="flex items-center rounded-md border border-border bg-panel-2 text-xs text-fg-dim">

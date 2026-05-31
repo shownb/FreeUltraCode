@@ -5,14 +5,20 @@ import {
   DownloadCloud,
   Eye,
   EyeOff,
+  ExternalLink,
+  FileText,
   FolderOpen,
+  Globe,
+  Info,
   Keyboard,
   KeyRound,
   Palette,
   Pencil,
   Plus,
+  RefreshCw,
   Settings as SettingsIcon,
   SlidersHorizontal,
+  Sparkles,
   SquareTerminal,
   Trash2,
   Wrench,
@@ -31,7 +37,6 @@ import {
   deleteProvider,
   getActiveProviderIds,
   getProviderRuntimeInfo,
-  importProviders,
   isProviderBaseUrlValid,
   listProviders,
   providerMetadataSignature,
@@ -40,12 +45,21 @@ import {
   type Provider,
   type ProviderRuntimeStatus,
 } from '@/lib/apiConfig';
+import { importCcSwitchProviders } from '@/lib/ccSwitchAutoImport';
 import {
-  importCcSwitchClaude,
   isTauri,
+  openExternal,
   validateCliPath,
   validateShellPath,
 } from '@/lib/tauri';
+import {
+  APP_VERSION,
+  REPO_URL,
+  RELEASES_URL,
+  checkForUpdate,
+  openDownload,
+  type UpdateStatus,
+} from '@/lib/updateCheck';
 import {
   getRunShell,
   setRunShell,
@@ -79,7 +93,8 @@ type SettingsTab =
   | 'shortcuts'
   | 'runtime'
   | 'appearance'
-  | 'advanced';
+  | 'advanced'
+  | 'about';
 type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
 
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
@@ -89,10 +104,11 @@ const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = 
   { id: 'runtime', labelKey: 'settings.tabs.runtime', Icon: SquareTerminal },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
   { id: 'advanced', labelKey: 'settings.tabs.advanced', Icon: Wrench },
+  { id: 'about', labelKey: 'settings.tabs.about', Icon: Info },
 ];
 
 const placeholderCopy: Record<
-  Exclude<SettingsTab, 'general' | 'models' | 'shortcuts'>,
+  Exclude<SettingsTab, 'general' | 'models' | 'shortcuts' | 'about'>,
   { titleKey: TranslationKey; descriptionKey: TranslationKey }
 > = {
   runtime: {
@@ -236,6 +252,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 <ModelsSettings locale={locale} cliRuntime={cliRuntime} />
               ) : tab === 'shortcuts' ? (
                 <ShortcutsSettings locale={locale} />
+              ) : tab === 'about' ? (
+                <AboutSettings locale={locale} />
               ) : (
                 <PlaceholderTab tab={tab} locale={locale} />
               )}
@@ -967,44 +985,39 @@ function ModelsSettings({
     setImporting(true);
     setStatus(null);
     try {
-      const result = await importCcSwitchClaude();
-      if (!result.providers.length) {
+      const result = await importCcSwitchProviders({
+        promoteActiveAnthropic: true,
+      });
+      if (result.status === 'empty') {
         setStatus({ tone: 'err', msg: t(locale, 'settings.models.importEmpty') });
         return;
       }
-      // Only the Claude(anthropic) active pointer promotes the OWF active
-      // provider — importing Codex/Gemini channels should not silently switch
-      // the active model away from Claude.
-      const activeAnthropic = result.active?.anthropic;
-      const { imported, skipped } = importProviders(
-        result.providers.map((p) => ({
-          kind: p.kind,
-          name: p.name,
-          apiKey: p.apiKey,
-          baseUrl: p.baseUrl,
-          model: p.model,
-        })),
-        // Mark the cc-switch-active Claude provider as active. Matched by ccId
-        // via a name+key signature lookup (ccId is stripped before storage).
-        activeAnthropic
-          ? (incoming) =>
-              result.providers.some(
-                (r) =>
-                  r.ccId === activeAnthropic &&
-                  r.name === incoming.name &&
-                  r.apiKey === incoming.apiKey,
-              )
-          : undefined,
-      );
+      if (result.status === 'no-source') {
+        const msg =
+          result.reason === 'NO_BACKEND'
+            ? t(locale, 'settings.models.importDesktopOnly')
+            : t(locale, 'settings.models.importNoDb');
+        setStatus({ tone: 'err', msg });
+        return;
+      }
+      if (result.status === 'failed') {
+        const reason = result.reason ?? 'Unknown error';
+        setStatus({
+          tone: 'err',
+          msg: `${t(locale, 'settings.models.importError')}: ${reason}`,
+        });
+        return;
+      }
+
       refresh();
       const msg =
-        skipped > 0
+        result.skippedCount > 0
           ? t(locale, 'settings.models.importSkipped')
-              .replace('{n}', String(imported))
-              .replace('{m}', String(skipped))
+              .replace('{n}', String(result.importedCount))
+              .replace('{m}', String(result.skippedCount))
           : t(locale, 'settings.models.importSuccess').replace(
               '{n}',
-              String(imported),
+              String(result.importedCount),
             );
       setStatus({ tone: 'ok', msg });
     } catch (err) {
@@ -2112,7 +2125,7 @@ function PlaceholderTab({
   tab,
   locale,
 }: {
-  tab: Exclude<SettingsTab, 'general' | 'models' | 'shortcuts'>;
+  tab: Exclude<SettingsTab, 'general' | 'models' | 'shortcuts' | 'about'>;
   locale: Locale;
 }) {
   const copy = placeholderCopy[tab];
@@ -2132,5 +2145,72 @@ function PlaceholderTab({
         <div className="h-12 rounded-lg border border-dashed border-border-soft bg-bg-alt/30" />
       </div>
     </div>
+  );
+}
+
+function AboutSettings({ locale }: { locale: Locale }) {
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+  const runCheck = async () => {
+    setChecking(true);
+    try { setStatus(await checkForUpdate()); } finally { setChecking(false); }
+  };
+  return (
+    <div className="space-y-5">
+      <header className="space-y-1">
+        <h3 className="text-base font-semibold text-fg">{t(locale, 'settings.aboutTitle')}</h3>
+        <p className="text-xs leading-relaxed text-fg-faint">{t(locale, 'settings.aboutDescription')}</p>
+      </header>
+      <div className="rounded-lg border border-border bg-bg-alt p-5">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent/15 text-accent">
+            <Sparkles size={20} strokeWidth={2.2} />
+          </span>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-fg">OpenWorkflow</div>
+            <span className="mt-1 inline-block rounded-md border border-border bg-panel-2 px-2 py-0.5 font-mono text-[11px] text-fg-dim">
+              {t(locale, 'settings.aboutVersion')} v{APP_VERSION}
+            </span>
+          </div>
+          <div className="flex-1" />
+          <div className="flex flex-wrap items-center gap-2">
+            <AboutLink label={t(locale, 'settings.aboutWebsite')} icon={<Globe size={14} />} onClick={() => void openExternal(REPO_URL)} />
+            <AboutLink label="GitHub" icon={<ExternalLink size={14} />} onClick={() => void openExternal(REPO_URL)} />
+            <AboutLink label={t(locale, 'settings.aboutChangelog')} icon={<FileText size={14} />} onClick={() => void openExternal(RELEASES_URL)} />
+            <button type="button" onClick={() => void runCheck()} disabled={checking}
+              className="flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-bg transition-opacity hover:opacity-90 disabled:opacity-50">
+              <RefreshCw size={14} className={checking ? "animate-spin" : undefined} />
+              {checking ? t(locale, 'settings.aboutChecking') : t(locale, 'settings.aboutCheckUpdate')}
+            </button>
+          </div>
+        </div>
+        {status && !checking && (
+          <div className="mt-4 border-t border-border-soft pt-3 text-xs">
+            {status.error ? (
+              <span className="text-[#f78b8b]">{t(locale, 'settings.aboutCheckFailed')}</span>
+            ) : status.updateAvailable && status.manifest ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-accent-2">{t(locale, 'settings.aboutUpdateFound')} v{status.latest}</span>
+                <button type="button" onClick={() => void openDownload(status.manifest!.url)}
+                  className="flex items-center gap-1.5 rounded-md border border-accent-2/50 bg-accent-2/15 px-2.5 py-1 font-semibold text-accent-2 transition-opacity hover:opacity-90">
+                  <DownloadCloud size={14} />{t(locale, 'settings.aboutDownload')}
+                </button>
+              </div>
+            ) : (
+              <span className="text-fg-dim">{t(locale, 'settings.aboutUpToDate')}</span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AboutLink({ label, icon, onClick }: { label: string; icon: ReactNode; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick}
+      className="flex items-center gap-1.5 rounded-md border border-border bg-panel-2 px-2.5 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg">
+      {icon}<span>{label}</span>
+    </button>
   );
 }
