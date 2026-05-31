@@ -1,12 +1,12 @@
 ---
 name: owf-release
-description: Cut a new OpenWorkflow desktop release — bump the version everywhere, build the Windows installer, regenerate the version.txt update manifest, commit/push, and publish a GitHub Release with the setup.exe attached. Use when the user says "release", "发版", "打包发布", "cut a release", or "ship a new version".
+description: Cut a new OpenWorkflows desktop release — bump the version everywhere, build the Windows installer, regenerate the version.txt update manifest, commit/push, and publish a GitHub Release with the setup.exe attached. Use when the user says "release", "发版", "打包发布", "cut a release", or "ship a new version".
 ---
 
-# OpenWorkflow Release
+# OpenWorkflows Release
 
-Automates the full release of the OpenWorkflow Tauri desktop app for
-`wellingfeng/OpenWorkflow`. The in-app updater (see `app/src/lib/updateCheck.ts`)
+Automates the full release of the OpenWorkflows Tauri desktop app for
+`wellingfeng/OpenWorkflows`. The in-app updater (see `app/src/lib/updateCheck.ts`)
 reads `app/version.txt` from GitHub raw, so the manifest and the published
 Release asset MUST stay in lockstep — this skill guarantees that.
 
@@ -48,8 +48,8 @@ npm run package
 ```
 
 Produces (under `app/src-tauri/target/release`):
-- `bundle/nsis/OpenWorkflow_${VER}_x64-setup.exe`  ← the installer asset
-- `OpenWorkflow.exe`                                ← standalone binary
+- `bundle/nsis/OpenWorkflows_${VER}_x64-setup.exe`  ← the installer asset
+- `OpenWorkflows.exe`                                ← standalone binary
 
 The first build downloads the NSIS bundler and compiles crates (several
 minutes). If it fails, stop and surface the log — do NOT publish.
@@ -57,7 +57,7 @@ minutes). If it fails, stop and surface the log — do NOT publish.
 Confirm the installer exists before continuing:
 
 ```bash
-ls "app/src-tauri/target/release/bundle/nsis/OpenWorkflow_${VER}_x64-setup.exe"
+ls "app/src-tauri/target/release/bundle/nsis/OpenWorkflows_${VER}_x64-setup.exe"
 ```
 
 ### 3. Commit + push
@@ -75,25 +75,25 @@ so it must land on `main`.
 
 ```bash
 gh release create "v${VER}" \
-  --repo wellingfeng/OpenWorkflow \
-  --title "OpenWorkflow v${VER}" \
+  --repo wellingfeng/OpenWorkflows \
+  --title "OpenWorkflows v${VER}" \
   --notes "Release v${VER}" \
-  "app/src-tauri/target/release/bundle/nsis/OpenWorkflow_${VER}_x64-setup.exe" \
-  "app/src-tauri/target/release/OpenWorkflow.exe"
+  "app/src-tauri/target/release/bundle/nsis/OpenWorkflows_${VER}_x64-setup.exe" \
+  "app/src-tauri/target/release/OpenWorkflows.exe"
 ```
 
-The asset filename MUST be `OpenWorkflow_${VER}_x64-setup.exe` — that is exactly
+The asset filename MUST be `OpenWorkflows_${VER}_x64-setup.exe` — that is exactly
 the URL `version.txt` points at. If you rename the asset, also fix `version.txt`.
 
 ### 5. Verify the update path end-to-end
 
 ```bash
 # Manifest is live and matches the release:
-rtk curl -s "https://raw.githubusercontent.com/wellingfeng/OpenWorkflow/main/app/version.txt"
+rtk curl -s "https://raw.githubusercontent.com/wellingfeng/OpenWorkflows/main/app/version.txt"
 
 # The download URL resolves (302 -> the asset):
 rtk curl -sI -o /dev/null -w "%{http_code}\n" -L \
-  "https://github.com/wellingfeng/OpenWorkflow/releases/download/v${VER}/OpenWorkflow_${VER}_x64-setup.exe"
+  "https://github.com/wellingfeng/OpenWorkflows/releases/download/v${VER}/OpenWorkflows_${VER}_x64-setup.exe"
 ```
 
 The manifest `version` must equal `$VER`, and the download HEAD must end in

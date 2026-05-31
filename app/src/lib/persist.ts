@@ -22,7 +22,7 @@ import { tauriAvailable } from './tauri';
  *       writes to `path` if provided; otherwise it falls back to localStorage
  *       so a fresh, never-saved graph still survives a reload.
  *
- * The .owf.json extension is the canonical OpenWorkflow file extension. The
+ * The .owf.json extension is the canonical OpenWorkflows file extension. The
  * IR is serialised with stable 2-space JSON so diffs are human-readable.
  */
 
@@ -92,7 +92,7 @@ export async function saveWorkflow(
       title,
       defaultPath: defaultFileName(ir),
       filters: [
-        { name: 'OpenWorkflow', extensions: ['owf.json', 'json'] },
+        { name: 'OpenWorkflows', extensions: ['owf.json', 'json'] },
       ],
     });
     if (!picked) return null;
@@ -136,7 +136,7 @@ export async function openWorkflow(title = '打开 Workflow'): Promise<{
     title,
     multiple: false,
     directory: false,
-    filters: [{ name: 'OpenWorkflow', extensions: ['owf.json', 'json'] }],
+    filters: [{ name: 'OpenWorkflows', extensions: ['owf.json', 'json'] }],
   });
   if (!picked) return null;
   const target = Array.isArray(picked)

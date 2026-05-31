@@ -1,4 +1,4 @@
-/** Canonical filesystem root for OpenWorkflow history data. */
+/** Canonical filesystem root for OpenWorkflows history data. */
 export const HISTORY_ROOT_DIR = 'C:\\Users\\FW\\.worktree';
 
 /** Alias used by code that talks about the physical worktree root. */

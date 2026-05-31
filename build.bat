@@ -1,12 +1,12 @@
 @echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
-title OpenWorkflow (Build EXE)
+title OpenWorkflows (Build EXE)
 
 cd /d "%~dp0app"
 
 echo ============================================================
-echo   OpenWorkflow  -  Package Windows EXE  (tauri build)
+echo   OpenWorkflows  -  Package Windows EXE  (tauri build)
 echo ============================================================
 echo.
 
@@ -40,17 +40,17 @@ echo ============================================================
 echo   BUILD COMPLETE
 echo ============================================================
 set "REL=%~dp0app\src-tauri\target\release"
-echo   Standalone app : !REL!\OpenWorkflow.exe
-echo   Installer (exe): !REL!\bundle\nsis\OpenWorkflow_0.1.2_x64-setup.exe
+echo   Standalone app : !REL!\OpenWorkflows.exe
+echo   Installer (exe): !REL!\bundle\nsis\OpenWorkflows_0.1.2_x64-setup.exe
 echo ------------------------------------------------------------
-echo   - Double-click OpenWorkflow.exe to run directly (needs WebView2,
+echo   - Double-click OpenWorkflows.exe to run directly (needs WebView2,
 echo     which ships with Windows 10/11).
 echo   - Or run the *_x64-setup.exe installer to install it like normal software.
 echo ------------------------------------------------------------
 
 REM ---- open the output folders in Explorer ----
 if exist "!REL!\bundle\nsis" start "" explorer "!REL!\bundle\nsis"
-if exist "!REL!\OpenWorkflow.exe" start "" explorer /select,"!REL!\OpenWorkflow.exe"
+if exist "!REL!\OpenWorkflows.exe" start "" explorer /select,"!REL!\OpenWorkflows.exe"
 
 echo.
 pause

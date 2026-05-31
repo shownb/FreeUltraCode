@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Bump the OpenWorkflow version across every place it is declared and
+ * Bump the OpenWorkflows version across every place it is declared and
  * regenerate the update manifest (app/version.txt).
  *
  * Touches:
@@ -20,7 +20,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const REPO = 'wellingfeng/OpenWorkflow';
+const REPO = 'wellingfeng/OpenWorkflows';
 const here = dirname(fileURLToPath(import.meta.url));
 const appDir = join(here, '..'); // app/
 
@@ -71,13 +71,13 @@ writeFileSync(cargoPath, cargo);
 // version.txt manifest
 const manifest = {
   version: next,
-  url: `https://github.com/${REPO}/releases/download/v${next}/OpenWorkflow_${next}_x64-setup.exe`,
-  notes: `OpenWorkflow v${next}`,
+  url: `https://github.com/${REPO}/releases/download/v${next}/OpenWorkflows_${next}_x64-setup.exe`,
+  notes: `OpenWorkflows v${next}`,
   pubDate: new Date().toISOString().slice(0, 10),
 };
 writeFileSync(versionTxtPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
 console.log(`bumped ${current} -> ${next}`);
 console.log('  updated: package.json, tauri.conf.json, Cargo.toml, version.txt');
-console.log(`  installer asset: OpenWorkflow_${next}_x64-setup.exe`);
+console.log(`  installer asset: OpenWorkflows_${next}_x64-setup.exe`);
 console.log(`VERSION=${next}`);

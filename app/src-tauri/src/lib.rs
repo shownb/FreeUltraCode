@@ -441,7 +441,7 @@ async fn run_workflow(
 
 /// System prompt steering the model to emit a pure IRGraph JSON object that maps
 /// onto a *runnable* Claude Code workflow (the injected-globals DSL).
-const AI_EDIT_SYSTEM: &str = "You are a workflow graph editor for OpenWorkflow. You receive the current workflow as an IRGraph JSON object plus a natural-language instruction (in Chinese or English). Return ONLY a single valid IRGraph JSON object (no markdown, no prose).
+const AI_EDIT_SYSTEM: &str = "You are a workflow graph editor for OpenWorkflows. You receive the current workflow as an IRGraph JSON object plus a natural-language instruction (in Chinese or English). Return ONLY a single valid IRGraph JSON object (no markdown, no prose).
 
 The IRGraph compiles to a real Claude Code workflow script, so use these exact node shapes:
 - Envelope: {version, meta, nodes, edges, layout?}.

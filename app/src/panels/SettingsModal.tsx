@@ -21,7 +21,6 @@ import {
   Sparkles,
   SquareTerminal,
   Trash2,
-  Wrench,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -98,39 +97,17 @@ type SettingsTab =
   | 'general'
   | 'models'
   | 'shortcuts'
-  | 'runtime'
   | 'appearance'
-  | 'advanced'
   | 'about';
 type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
-type PlaceholderTabId = Exclude<
-  SettingsTab,
-  'general' | 'models' | 'shortcuts' | 'appearance' | 'about'
->;
 
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
   { id: 'general', labelKey: 'settings.tabs.general', Icon: SlidersHorizontal },
   { id: 'models', labelKey: 'settings.tabs.models', Icon: KeyRound },
   { id: 'shortcuts', labelKey: 'settings.tabs.shortcuts', Icon: Keyboard },
-  { id: 'runtime', labelKey: 'settings.tabs.runtime', Icon: SquareTerminal },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
-  { id: 'advanced', labelKey: 'settings.tabs.advanced', Icon: Wrench },
   { id: 'about', labelKey: 'settings.tabs.about', Icon: Info },
 ];
-
-const placeholderCopy: Record<
-  PlaceholderTabId,
-  { titleKey: TranslationKey; descriptionKey: TranslationKey }
-> = {
-  runtime: {
-    titleKey: 'settings.runtimeTitle',
-    descriptionKey: 'settings.runtimeDescription',
-  },
-  advanced: {
-    titleKey: 'settings.advancedTitle',
-    descriptionKey: 'settings.advancedDescription',
-  },
-};
 
 export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<SettingsTab>('general');
@@ -263,9 +240,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 <AppearanceSettings locale={locale} />
               ) : tab === 'about' ? (
                 <AboutSettings locale={locale} />
-              ) : (
-                <PlaceholderTab tab={tab} locale={locale} />
-              )}
+              ) : null}
             </div>
           </section>
         </div>
@@ -2130,33 +2105,6 @@ function SettingRow({
   );
 }
 
-function PlaceholderTab({
-  tab,
-  locale,
-}: {
-  tab: PlaceholderTabId;
-  locale: Locale;
-}) {
-  const copy = placeholderCopy[tab];
-  return (
-    <div className="space-y-4">
-      <div>
-        <h3 className="text-lg font-semibold text-fg">
-          {t(locale, copy.titleKey)}
-        </h3>
-        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
-          {t(locale, copy.descriptionKey)}
-        </p>
-      </div>
-      <div className="space-y-2">
-        <div className="h-12 rounded-lg border border-dashed border-border-soft bg-bg-alt/70" />
-        <div className="h-12 rounded-lg border border-dashed border-border-soft bg-bg-alt/50" />
-        <div className="h-12 rounded-lg border border-dashed border-border-soft bg-bg-alt/30" />
-      </div>
-    </div>
-  );
-}
-
 function AppearanceSettings({ locale }: { locale: Locale }) {
   const appearance = useStore((s) => s.appearance);
   const setStylePresetId = useStore((s) => s.setStylePresetId);
@@ -2291,7 +2239,7 @@ function AboutSettings({ locale }: { locale: Locale }) {
             <Sparkles size={20} strokeWidth={2.2} />
           </span>
           <div className="min-w-0">
-            <div className="text-sm font-semibold text-fg">OpenWorkflow</div>
+            <div className="text-sm font-semibold text-fg">OpenWorkflows</div>
             <span className="mt-1 inline-block rounded-md border border-border bg-panel-2 px-2 py-0.5 font-mono text-[11px] text-fg-dim">
               {t(locale, 'settings.aboutVersion')} v{APP_VERSION}
             </span>

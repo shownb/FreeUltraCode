@@ -1,15 +1,15 @@
 @echo off
 setlocal enabledelayedexpansion
-title OpenWorkflow Runner
+title OpenWorkflows Runner
 cd /d "%~dp0"
 
-set "EXE=app\src-tauri\target\release\OpenWorkflow.exe"
+set "EXE=app\src-tauri\target\release\OpenWorkflows.exe"
 set "MODE=auto"
 if /I "%~1"=="/run"   set "MODE=run"
 if /I "%~1"=="/build" set "MODE=build"
 
 echo ============================================================
-echo   OpenWorkflow Runner
+echo   OpenWorkflows Runner
 echo ============================================================
 echo   run.bat          auto: rebuild if sources changed, then launch
 echo   run.bat /run     launch existing exe only
@@ -65,7 +65,7 @@ if "%MODE%"=="build" goto build_only_done
 :do_launch
 if not exist "%EXE%" goto no_exe
 echo.
-echo [..] launching OpenWorkflow ...
+echo [..] launching OpenWorkflows ...
 start "" "%EXE%"
 echo [OK] launched an independent window. You can close this console.
 echo      (self-test tip: point the in-app workspace to a project COPY.)

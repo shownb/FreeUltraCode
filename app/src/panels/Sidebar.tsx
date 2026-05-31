@@ -122,7 +122,7 @@ export default function Sidebar() {
       <div className="flex items-center gap-2 border-b border-border-soft px-4 py-3.5">
         <span className="text-accent-2">◆</span>
         <span className="text-sm font-semibold tracking-tight text-fg">
-          OpenWorkflow
+          OpenWorkflows
         </span>
       </div>
 

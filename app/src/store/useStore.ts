@@ -3784,7 +3784,7 @@ function withNodeExecutionContract(prompt: string): string {
   return `${prompt}
 
 ---
-OpenWorkflow node execution contract:
+OpenWorkflows node execution contract:
 - Treat this as one bounded workflow node, not an open-ended session.
 - Finish with a concise final answer even if optional verification remains.
 - Do not start long-running ad-hoc harnesses after the requested checks pass.
