@@ -189,7 +189,7 @@ function runningDot(
 
 function statusDot(
   container: HTMLElement,
-  status: 'none' | 'running' | 'aiEditing' | 'success' | 'error' | 'interrupted',
+  status: 'none' | 'thinking' | 'unrun' | 'running' | 'success' | 'failed',
 ): HTMLElement | null {
   return container.querySelector(`[data-status="${status}"]`);
 }
@@ -232,6 +232,9 @@ describe('Sidebar running progress dot', () => {
       const zeroSpinner = statusIndicator(zeroDot);
       expect(zeroSpinner).not.toBeNull();
       expect(zeroSpinner?.classList.contains('owf-status-spinner')).toBe(true);
+      expect(zeroSpinner?.style.getPropertyValue('--owf-status-color')).toBe(
+        'var(--status-success)',
+      );
 
       mockState.runningSessionProgress = {
         [WORKSPACE.id + '::' + SESSION.id]: {
@@ -248,14 +251,41 @@ describe('Sidebar running progress dot', () => {
       const completeSpinner = statusIndicator(completeDot);
       expect(completeSpinner).not.toBeNull();
       expect(completeSpinner?.classList.contains('owf-status-spinner')).toBe(true);
+      expect(completeSpinner?.style.getPropertyValue('--owf-status-color')).toBe(
+        'var(--status-success)',
+      );
       expect(statusDot(view.container, 'success')).toBeNull();
     } finally {
       await view.cleanup();
     }
   });
 
-  it('reserves a fixed status slot when a session has no status', async () => {
+  it('renders unrun workflow sessions as a static blue dot', async () => {
     resetSidebarStore();
+    const view = await renderSidebar();
+
+    try {
+      const dot = statusDot(view.container, 'unrun');
+      expect(dot).not.toBeNull();
+      expect(dot?.getAttribute('title')).toBe('未运行');
+      const indicator = statusIndicator(dot);
+      expect(indicator).not.toBeNull();
+      expect(indicator?.classList.contains('owf-status-spinner')).toBe(false);
+      expect(indicator?.style.getPropertyValue('--owf-status-color')).toBe(
+        'var(--status-ai-edit)',
+      );
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('reserves a fixed status slot when a chat session has no status', async () => {
+    resetSidebarStore();
+    mockState.sessionTree = {
+      [WORKSPACE.id]: [{ ...SESSION, isWorkflow: false }],
+    };
+    mockState.sessions = [{ ...SESSION, isWorkflow: false }];
+
     const view = await renderSidebar();
 
     try {
@@ -275,32 +305,35 @@ describe('Sidebar running progress dot', () => {
   });
 
   it.each([
-    ['success', '已完成', 'var(--status-success)'],
-    ['error', '已失败', 'var(--status-error)'],
-    ['interrupted', '已中断', 'var(--status-interrupted)'],
-  ] as const)('renders the %s terminal status indicator', async (status, label, color) => {
-    resetSidebarStore();
-    mockState.sessionTree = {
-      [WORKSPACE.id]: [{ ...SESSION, runStatus: status }],
-    };
-    mockState.sessions = [{ ...SESSION, runStatus: status }];
+    ['success', 'success', '已完成', 'var(--status-success)'],
+    ['error', 'failed', '已失败', 'var(--status-error)'],
+    ['interrupted', 'failed', '已失败', 'var(--status-error)'],
+  ] as const)(
+    'renders the %s terminal status indicator',
+    async (status, tone, label, color) => {
+      resetSidebarStore();
+      mockState.sessionTree = {
+        [WORKSPACE.id]: [{ ...SESSION, runStatus: status }],
+      };
+      mockState.sessions = [{ ...SESSION, runStatus: status }];
 
-    const view = await renderSidebar();
+      const view = await renderSidebar();
 
-    try {
-      const dot = statusDot(view.container, status);
-      expect(dot).not.toBeNull();
-      expect(dot?.getAttribute('title')).toBe(label);
-      const indicator = statusIndicator(dot);
-      expect(indicator).not.toBeNull();
-      expect(indicator?.classList.contains('owf-status-spinner')).toBe(false);
-      expect(indicator?.style.getPropertyValue('--owf-status-color')).toBe(
-        color,
-      );
-    } finally {
-      await view.cleanup();
-    }
-  });
+      try {
+        const dot = statusDot(view.container, tone);
+        expect(dot).not.toBeNull();
+        expect(dot?.getAttribute('title')).toBe(label);
+        const indicator = statusIndicator(dot);
+        expect(indicator).not.toBeNull();
+        expect(indicator?.classList.contains('owf-status-spinner')).toBe(false);
+        expect(indicator?.style.getPropertyValue('--owf-status-color')).toBe(
+          color,
+        );
+      } finally {
+        await view.cleanup();
+      }
+    },
+  );
 
   it('keeps the new workflow action enabled while the active workflow is running', async () => {
     resetSidebarStore();
@@ -338,6 +371,27 @@ describe('Sidebar running progress dot', () => {
       });
 
       expect(mockState.newWorkflow).toHaveBeenCalledTimes(1);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('renders a blue spinning indicator while AI is thinking', async () => {
+    resetSidebarStore();
+    mockState.aiEditingSessions = [SESSION_KEY];
+
+    const view = await renderSidebar();
+
+    try {
+      const dot = statusDot(view.container, 'thinking');
+      expect(dot).not.toBeNull();
+      expect(dot?.getAttribute('title')).toBe('AI 思考中');
+      const indicator = statusIndicator(dot);
+      expect(indicator).not.toBeNull();
+      expect(indicator?.classList.contains('owf-status-spinner')).toBe(true);
+      expect(indicator?.style.getPropertyValue('--owf-status-color')).toBe(
+        'var(--status-ai-edit)',
+      );
     } finally {
       await view.cleanup();
     }

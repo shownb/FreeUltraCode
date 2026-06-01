@@ -43,6 +43,8 @@ function flowNodeType(type: NodeType): string {
       return 'parallel';
     case 'pipeline':
       return 'pipeline';
+    case 'consensus':
+      return 'consensus';
     case 'branch':
     case 'loop':
       return 'container';

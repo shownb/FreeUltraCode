@@ -10,6 +10,7 @@ app/*.tsbuildinfo
 # Local agent/browser/debug state
 .omc/
 .gstack/
+.claude/
 app/.gstack/
 app/src-tauri/.gstack/
 

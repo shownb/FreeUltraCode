@@ -289,8 +289,8 @@ pre,
 .owf-status-spinner {
   background: transparent;
   border: var(--owf-status-spinner-ring) solid var(--status-running-track);
-  border-right-color: var(--status-running);
-  border-top-color: var(--status-running);
+  border-right-color: var(--owf-status-color, var(--status-running));
+  border-top-color: var(--owf-status-color, var(--status-running));
   animation: owf-status-spin 900ms linear infinite;
 }
 

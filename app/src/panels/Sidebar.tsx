@@ -5,6 +5,7 @@ import {
   useStore,
   workflowSessionKeyId,
 } from '@/store/useStore';
+import type { Session } from '@/store/types';
 import type { Locale } from '@/lib/i18n';
 import { openWorkflow } from '@/lib/persist';
 import { useResizableWidth } from '@/lib/useResizableWidth';
@@ -62,10 +63,26 @@ function historyStatusLabel(
 ): string | undefined {
   if (!status) return undefined;
   if (status === 'running') return runningProgressLabel(locale, percent);
-  if (status === 'aiEditing') return t(locale, 'sidebar.aiEditing');
+  if (status === 'thinking') return t(locale, 'sidebar.thinking');
+  if (status === 'unrun') return t(locale, 'sidebar.unrun');
   if (status === 'success') return t(locale, 'sidebar.completed');
-  if (status === 'error') return t(locale, 'sidebar.failed');
-  return t(locale, 'sidebar.interrupted');
+  return t(locale, 'sidebar.failed');
+}
+
+function historyStatusTone(
+  session: Pick<Session, 'isWorkflow' | 'runStatus'>,
+  liveStatus: ReturnType<typeof sessionLiveStatus>,
+): StatusTone | null {
+  if (liveStatus === 'running') return 'running';
+  if (liveStatus === 'aiEditing') return 'thinking';
+  if (session.runStatus === 'success') return 'success';
+  if (
+    session.runStatus === 'error' ||
+    session.runStatus === 'interrupted'
+  ) {
+    return 'failed';
+  }
+  return session.isWorkflow ? 'unrun' : null;
 }
 
 export default function Sidebar() {
@@ -192,7 +209,7 @@ export default function Sidebar() {
                             sessionKey,
                             { runningSessions, aiEditingSessions },
                           );
-                          const status = liveStatus ?? session.runStatus ?? null;
+                          const status = historyStatusTone(session, liveStatus);
                           const runProgress =
                             runningSessionProgress[workflowSessionKeyId(sessionKey)];
                           const statusLabel = historyStatusLabel(
@@ -263,7 +280,7 @@ export default function Sidebar() {
                   sessionKey,
                   { runningSessions, aiEditingSessions },
                 );
-                const status = liveStatus ?? session.runStatus ?? null;
+                const status = historyStatusTone(session, liveStatus);
                 const runProgress =
                   runningSessionProgress[workflowSessionKeyId(sessionKey)];
                 const statusLabel = historyStatusLabel(

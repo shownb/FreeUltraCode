@@ -549,12 +549,18 @@ const CLI_ERROR_CONTEXT_LIMIT: usize = 1200;
 /// Read the CLI timeout override from the environment, falling back to a
 /// longer default so legitimate long-running workflows are less likely to be
 /// killed too early.
-fn ai_cli_timeout_secs() -> u64 {
+fn configured_ai_cli_timeout_secs() -> u64 {
     std::env::var("OPENWORKFLOW_AI_CLI_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|secs| *secs >= 60)
         .unwrap_or(DEFAULT_AI_CLI_TIMEOUT_SECS)
+}
+
+fn ai_cli_timeout_secs(override_secs: Option<u64>) -> u64 {
+    let configured = configured_ai_cli_timeout_secs();
+    let dynamic = override_secs.filter(|secs| *secs >= 60).unwrap_or(configured);
+    configured.max(dynamic)
 }
 
 /// Whether to load the machine's global MCP servers for each workflow node.
@@ -571,12 +577,24 @@ fn mcp_enabled() -> bool {
 }
 
 /// Read the no-progress timeout override. Set to 0 to disable idle detection.
-fn ai_cli_idle_timeout_secs() -> u64 {
+fn configured_ai_cli_idle_timeout_secs() -> u64 {
     std::env::var("OPENWORKFLOW_AI_CLI_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|secs| *secs == 0 || *secs >= 30)
         .unwrap_or(DEFAULT_AI_CLI_IDLE_TIMEOUT_SECS)
+}
+
+fn ai_cli_idle_timeout_secs(override_secs: Option<u64>) -> u64 {
+    let configured = configured_ai_cli_idle_timeout_secs();
+    if configured == 0 {
+        return 0;
+    }
+    match override_secs.filter(|secs| *secs == 0 || *secs >= 30) {
+        Some(0) => 0,
+        Some(dynamic) => configured.max(dynamic),
+        None => configured,
+    }
 }
 
 fn touch_activity(last_activity: &Arc<Mutex<std::time::Instant>>) {
@@ -800,6 +818,8 @@ async fn ai_cli(
     cwd: Option<String>,
     permission: Option<String>,
     env_vars: Option<HashMap<String, String>>,
+    timeout_seconds: Option<u64>,
+    idle_timeout_seconds: Option<u64>,
     run_id: String,
     // Optional Claude session continuity (claude only): when `session_id` is set
     // and `resume` is false the run *creates* that session (`--session-id`); when
@@ -1123,8 +1143,8 @@ async fn ai_cli(
             CodexLastMessageReady,
         }
 
-        let timeout_secs = ai_cli_timeout_secs();
-        let idle_timeout_secs = ai_cli_idle_timeout_secs();
+        let timeout_secs = ai_cli_timeout_secs(timeout_seconds);
+        let idle_timeout_secs = ai_cli_idle_timeout_secs(idle_timeout_seconds);
         let idle_timeout = (idle_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(idle_timeout_secs));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);

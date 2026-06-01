@@ -14,6 +14,7 @@ import {
   getDefaultGatewaySelection,
   getExplicitActiveGatewaySelection,
   listGatewayProviders,
+  preferredGatewayProvider,
   setActiveGatewaySelection,
 } from '@/lib/gatewayConfig';
 import {
@@ -27,11 +28,23 @@ import {
   type ResolvedGatewayRoute,
 } from './types';
 
-const DEFAULT_MODEL_BY_CLASS: Record<string, string> = {
-  sonnet: 'claude-sonnet-4-20250514',
-  opus: 'claude-opus-4-20250514',
-  haiku: 'claude-3-5-haiku-latest',
-};
+// Bare tier words the claude CLI maps to a concrete model on its own. Passing
+// these as --model is safe; the CLI resolves them against the active endpoint.
+const CLI_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
+
+/**
+ * True only for strings the claude CLI / Anthropic relay will accept as a
+ * --model value: a genuine `claude-*` model id, or a bare tier alias the CLI
+ * maps. Plan/label strings imported from cc-switch (e.g. "kimi-for-coding")
+ * return false so we omit --model and let the relay use its default — matching
+ * the working bare `claude` CLI, which passes no --model at all.
+ */
+export function looksLikeClaudeModelId(model: unknown): boolean {
+  if (typeof model !== 'string') return false;
+  const lower = model.trim().toLowerCase();
+  if (!lower) return false;
+  return lower.startsWith('claude') || CLI_TIER_ALIASES.has(lower);
+}
 
 export function modelClassFromModelId(model: unknown): ModelClass {
   if (typeof model !== 'string') return DEFAULT_GATEWAY_SELECTION.modelClass;
@@ -39,7 +52,10 @@ export function modelClassFromModelId(model: unknown): ModelClass {
   if (lower.includes('haiku')) return 'haiku';
   if (lower.includes('opus')) return 'opus';
   if (lower.includes('sonnet')) return 'sonnet';
-  return model;
+  // A label that names no Claude tier (e.g. a cc-switch plan id like
+  // "kimi-for-coding") must NOT be persisted as a modelClass. Default to the
+  // standard tier so it never leaks downstream as a --model value.
+  return DEFAULT_GATEWAY_SELECTION.modelClass;
 }
 
 export function normalizeGatewaySelection(
@@ -354,7 +370,7 @@ export function listGatewayRunOptions(): GatewayRunOption[] {
           options.push({
             id: selectionKey(selection),
             label: `${provider.name} · ${channel.name} · ${modelClass.label}`,
-            hint: gatewayChannelHint(channel),
+            hint: gatewayChannelHint(provider, channel),
             selection,
             transport: channel.route.transport,
             providerName: provider.name,
@@ -374,7 +390,7 @@ export function listGatewayRunOptions(): GatewayRunOption[] {
         options.push({
           id: selectionKey(selection),
           label: `${provider.name} · ${channel.name}`,
-          hint: gatewayChannelHint(channel),
+          hint: gatewayChannelHint(provider, channel),
           selection,
           transport: channel.route.transport,
           providerName: provider.name,
@@ -490,11 +506,17 @@ export function gatewayRouteEnv(
     if (route.baseUrl) env.OPENAI_BASE_URL = route.baseUrl;
     if (route.model) env.OPENAI_MODEL = route.model;
   } else if (route.transport === 'cli') {
-    // CLI adapters (codex / gemini) read credentials from their own config or
-    // env. Inject the selected channel's key + base url so the local CLI can
-    // reach a relay (e.g. PackyCode) without re-running cc-switch. The exact
-    // var a given CLI honours is version-specific; we set the common ones.
-    if (route.adapter === 'codex') {
+    // CLI adapters read credentials from their own config or env. Inject the
+    // selected channel's key + base url so imported cc-switch providers target
+    // the same relay/model without re-running cc-switch.
+    if (route.adapter === 'claude-code') {
+      if (route.apiKey) {
+        env.ANTHROPIC_API_KEY = route.apiKey;
+        env.ANTHROPIC_AUTH_TOKEN = route.apiKey;
+      }
+      if (route.baseUrl) env.ANTHROPIC_BASE_URL = route.baseUrl;
+      if (route.model) env.ANTHROPIC_MODEL = route.model;
+    } else if (route.adapter === 'codex') {
       if (route.apiKey) env.OPENAI_API_KEY = route.apiKey;
       if (route.baseUrl) env.OPENAI_BASE_URL = route.baseUrl;
     } else if (route.adapter === 'gemini') {
@@ -518,23 +540,24 @@ function resolveProvider(
   providers: GatewayProvider[],
   selection: GatewaySelection,
 ): GatewayProvider | undefined {
+  const adapter = normalizeAdapter(selection.adapter);
   if (selection.providerId) {
     const selected = providers.find(
       (provider) => provider.id === selection.providerId,
     );
-    if (selected) return selected;
+    if (selected && selected.adapter === adapter) return selected;
   }
-  // No (or stale) channel pinned → fall back to this category's default
-  // provider, then to the first provider of the adapter. This is what makes a
-  // per-category default (set in Settings) actually drive resolution.
+  // No (or stale) channel pinned → fall back to the category default, then
+  // prefer any CLI-backed provider for the adapter before taking the first
+  // remaining match. This keeps cc-switch imports on the local runtime.
   const activeId = getActiveProviderId(
-    adapterToProviderKind(selection.adapter),
+    adapterToProviderKind(adapter),
   );
   if (activeId) {
     const active = providers.find((provider) => provider.id === activeId);
-    if (active && active.adapter === selection.adapter) return active;
+    if (active && active.adapter === adapter) return active;
   }
-  return providers.find((provider) => provider.adapter === selection.adapter);
+  return preferredGatewayProvider(providers, adapter);
 }
 
 function gatewayChannelAvailable(
@@ -554,12 +577,18 @@ function gatewayChannelAvailable(
 }
 
 function gatewayChannelHint(
+  provider: GatewayProvider,
   channel: GatewayProvider['channels'][number],
 ): string {
   const transport = channel.route.transport;
   if (transport === 'anthropic' || transport === 'openai-compatible') {
     const baseUrl = channel.route.baseUrl ?? channel.baseUrl ?? '';
     return `${transport === 'anthropic' ? 'Anthropic API' : 'OpenAI-compatible'} · ${providerBaseUrlHost(baseUrl)}`;
+  }
+  if (transport === 'cli') {
+    const baseUrl = channel.route.baseUrl ?? channel.baseUrl ?? '';
+    const host = baseUrl.trim() ? ` · ${providerBaseUrlHost(baseUrl)}` : '';
+    return `${runtimeAdapterLabel(provider.adapter)} CLI${host}`;
   }
   return transport;
 }
@@ -569,15 +598,31 @@ function resolveChannelModel(
   channel: GatewayProvider['channels'][number],
   modelClass: ModelClass,
 ): string | undefined {
-  return (
-    channel.route.models?.[modelClass] ??
-    channel.models?.[modelClass] ??
-    channel.route.model ??
-    channel.model ??
-    (provider.adapter === 'claude-code'
-      ? DEFAULT_MODEL_BY_CLASS[modelClass] ?? modelClass
-      : modelClass)
-  );
+  // litellm-style per-tier maps win: an explicit tier->modelId mapping is a
+  // deliberate real model id, so it is always honoured (claude-code included).
+  const tierModel =
+    channel.route.models?.[modelClass] ?? channel.models?.[modelClass];
+  if (tierModel) return tierModel;
+
+  const channelModel = channel.route.model ?? channel.model;
+
+  if (provider.adapter === 'claude-code') {
+    if (channelModel) {
+      // A channel model IS configured (typically a cc-switch import or a
+      // custom relay). Pass it only when it's a genuine Claude model id; a plan
+      // label (e.g. "kimi-for-coding") is NOT a model and must be dropped so the
+      // relay falls back to its own default — exactly like bare `claude`, which
+      // sends no --model against a custom endpoint.
+      return looksLikeClaudeModelId(channelModel) ? channelModel : undefined;
+    }
+    // No channel model configured (e.g. the official Anthropic endpoint): ship
+    // the bare tier alias so sonnet/opus/haiku selection still works; the CLI
+    // maps it. An arbitrary (non-tier) modelClass -> omit --model.
+    return CLI_TIER_ALIASES.has(modelClass) ? modelClass : undefined;
+  }
+
+  // codex / gemini: their model ids are real upstream ids; pass through.
+  return channelModel ?? modelClass;
 }
 
 function cliFallbackRoute(
@@ -587,7 +632,11 @@ function cliFallbackRoute(
   const adapter = normalizeAdapter(selection.adapter);
   const model =
     adapter === 'claude-code'
-      ? DEFAULT_MODEL_BY_CLASS[selection.modelClass] ?? selection.modelClass
+      ? // Tier alias (sonnet/opus/haiku) -> let the CLI map it; any other
+        // modelClass (a custom label) -> omit --model and use the relay default.
+        CLI_TIER_ALIASES.has(selection.modelClass)
+        ? selection.modelClass
+        : undefined
       : selection.modelClass;
   return {
     selection: { ...selection, adapter },

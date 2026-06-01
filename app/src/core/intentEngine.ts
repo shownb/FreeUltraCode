@@ -46,6 +46,7 @@ const NODE_DEFAULTS: Record<
   log: { label: '日志', params: { message: '' } },
   variable: { label: '变量', params: { value: null } },
   codeblock: { label: '代码块', params: { code: '' } },
+  consensus: { label: '共识', params: { voters: [], strategy: 'multi-lens' } },
 };
 
 /**
@@ -55,6 +56,7 @@ const NODE_DEFAULTS: Record<
 function detectNodeType(text: string): NodeType | null {
   const t = text.toLowerCase();
   if (/(verify|verifier|校验|验证|核验)/.test(t)) return 'agent';
+  if (/(consensus|共识|投票|交叉验证|多视角|对抗验证|方案竞标)/.test(t)) return 'consensus';
   if (/(parallel|并行|并联|并行节点)/.test(t)) return 'parallel';
   if (/(pipeline|流水线|串联)/.test(t)) return 'pipeline';
   if (/(phase|阶段)/.test(t)) return 'phase';

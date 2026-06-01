@@ -22,6 +22,7 @@ interface LegacyProvider {
   name?: string;
   apiKey?: string;
   baseUrl?: string;
+  transport?: string;
   model?: string;
 }
 
@@ -198,6 +199,8 @@ function readLegacyProviders(): LegacyProvider[] {
           name: typeof raw.name === 'string' ? raw.name : undefined,
           apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : undefined,
           baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl : undefined,
+          transport:
+            typeof raw.transport === 'string' ? raw.transport : undefined,
           model: typeof raw.model === 'string' ? raw.model : undefined,
         };
       })
@@ -219,11 +222,19 @@ function legacyKind(value: LegacyProvider): string {
   return 'anthropic';
 }
 
+function legacyTransport(value: LegacyProvider): GatewayTransport {
+  if (value.transport === 'cli') return 'cli';
+  if (value.transport === 'direct') {
+    return legacyKind(value) === 'anthropic' ? 'anthropic' : 'cli';
+  }
+  const kind = legacyKind(value);
+  return kind === 'anthropic' ? 'anthropic' : 'cli';
+}
+
 function legacyProviderToGateway(provider: LegacyProvider): GatewayProvider {
   const kind = legacyKind(provider);
   const adapter = normalizeAdapter(kind === 'anthropic' ? 'claude-code' : kind);
-  const transport: GatewayTransport =
-    kind === 'anthropic' ? 'anthropic' : 'cli';
+  const transport = legacyTransport(provider);
   const name =
     provider.name?.trim() ||
     (adapter === 'claude-code' ? 'Claude' : adapter);
@@ -249,6 +260,18 @@ function legacyProviderToGateway(provider: LegacyProvider): GatewayProvider {
       },
     ],
   };
+}
+
+export function preferredGatewayProvider(
+  providers: GatewayProvider[],
+  adapter: RuntimeAdapterId,
+): GatewayProvider | undefined {
+  const matches = providers.filter((provider) => provider.adapter === adapter);
+  return (
+    matches.find((provider) =>
+      provider.channels.some((channel) => channel.route.transport === 'cli'),
+    ) ?? matches[0]
+  );
 }
 
 function selectionFromProvider(provider: GatewayProvider): GatewaySelection {
@@ -315,8 +338,10 @@ export function getExplicitActiveGatewaySelection(): GatewaySelection | null {
 }
 
 export function getDefaultGatewaySelection(): GatewaySelection {
-  const providers = loadGatewayConfig().providers;
-  const provider = providers.find((candidate) => candidate.adapter === 'claude-code');
+  const provider = preferredGatewayProvider(
+    loadGatewayConfig().providers,
+    'claude-code',
+  );
   return provider ? selectionFromProvider(provider) : DEFAULT_GATEWAY_SELECTION;
 }
 

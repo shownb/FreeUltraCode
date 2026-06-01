@@ -2,11 +2,11 @@ import type { CSSProperties } from 'react';
 import { cn } from '@/lib/cn';
 
 export type StatusTone =
+  | 'thinking'
+  | 'unrun'
   | 'running'
-  | 'aiEditing'
   | 'success'
-  | 'error'
-  | 'interrupted';
+  | 'failed';
 
 interface StatusIndicatorProps {
   tone?: StatusTone | null;
@@ -14,18 +14,21 @@ interface StatusIndicatorProps {
   className?: string;
 }
 
-type StaticStatusTone = Exclude<StatusTone, 'running'>;
-
 function statusColorStyle(color: string): CSSProperties {
   return { '--owf-status-color': color } as CSSProperties;
 }
 
-const STATIC_TONE_STYLE: Record<StaticStatusTone, CSSProperties> = {
-  aiEditing: statusColorStyle('var(--status-ai-edit)'),
+const TONE_STYLE: Record<StatusTone, CSSProperties> = {
+  thinking: statusColorStyle('var(--status-ai-edit)'),
+  unrun: statusColorStyle('var(--status-ai-edit)'),
+  running: statusColorStyle('var(--status-success)'),
   success: statusColorStyle('var(--status-success)'),
-  error: statusColorStyle('var(--status-error)'),
-  interrupted: statusColorStyle('var(--status-interrupted)'),
+  failed: statusColorStyle('var(--status-error)'),
 };
+
+function isSpinningTone(tone: StatusTone): boolean {
+  return tone === 'thinking' || tone === 'running';
+}
 
 export default function StatusIndicator({
   tone = null,
@@ -43,16 +46,14 @@ export default function StatusIndicator({
       role={active ? 'img' : undefined}
       title={active ? label : undefined}
     >
-      {tone === 'running' ? (
+      {tone ? (
         <span
           aria-hidden="true"
-          className="owf-status-indicator owf-status-spinner"
-        />
-      ) : tone ? (
-        <span
-          aria-hidden="true"
-          className="owf-status-indicator"
-          style={STATIC_TONE_STYLE[tone]}
+          className={cn(
+            'owf-status-indicator',
+            isSpinningTone(tone) && 'owf-status-spinner',
+          )}
+          style={TONE_STYLE[tone]}
         />
       ) : null}
     </span>

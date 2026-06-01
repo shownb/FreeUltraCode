@@ -92,10 +92,17 @@ import {
   type StylePresetDefinition,
 } from '@/lib/appearance';
 import { useStore } from '@/store/useStore';
+import {
+  CONSENSUS_LIMITS,
+  getConsensusSettings,
+  setConsensusSetting,
+  type ConsensusSettings as ConsensusSettingsValues,
+} from '@/lib/consensusSettings';
 
 type SettingsTab =
   | 'general'
   | 'models'
+  | 'consensus'
   | 'shortcuts'
   | 'appearance'
   | 'about';
@@ -104,6 +111,7 @@ type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
   { id: 'general', labelKey: 'settings.tabs.general', Icon: SlidersHorizontal },
   { id: 'models', labelKey: 'settings.tabs.models', Icon: KeyRound },
+  { id: 'consensus', labelKey: 'settings.tabs.consensus', Icon: Sparkles },
   { id: 'shortcuts', labelKey: 'settings.tabs.shortcuts', Icon: Keyboard },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
   { id: 'about', labelKey: 'settings.tabs.about', Icon: Info },
@@ -234,6 +242,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 />
               ) : tab === 'models' ? (
                 <ModelsSettings locale={locale} cliRuntime={cliRuntime} />
+              ) : tab === 'consensus' ? (
+                <ConsensusSettings locale={locale} />
               ) : tab === 'shortcuts' ? (
                 <ShortcutsSettings locale={locale} />
               ) : tab === 'appearance' ? (
@@ -1338,8 +1348,11 @@ function ProviderCard({
   return (
     <article
       className={cn(
-        'relative flex min-h-[146px] flex-col overflow-hidden rounded-lg border border-border bg-bg-alt p-4',
-        onSelect && 'transition-colors hover:border-accent/60',
+        'relative flex min-h-[146px] flex-col overflow-hidden rounded-lg border p-4 transition-colors',
+        active
+          ? 'border-accent/60 bg-accent/10 ring-1 ring-inset ring-accent/20'
+          : 'border-border bg-bg-alt',
+        onSelect && 'hover:border-accent/60 hover:bg-accent/5',
       )}
     >
       {onSelect && (
@@ -1865,28 +1878,35 @@ function providerDraft(provider: ProviderDraft): ProviderDraft {
     name: provider.name,
     apiKey: provider.apiKey,
     baseUrl: provider.baseUrl,
+    transport: provider.transport,
     model: provider.model ?? '',
   };
 }
 
 function trimProviderDraft(draft: ProviderDraft): ProviderDraft {
   const model = draft.model?.trim();
+  const transport =
+    draft.kind === 'anthropic' ? draft.transport ?? 'direct' : 'cli';
   return {
     kind: draft.kind,
     name: draft.name.trim(),
     apiKey: draft.apiKey.trim(),
     baseUrl: draft.baseUrl.trim(),
+    transport,
     ...(model ? { model } : {}),
   };
 }
 
 function providerDraftChanged(a: ProviderDraft, b: ProviderDraft): boolean {
+  const left = trimProviderDraft(a);
+  const right = trimProviderDraft(b);
   return (
-    a.kind !== b.kind ||
-    a.name !== b.name ||
-    a.apiKey !== b.apiKey ||
-    a.baseUrl !== b.baseUrl ||
-    (a.model ?? '') !== (b.model ?? '')
+    left.kind !== right.kind ||
+    left.name !== right.name ||
+    left.apiKey !== right.apiKey ||
+    left.baseUrl !== right.baseUrl ||
+    (left.transport ?? '') !== (right.transport ?? '') ||
+    (left.model ?? '') !== (right.model ?? '')
   );
 }
 
@@ -2101,6 +2121,165 @@ function SettingRow({
         )}
       </div>
       <div className="md:justify-self-end">{children}</div>
+    </div>
+  );
+}
+
+function SwitchControl({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={cn(
+        'relative h-6 w-11 rounded-full border transition-colors',
+        checked ? 'border-accent bg-accent/25' : 'border-border bg-panel-2',
+      )}
+    >
+      <span
+        className={cn(
+          'absolute left-0.5 top-0.5 h-5 w-5 rounded-full transition-transform',
+          checked ? 'translate-x-5 bg-accent' : 'translate-x-0 bg-fg-faint',
+        )}
+      />
+    </button>
+  );
+}
+
+function StepperControl({
+  value,
+  min,
+  max,
+  disabled = false,
+  onChange,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  disabled?: boolean;
+  onChange: (value: number) => void;
+}) {
+  const set = (v: number) => onChange(Math.min(max, Math.max(min, v)));
+  const btn =
+    'flex h-8 w-8 items-center justify-center rounded-md border border-border bg-panel text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-40';
+  return (
+    <div
+      className={cn(
+        'inline-flex items-center gap-1.5',
+        disabled && 'pointer-events-none opacity-50',
+      )}
+    >
+      <button
+        type="button"
+        aria-label="−"
+        onClick={() => set(value - 1)}
+        disabled={value <= min}
+        className={btn}
+      >
+        −
+      </button>
+      <span className="w-10 text-center font-mono text-sm text-fg">{value}</span>
+      <button
+        type="button"
+        aria-label="+"
+        onClick={() => set(value + 1)}
+        disabled={value >= max}
+        className={btn}
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
+function ConsensusSettings({ locale }: { locale: Locale }) {
+  const [s, setS] = useState<ConsensusSettingsValues>(() => getConsensusSettings());
+  const update = <K extends keyof ConsensusSettingsValues>(
+    key: K,
+    value: ConsensusSettingsValues[K],
+  ) => {
+    setConsensusSetting(key, value);
+    setS(getConsensusSettings());
+  };
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className="text-lg font-semibold text-fg">
+          {t(locale, 'settings.consensusTitle')}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+          {t(locale, 'settings.consensusDescription')}
+        </p>
+      </div>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.genEnabledLabel')}
+        description={t(locale, 'settings.consensus.genEnabledDesc')}
+      >
+        <SwitchControl
+          checked={s.genEnabled}
+          onChange={(v) => update('genEnabled', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.genCandidatesLabel')}
+        description={t(locale, 'settings.consensus.genCandidatesDesc')}
+      >
+        <StepperControl
+          value={s.genCandidates}
+          min={CONSENSUS_LIMITS.genCandidates.min}
+          max={CONSENSUS_LIMITS.genCandidates.max}
+          disabled={!s.genEnabled}
+          onChange={(v) => update('genCandidates', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.voteSamplesLabel')}
+        description={t(locale, 'settings.consensus.voteSamplesDesc')}
+      >
+        <StepperControl
+          value={s.voteSamples}
+          min={CONSENSUS_LIMITS.voteSamples.min}
+          max={CONSENSUS_LIMITS.voteSamples.max}
+          onChange={(v) => update('voteSamples', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.concurrencyLabel')}
+        description={t(locale, 'settings.consensus.concurrencyDesc')}
+      >
+        <StepperControl
+          value={s.concurrency}
+          min={CONSENSUS_LIMITS.concurrency.min}
+          max={CONSENSUS_LIMITS.concurrency.max}
+          onChange={(v) => update('concurrency', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.autoSuggestLabel')}
+        description={t(locale, 'settings.consensus.autoSuggestDesc')}
+      >
+        <SwitchControl
+          checked={s.autoSuggest}
+          onChange={(v) => update('autoSuggest', v)}
+        />
+      </SettingRow>
+
+      <p className="text-xs leading-relaxed text-fg-faint">
+        {t(locale, 'settings.consensus.costNote')}
+      </p>
     </div>
   );
 }

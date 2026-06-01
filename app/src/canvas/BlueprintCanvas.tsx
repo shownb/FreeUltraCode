@@ -26,6 +26,7 @@ import { irToFlow, type FlowEdge, type FlowNodeData } from './irToFlow';
 import AgentNode from './nodes/AgentNode';
 import ParallelNode from './nodes/ParallelNode';
 import PipelineNode from './nodes/PipelineNode';
+import ConsensusNode from './nodes/ConsensusNode';
 import ContainerNode from './nodes/ContainerNode';
 import ControlNode from './nodes/ControlNode';
 import CanvasToolbar from './CanvasToolbar';
@@ -56,6 +57,7 @@ const nodeTypes: NodeTypes = {
   agent: AgentNode,
   parallel: ParallelNode,
   pipeline: PipelineNode,
+  consensus: ConsensusNode,
   container: ContainerNode,
   control: ControlNode,
 };
@@ -92,6 +94,12 @@ const ADDABLE_NODES: {
     label: 'Pipeline',
     accent: 'var(--accent-2)',
     translations: { 'zh-CN': { label: '流水线' }, 'en-US': { label: 'Pipeline' } },
+  },
+  {
+    type: 'consensus',
+    label: 'Consensus',
+    accent: 'var(--accent-2)',
+    translations: { 'zh-CN': { label: '共识投票' }, 'en-US': { label: 'Consensus' } },
   },
   {
     type: 'phase',

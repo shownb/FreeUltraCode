@@ -70,6 +70,15 @@ export function emitClaudeScript(ir: IRGraph): string {
     lines.push('');
   }
 
+  // Self-contained runtime helpers (e.g. `consensus`) so the exported script is
+  // genuinely runnable in real Claude Code without any external global. Annotated
+  // `// @owf:runtime` so the parser skips them and re-emits a fresh copy.
+  const helpers = emitRuntimeHelpers(ir);
+  if (helpers.length > 0) {
+    lines.push(...helpers);
+    lines.push('');
+  }
+
   // `let` declarations for producers referenced from an outer scope.
   if (hoisted.size > 0) {
     const names = [...hoisted].map((id) => varNames.get(id)!).filter(Boolean);
@@ -159,6 +168,15 @@ function emitScope(
         const v = assign(ctx, node.id);
         const spec = nodeToSpec(node);
         const call = emitPipeline(node, indent);
+        out.push(
+          `${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}${routeAnnotation(spec)}`,
+        );
+        break;
+      }
+      case 'consensus': {
+        const v = assign(ctx, node.id);
+        const spec = nodeToSpec(node);
+        const call = emitConsensus(node, indent);
         out.push(
           `${pad}${decl(ctx, node.id, v)}await ${call} // @node ${node.id}${routeAnnotation(spec)}`,
         );
@@ -293,6 +311,34 @@ function emitPipeline(node: IRNode, indent: number): string {
 }
 
 /**
+ * Emit a `consensus([ () => agent(...), … ], { strategy, … })` call. Voters mirror
+ * `parallel` branches (thunk array, no nested ctx block). The trailing options use
+ * a fixed key order (strategy, samples, quorum, schema) so re-emit is byte-stable;
+ * `schema` is a bare identifier defined in the schema preamble.
+ */
+function emitConsensus(node: IRNode, indent: number): string {
+  const voters = readSpecs(node.params.voters);
+  const opts = emitConsensusOpts(node);
+  if (voters.length === 0) return `consensus([]${opts})`;
+  const pad = '  '.repeat(indent + 1);
+  const items = voters.map((b) => `${pad}() => ${emitAgentCall(b, [])},`);
+  return `consensus([\n${items.join('\n')}\n${'  '.repeat(indent)}]${opts})`;
+}
+
+/** Build the `consensus` options object (fixed key order, present keys only). */
+function emitConsensusOpts(node: IRNode): string {
+  const p = node.params ?? {};
+  const opts: string[] = [];
+  const strategy = typeof p.strategy === 'string' ? p.strategy : 'multi-lens';
+  opts.push(`strategy: ${str(strategy)}`);
+  if (typeof p.samples === 'number') opts.push(`samples: ${p.samples}`);
+  if (typeof p.quorum === 'number') opts.push(`quorum: ${p.quorum}`);
+  const schema = optStr(p.schema);
+  if (schema) opts.push(`schema: ${ident(schema)}`); // bare identifier
+  return `, { ${opts.join(', ')} }`;
+}
+
+/**
  * Coerce a params array of agent specs into IRAgentSpec[], tolerating the legacy
  * `string[]` form (a bare agent-name string becomes `{ prompt: name }`).
  */
@@ -388,8 +434,68 @@ function collectSchemaNames(ir: IRGraph): Set<string> {
     if (node.type === 'agent') add(nodeToSpec(node).schema);
     if (node.type === 'parallel') for (const b of readSpecs(node.params.branches)) add(b.schema);
     if (node.type === 'pipeline') for (const s of readSpecs(node.params.stages)) add(s.schema);
+    if (node.type === 'consensus') {
+      add(optStr(node.params.schema));
+      for (const v of readSpecs(node.params.voters)) add(v.schema);
+    }
   }
   return names;
+}
+
+/* -------------------------------------------------------------------------- */
+/* self-contained runtime helpers (portable export)                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A self-contained `consensus(voters, opts)` helper, implementing the four
+ * quality patterns purely on top of the `agent`/`parallel` globals so the
+ * exported script runs in real Claude Code with no external dependency. Written
+ * with `String.raw` + `+` concatenation (no backticks / no `${}`) so its `\n`
+ * escapes survive verbatim into the emitted script. Annotated `// @owf:runtime`
+ * so the parser skips it and the emitter re-generates a fresh copy (idempotent).
+ */
+const CONSENSUS_RUNTIME_HELPER = String.raw`async function consensus(voters, opts) { // @owf:runtime consensus
+  const o = opts || {}
+  const strategy = o.strategy || 'multi-lens'
+  const want = strategy === 'self-consistency' ? Math.max(2, Math.min(7, o.samples || 3)) : voters.length
+  const thunks = strategy === 'self-consistency' ? Array.from({ length: want }, () => voters[0]) : voters
+  const out = (await parallel(thunks)).filter((r) => r != null)
+  if (out.length === 0) return null
+  const quorum = o.quorum || Math.ceil(want / 2)
+  const text = (r) => (typeof r === 'string' ? r : JSON.stringify(r))
+  const joinAll = out.map(text).join('\n\n')
+  if (strategy === 'adversarial') {
+    const kept = []
+    for (const r of out) {
+      const v = await agent('严格审视并尝试反驳下面的结论。若能推翻请以 REFUTED 开头，否则以 STANDS 开头：\n\n' + text(r))
+      if (!/^\s*REFUTED/i.test(typeof v === 'string' ? v : '')) kept.push(r)
+    }
+    return (kept.length ? kept : out).map(text).join('\n\n---\n\n')
+  }
+  if (strategy === 'tournament') {
+    const list = out.map((r, i) => '方案 ' + (i + 1) + '：\n' + text(r)).join('\n\n')
+    return await agent('下面是 ' + out.length + ' 个独立方案。请择优选出最佳方案，并把其它方案中值得借鉴的亮点合并进去后输出最终方案：\n\n' + list)
+  }
+  if (o.schema) {
+    const yes = out.filter((r) => r && (r.real || r.pass || r.agree || r.ok) === true)
+    if (yes.length >= quorum) return text(yes[0])
+    return await agent('下面是 ' + out.length + ' 份独立判定但未达成多数共识，请权衡后给出最可信结论：\n\n' + joinAll)
+  }
+  const buckets = new Map()
+  for (const r of out) {
+    const key = text(r).trim().toLowerCase().replace(/\s+/g, ' ')
+    buckets.set(key, (buckets.get(key) || []).concat([r]))
+  }
+  let best = out[0], bestN = 0
+  for (const g of buckets.values()) if (g.length > bestN) { bestN = g.length; best = g[0] }
+  if (bestN >= quorum) return text(best)
+  return await agent('下面是 ' + out.length + ' 份独立结果但未形成多数一致，请综合给出最可信结论：\n\n' + joinAll)
+}`;
+
+/** Emit any self-contained runtime helpers the graph needs (currently `consensus`). */
+function emitRuntimeHelpers(ir: IRGraph): string[] {
+  const needsConsensus = ir.nodes.some((n) => n.type === 'consensus');
+  return needsConsensus ? [CONSENSUS_RUNTIME_HELPER] : [];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -480,10 +586,29 @@ function flattenEmissionOrder(ir: IRGraph): IRNode[] {
   return out;
 }
 
+/**
+ * Identifiers that must never be used as a node's variable name: the injected
+ * DSL globals and our self-contained runtime helpers. Seeding the used-set with
+ * these prevents `const consensus = await consensus(...)` (a TDZ self-shadow) and
+ * similar collisions with `agent`/`parallel`/… globals.
+ */
+const RESERVED_VAR_NAMES = [
+  'agent',
+  'parallel',
+  'pipeline',
+  'phase',
+  'log',
+  'workflow',
+  'consensus',
+  'args',
+  'budget',
+  'meta',
+];
+
 /** Assign a readable, unique JS identifier to each value-producing node. */
 function assignVarNames(order: IRNode[]): Map<string, string> {
   const names = new Map<string, string>();
-  const used = new Set<string>();
+  const used = new Set<string>(RESERVED_VAR_NAMES);
   for (const node of order) {
     if (!producesValue(node.type)) continue;
     // Prefer a recovered binding so re-emit reproduces the exact var name.
@@ -510,6 +635,7 @@ function producesValue(type: IRNode['type']): boolean {
     type === 'parallel' ||
     type === 'pipeline' ||
     type === 'workflow' ||
+    type === 'consensus' ||
     type === 'variable'
   );
 }
@@ -517,7 +643,11 @@ function producesValue(type: IRNode['type']): boolean {
 /** Value-producing node types surfaced in the top-level `return { … }`. */
 function producesReturn(type: IRNode['type']): boolean {
   return (
-    type === 'agent' || type === 'parallel' || type === 'pipeline' || type === 'workflow'
+    type === 'agent' ||
+    type === 'parallel' ||
+    type === 'pipeline' ||
+    type === 'workflow' ||
+    type === 'consensus'
   );
 }
 

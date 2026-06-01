@@ -32,7 +32,8 @@ export type NodeType =
   | 'workflow'
   | 'log'
   | 'variable'
-  | 'codeblock';
+  | 'codeblock'
+  | 'consensus';
 
 /** A single pin (input/output port) on a node. */
 export interface IRPort {
@@ -62,6 +63,35 @@ export interface IRAgentSpec {
   schema?: string;
   isolation?: 'worktree';
   phase?: string;
+}
+
+/**
+ * Consensus strategies — the four reusable "quality patterns" Claude Code
+ * Dynamic Workflows use to win by adversarial verification rather than scale:
+ *   - 'adversarial'      一批出结论 → 一批专门反驳,扛住反驳才保留
+ *   - 'multi-lens'       多个角度审同一目标 → 多数票通过
+ *   - 'tournament'       各出方案 → 打分选胜 + 嫁接亮点
+ *   - 'self-consistency' 同一提示跑 N 次 → 结构化多数票
+ */
+export type ConsensusStrategy =
+  | 'adversarial'
+  | 'multi-lens'
+  | 'tournament'
+  | 'self-consistency';
+
+/**
+ * Options for a `consensus` node, shared by the emitter, parser and run engine.
+ * Emitted as the trailing `{ … }` of a `consensus([…voters], { … })` call with a
+ * fixed key order so emit→parse→emit stays byte-stable.
+ */
+export interface ConsensusOpts {
+  strategy: ConsensusStrategy;
+  /** self-consistency only: run voters[0] this many times. Default 3, clamp 2..7. */
+  samples?: number;
+  /** Votes required to pass. Default ceil(N/2). */
+  quorum?: number;
+  /** Structured-verdict schema identifier (bare), e.g. "VERDICT". */
+  schema?: string;
 }
 
 export type ModelClass = 'haiku' | 'sonnet' | 'opus' | string;
@@ -109,6 +139,10 @@ export interface IRNode {
    *   pipeline: { items: string, stages: IRAgentSpec[] } — items is an expr ref
    *   branch:   { condition: string }             — children carry parent=this.id
    *   loop:     { condition: string }             — while-continue condition
+   *   consensus:{ voters: IRAgentSpec[], strategy, samples?, quorum?, schema? }
+   *             — fan out voters, cross-validate, then vote (see ConsensusStrategy /
+   *               ConsensusOpts). voters mirror parallel.branches (each carries its
+   *               own full prompt); emitted as `consensus([…thunks], { … })`.
    */
   params: Record<string, unknown>;
   /** Optional explicit pin definitions; otherwise derived from the registry. */

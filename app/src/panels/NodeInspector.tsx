@@ -2,12 +2,15 @@ import { useEffect, useMemo, useState } from 'react';
 import { isWorkflowReadOnly, useStore } from '@/store/useStore';
 import AutoTextarea from '@/components/AutoTextarea';
 import type {
+  ConsensusStrategy,
   GatewaySelection,
   IRAgentSpec,
   IRNode,
   NodeGatewayOverride,
   NodeType,
 } from '@/core/ir';
+import { assessConsensusFit, defaultConsensusLenses } from '@/core/consensusHeuristic';
+import { autoSuggestEnabled } from '@/lib/consensusSettings';
 import { readStartUserInputs } from '@/core/startInputs';
 import { primeCliRuntime, subscribeCliRuntime } from '@/lib/cliConfig';
 import { t, type Locale } from '@/lib/i18n';
@@ -52,6 +55,7 @@ const NODE_TYPE_OPTIONS: { id: NodeType; label: string }[] = [
   { id: 'agent', label: 'Agent' },
   { id: 'parallel', label: 'Parallel' },
   { id: 'pipeline', label: 'Pipeline' },
+  { id: 'consensus', label: 'Consensus' },
   { id: 'phase', label: 'Phase' },
   { id: 'branch', label: 'Branch' },
   { id: 'loop', label: 'Loop' },
@@ -500,6 +504,80 @@ function ParamFields({
         </>
       );
 
+    case 'consensus': {
+      const strategy = (p.strategy as ConsensusStrategy) ?? 'multi-lens';
+      return (
+        <>
+          <Field label={t(locale, 'inspector.strategyLabel')}>
+            <select
+              className={selectClass}
+              value={strategy}
+              onChange={(e) => onParam({ strategy: e.target.value })}
+              disabled={disabled}
+            >
+              <option value="multi-lens">
+                {t(locale, 'inspector.strategyMultiLens')}
+              </option>
+              <option value="adversarial">
+                {t(locale, 'inspector.strategyAdversarial')}
+              </option>
+              <option value="tournament">
+                {t(locale, 'inspector.strategyTournament')}
+              </option>
+              <option value="self-consistency">
+                {t(locale, 'inspector.strategySelfConsistency')}
+              </option>
+            </select>
+          </Field>
+          <SpecListField
+            label={t(locale, 'inspector.votersLabel')}
+            specs={readSpecs(p.voters)}
+            onChange={(voters) => onParam({ voters })}
+            addLabel={t(locale, 'inspector.addVoter')}
+            locale={locale}
+            disabled={disabled}
+          />
+          {strategy === 'self-consistency' && (
+            <Field label={t(locale, 'inspector.samplesLabel')}>
+              <input
+                type="number"
+                min={2}
+                max={7}
+                className={textInputClass}
+                value={asString(p.samples ?? 3)}
+                onChange={(e) => onParam({ samples: Number(e.target.value) || 3 })}
+                disabled={disabled}
+              />
+            </Field>
+          )}
+          <Field label={t(locale, 'inspector.quorumLabel')}>
+            <input
+              type="number"
+              min={1}
+              className={textInputClass}
+              value={asString(p.quorum ?? '')}
+              onChange={(e) =>
+                onParam({ quorum: e.target.value ? Number(e.target.value) : undefined })
+              }
+              disabled={disabled}
+            />
+          </Field>
+          <Field label={t(locale, 'inspector.schemaLabel')}>
+            <input
+              className={textInputClass}
+              value={asString(p.schema)}
+              onChange={(e) => onParam({ schema: e.target.value })}
+              placeholder={t(locale, 'inspector.schemaPlaceholder')}
+              disabled={disabled}
+            />
+          </Field>
+          <div className="text-[11px] leading-relaxed text-fg-faint">
+            {t(locale, 'inspector.consensusHint')}
+          </div>
+        </>
+      );
+    }
+
     case 'phase':
       return (
         <Field label="Title">
@@ -691,6 +769,32 @@ export default function NodeInspector() {
     selectNode(newId);
   };
 
+  /**
+   * Upgrade a plain agent node into a consensus node, seeding differentiated lens
+   * voters from its prompt. The free heuristic (assessConsensusFit) only suggests
+   * this — the user decides — so consensus stays a visible, first-class node.
+   */
+  const convertToConsensus = (strategy: ConsensusStrategy) => {
+    if (readOnly) return;
+    const prompt = String(node.params.prompt ?? node.label ?? '');
+    const label = node.label;
+    const parent = node.parent;
+    removeNode(node.id);
+    const newId = addNode(
+      'consensus',
+      { strategy, voters: defaultConsensusLenses(prompt) },
+      parent,
+    );
+    if (!newId) return;
+    if (label) updateNodeLabel(newId, label);
+    selectNode(newId);
+  };
+
+  const consensusFit =
+    node.type === 'agent' && !readOnly && autoSuggestEnabled()
+      ? assessConsensusFit(node, workflow)
+      : { fit: false as const, strategy: 'multi-lens' as ConsensusStrategy, reason: '' };
+
   return (
     <div className="flex flex-col gap-3 text-xs">
       <div className="flex items-center justify-between">
@@ -723,6 +827,26 @@ export default function NodeInspector() {
       </Field>
 
       <div className="my-1 border-t border-border-soft" />
+
+      {consensusFit.fit && (
+        <div
+          className="rounded-md border px-2 py-2 text-[11px] leading-relaxed"
+          style={{
+            borderColor: 'var(--accent-2)',
+            background: 'var(--bg-alt)',
+            color: 'var(--fg-dim)',
+          }}
+        >
+          <div className="mb-1">⚖ {t(locale, 'inspector.consensusSuggest')}</div>
+          <button
+            type="button"
+            onClick={() => convertToConsensus(consensusFit.strategy)}
+            className="rounded-md border border-border bg-panel-2 px-2 py-1 text-[11px] text-fg-dim transition-colors hover:border-accent hover:text-fg"
+          >
+            {t(locale, 'inspector.convertToConsensus')}
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-col gap-3">
         <ParamFields

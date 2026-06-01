@@ -18,15 +18,35 @@ export async function completeGatewayText(
   request: GatewayTextRequest,
 ): Promise<string> {
   if (request.route.transport === 'anthropic' && request.route.apiKey) {
-    return completeAnthropic(request);
+    try {
+      return await completeAnthropic(request);
+    } catch (error) {
+      if (!shouldFallbackDirectFetchToCli(error, request.route)) {
+        throw error;
+      }
+      return completeGatewayTextViaCli(request);
+    }
   }
   if (
     request.route.transport === 'openai-compatible' &&
     request.route.apiKey
   ) {
-    return completeOpenAICompatible(request);
+    try {
+      return await completeOpenAICompatible(request);
+    } catch (error) {
+      if (!shouldFallbackDirectFetchToCli(error, request.route)) {
+        throw error;
+      }
+      return completeGatewayTextViaCli(request);
+    }
   }
 
+  return completeGatewayTextViaCli(request);
+}
+
+async function completeGatewayTextViaCli(
+  request: GatewayTextRequest,
+): Promise<string> {
   if (!isTauri()) {
     throw new Error(
       request.route.transport === 'simulator'
@@ -45,7 +65,27 @@ export async function completeGatewayText(
     // Inject the channel's credentials (e.g. a Codex relay key/base url) so the
     // local CLI targets the selected provider. See gatewayRouteEnv (cli branch).
     env: request.route.env,
+    timeoutSeconds: request.timeoutSeconds,
+    idleTimeoutSeconds: request.idleTimeoutSeconds,
   });
+}
+
+function shouldFallbackDirectFetchToCli(
+  error: unknown,
+  route: ResolvedGatewayRoute,
+): boolean {
+  if (!isTauri()) return false;
+  if (route.transport !== 'anthropic' && route.transport !== 'openai-compatible') {
+    return false;
+  }
+  if (!route.apiKey && !route.baseUrl) return false;
+  if (error instanceof TypeError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message === 'Failed to fetch' ||
+    message.includes('NetworkError') ||
+    message.includes('Load failed')
+  );
 }
 
 export { nodeGatewayOverride };

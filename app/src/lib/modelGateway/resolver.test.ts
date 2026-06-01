@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { IRGraph } from '@/core/ir';
 import { setActiveGatewaySelection } from '@/lib/gatewayConfig';
+import { PROVIDERS_STORAGE } from '@/lib/apiConfig';
 import {
   resolveGatewayRoute,
   nodeGatewayOverride,
@@ -10,6 +11,7 @@ import {
   workflowDefaultGatewaySelection,
   workflowGatewaySelection,
 } from './resolver';
+import { resolveDirectGatewayRoute } from './modelGateway';
 
 function buildWorkflow(nodes: IRGraph['nodes']): IRGraph {
   return {
@@ -155,6 +157,193 @@ describe('model gateway compatibility', () => {
     expect(route.transport).toBe('cli');
     expect(route.channelId).toBe('cli_custom_codex');
     expect(route.selection.channelId).toBe('cli_custom_codex');
+  });
+
+  it('routes cc-switch imported Claude-compatible providers through the local CLI', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'relay_provider',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'Claude Code Import',
+          apiKey: 'sk-imported',
+          baseUrl: 'https://relay.example/v1/',
+          model: 'custom-model',
+        },
+      ]),
+    );
+    const selection = {
+      adapter: 'claude-code',
+      modelClass: 'opus',
+      providerId: 'relay_provider',
+      channelId: 'default',
+    };
+
+    expect(resolveDirectGatewayRoute(selection)).toBeNull();
+
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = { defaults: selection };
+    const route = resolveGatewayRoute(workflow);
+
+    // Credentials + base url still route through the local CLI, but a non-claude
+    // import label ("custom-model") is NOT forwarded as a model: like bare
+    // `claude`, we let the relay pick its default. A user who needs a specific
+    // model id configures a real claude-* id or a per-tier map (see below).
+    expect(route.env).toMatchObject({
+      ANTHROPIC_API_KEY: 'sk-imported',
+      ANTHROPIC_AUTH_TOKEN: 'sk-imported',
+      ANTHROPIC_BASE_URL: 'https://relay.example/v1/',
+    });
+    expect(route.env).not.toHaveProperty('ANTHROPIC_MODEL');
+    expect(route.model).toBeUndefined();
+  });
+
+  it('prefers cli-backed Claude providers over stale browser-direct defaults', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'stale_direct',
+          kind: 'anthropic',
+          name: 'Kimi Imported Before Transport',
+          apiKey: 'sk-old',
+          baseUrl: 'https://api.kimi.com/coding/',
+          model: 'kimi-for-coding',
+        },
+        {
+          id: 'cc_switch_cli',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'Kimi Imported From cc-switch',
+          apiKey: 'sk-new',
+          baseUrl: 'https://api.kimi.com/coding/',
+          model: 'kimi-for-coding',
+        },
+      ]),
+    );
+
+    const workflow = buildWorkflow([]);
+    const selection = workflowGatewaySelection(workflow);
+    expect(selection.providerId).toBe('cc_switch_cli');
+
+    const route = resolveGatewayRoute(workflow);
+    expect(route.providerId).toBe('cc_switch_cli');
+    expect(route.transport).toBe('cli');
+    // The relay rejects the plan label "kimi-for-coding"; like bare `claude`,
+    // we must NOT export it as a model. credentials still flow.
+    expect(route.env).toMatchObject({
+      ANTHROPIC_AUTH_TOKEN: 'sk-new',
+      ANTHROPIC_BASE_URL: 'https://api.kimi.com/coding/',
+    });
+    expect(route.env).not.toHaveProperty('ANTHROPIC_MODEL');
+    expect(route.model).toBeUndefined();
+  });
+
+  it('omits the model for claude-code when the channel model is a non-claude label', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'kimi_cli',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'Kimi Relay',
+          apiKey: 'sk-kimi',
+          baseUrl: 'https://api.kimi.com/coding/',
+          model: 'kimi-for-coding',
+        },
+      ]),
+    );
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'sonnet',
+        providerId: 'kimi_cli',
+        channelId: 'default',
+      },
+    };
+
+    const route = resolveGatewayRoute(workflow);
+    expect(route.model).toBeUndefined();
+    expect(route.env ?? {}).not.toHaveProperty('ANTHROPIC_MODEL');
+  });
+
+  it('passes a genuine claude-* channel model through for claude-code', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'claude_relay',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'Claude Relay',
+          apiKey: 'sk-relay',
+          baseUrl: 'https://relay.example/v1/',
+          model: 'claude-opus-4-8',
+        },
+      ]),
+    );
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'opus',
+        providerId: 'claude_relay',
+        channelId: 'default',
+      },
+    };
+
+    const route = resolveGatewayRoute(workflow);
+    expect(route.model).toBe('claude-opus-4-8');
+    expect(route.env).toMatchObject({ ANTHROPIC_MODEL: 'claude-opus-4-8' });
+  });
+
+  it('passes a litellm per-tier model id through for claude-code', () => {
+    const config = {
+      version: 1,
+      providers: [
+        {
+          id: 'litellm',
+          kind: 'anthropic',
+          name: 'LiteLLM Relay',
+          adapter: 'claude-code',
+          channels: [
+            {
+              id: 'default',
+              name: 'Default',
+              apiKey: 'sk-litellm',
+              baseUrl: 'https://litellm.example/v1/',
+              model: 'kimi-for-coding',
+              models: undefined,
+              route: {
+                transport: 'cli',
+                baseUrl: 'https://litellm.example/v1/',
+                model: 'kimi-for-coding',
+                models: { opus: 'claude-opus-4-8', sonnet: 'claude-sonnet-4-6' },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    window.localStorage.setItem('owf_model_gateway_v1', JSON.stringify(config));
+
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'opus',
+        providerId: 'litellm',
+        channelId: 'default',
+      },
+    };
+
+    const route = resolveGatewayRoute(workflow);
+    // Per-tier map wins even though channel.model is a junk label.
+    expect(route.model).toBe('claude-opus-4-8');
   });
 
   it('keeps non-sonnet legacy node models while migrating sonnet to inherit global', () => {

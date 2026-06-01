@@ -102,4 +102,6 @@ export interface GatewayTextRequest {
   onDelta?: (chunk: string) => void;
   permission?: string;
   cwd?: string;
+  timeoutSeconds?: number;
+  idleTimeoutSeconds?: number;
 }

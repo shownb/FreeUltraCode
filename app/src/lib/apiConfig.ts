@@ -23,6 +23,7 @@
  */
 
 export type ProviderKind = 'anthropic' | 'codex' | 'gemini';
+export type ProviderTransport = 'direct' | 'cli';
 
 /** One locally stored provider configuration. */
 export interface Provider {
@@ -36,6 +37,12 @@ export interface Provider {
   apiKey: string;
   /** Optional custom base URL ('' = default api.anthropic.com). */
   baseUrl: string;
+  /**
+   * How OpenWorkflows should execute this provider. Manual Anthropic entries
+   * default to browser-direct API calls; cc-switch imports default to CLI
+   * because they are copied from local agent environment config.
+   */
+  transport?: ProviderTransport;
   /** Optional model override (informational; the app uses `composer.model`). */
   model?: string;
 }
@@ -178,6 +185,12 @@ function resolveActiveForKind(
   const ofKind = list.filter((p) => p.kind === kind);
   const stored = map[kind];
   if (stored && ofKind.some((p) => p.id === stored)) return stored;
+  if (kind === 'anthropic') {
+    const cliBacked = ofKind.find(
+      (p) => normalizeProviderTransport(kind, p.transport) === 'cli',
+    );
+    if (cliBacked) return cliBacked.id;
+  }
   return ofKind[0]?.id ?? '';
 }
 
@@ -234,6 +247,10 @@ function normalizeStoredProvider(value: unknown): Provider | null {
     name: typeof v.name === 'string' ? v.name : 'Claude',
     apiKey: typeof v.apiKey === 'string' ? v.apiKey : '',
     baseUrl: typeof v.baseUrl === 'string' ? v.baseUrl : '',
+    transport: normalizeProviderTransport(
+      normalizeProviderKind(v.kind ?? v.adapter),
+      v.transport,
+    ),
     model: typeof v.model === 'string' ? v.model : undefined,
   };
 }
@@ -245,6 +262,14 @@ function normalizeProviderKind(value: unknown): ProviderKind {
   if (value === 'codex') return 'codex';
   if (value === 'gemini') return 'gemini';
   return 'anthropic';
+}
+
+function normalizeProviderTransport(
+  kind: ProviderKind,
+  value: unknown,
+): ProviderTransport {
+  if (value === 'cli' || value === 'direct') return value;
+  return kind === 'anthropic' ? 'direct' : 'cli';
 }
 
 function saveProviders(list: Provider[]): void {
@@ -275,21 +300,26 @@ export function providerBaseUrlHost(baseUrl: string): string {
 
 export function getProviderRuntimeInfo(
   provider: Pick<Provider, 'apiKey' | 'baseUrl'> &
-    Partial<Pick<Provider, 'kind'>>,
+    Partial<Pick<Provider, 'kind' | 'transport'>>,
   options: { canUseCliFallback?: boolean } = {},
 ): ProviderRuntimeInfo {
   const kind = normalizeProviderKind(provider.kind);
+  const transport = normalizeProviderTransport(kind, provider.transport);
   const hasApiKey = provider.apiKey.trim().length > 0;
   const hasBaseUrl = provider.baseUrl.trim().length > 0;
   const baseUrlValid = isProviderBaseUrlValid(provider.baseUrl);
   const canUseCliFallback = options.canUseCliFallback === true;
   const status: ProviderRuntimeStatus =
     kind === 'anthropic'
-      ? hasApiKey && baseUrlValid
-        ? 'direct'
-        : !hasApiKey && baseUrlValid && canUseCliFallback
+      ? transport === 'cli'
+        ? baseUrlValid && canUseCliFallback
           ? 'cli'
           : 'unavailable'
+        : hasApiKey && baseUrlValid
+          ? 'direct'
+          : !hasApiKey && baseUrlValid && canUseCliFallback
+            ? 'cli'
+            : 'unavailable'
       : canUseCliFallback
         ? 'cli'
         : 'unavailable';
@@ -306,10 +336,12 @@ export function getProviderRuntimeInfo(
 
 export function providerMetadataSignature(
   p: Pick<Provider, 'name' | 'baseUrl' | 'model'> &
-    Partial<Pick<Provider, 'kind'>>,
+    Partial<Pick<Provider, 'kind' | 'transport'>>,
 ): string {
+  const kind = normalizeProviderKind(p.kind);
   return [
-    normalizeProviderKind(p.kind),
+    kind,
+    normalizeProviderTransport(kind, p.transport),
     p.name.trim().toLowerCase(),
     p.baseUrl.trim().replace(/\/+$/, '').toLowerCase(),
     (p.model ?? '').trim().toLowerCase(),
@@ -415,35 +447,93 @@ export function deleteProvider(id: string): void {
 }
 
 /**
+ * Identity of a provider for cc-switch dedup, IGNORING transport: a relay is the
+ * same relay whether a stale entry recorded it as `direct` or the import records
+ * it as `cli`. Used only when `collapseTransport` is set so the general import
+ * contract (direct vs cli kept distinct) is preserved for non-cc-switch callers.
+ */
+function providerIdentityKey(
+  p: Pick<Provider, 'name' | 'baseUrl' | 'model'> & Partial<Pick<Provider, 'kind'>>,
+): string {
+  return [
+    normalizeProviderKind(p.kind),
+    p.name.trim().toLowerCase(),
+    p.baseUrl.trim().replace(/\/+$/, '').toLowerCase(),
+    (p.model ?? '').trim().toLowerCase(),
+  ].join('\0');
+}
+
+/**
  * Import a batch of providers (e.g. from cc-switch). Dedupes against existing
  * entries by provider metadata (name + baseUrl + model), never by API key.
  * `makeActiveMatch`, if given, marks the matching imported provider as the new
  * active one.
+ *
+ * `opts.collapseTransport` (used by the cc-switch import) dedupes ignoring the
+ * transport field and upgrades a matching stale `direct` entry in place to the
+ * freshly-imported `cli` runtime, so re-importing never leaves two copies of the
+ * same relay (one pre-`transport` `direct`, one `cli`).
  */
 export function importProviders(
   incoming: Array<Omit<Provider, 'id'>>,
   makeActiveMatch?: (p: Omit<Provider, 'id'>) => boolean,
+  opts: { collapseTransport?: boolean } = {},
 ): { imported: number; skipped: number } {
-  const list = loadProviders();
-  const seen = new Set(list.map(providerMetadataSignature));
+  const loaded = loadProviders();
+  const collapse = opts.collapseTransport === true;
+  const keyOf = (p: Parameters<typeof providerMetadataSignature>[0]): string =>
+    collapse ? providerIdentityKey(p) : providerMetadataSignature(p);
+
+  // When collapsing, first fold any PRE-EXISTING duplicates of the same relay
+  // (e.g. a stale `direct` entry left beside a `cli` one by an older import)
+  // into a single entry, preferring the cli-backed runtime. `idRemap` records
+  // dropped-id -> kept-id so active pointers can be repaired below.
+  const idRemap = new Map<string, string>();
+  let list = loaded;
+  if (collapse) {
+    const winners = new Map<string, Provider>();
+    for (const p of loaded) {
+      const k = keyOf(p);
+      const prev = winners.get(k);
+      if (!prev) {
+        winners.set(k, p);
+        continue;
+      }
+      const winner = prev.transport === 'cli' || p.transport !== 'cli' ? prev : p;
+      const loser = winner === prev ? p : prev;
+      winners.set(k, winner);
+      idRemap.set(loser.id, winner.id);
+    }
+    if (idRemap.size > 0) list = loaded.filter((p) => !idRemap.has(p.id));
+  }
+
+  const byKey = new Map(list.map((e) => [keyOf(e), e]));
+  const seen = new Set(byKey.keys());
   let imported = 0;
   let skipped = 0;
   let activeTarget: string | null = null;
 
   for (const p of incoming) {
-    const sig = providerMetadataSignature(p);
+    const sig = keyOf(p);
     if (seen.has(sig)) {
-      // Already present — still let it be the active target if requested.
-      if (makeActiveMatch?.(p)) {
-        const existing = list.find((e) => providerMetadataSignature(e) === sig);
-        if (existing) activeTarget = existing.id;
+      const existing = byKey.get(sig) ?? list.find((e) => keyOf(e) === sig);
+      // When collapsing, upgrade a stale entry to the imported runtime in place
+      // (e.g. a pre-`transport` `direct` relay -> `cli`) instead of duplicating.
+      if (collapse && existing) {
+        existing.apiKey = p.apiKey;
+        existing.baseUrl = p.baseUrl;
+        if (p.transport) existing.transport = p.transport;
+        if (p.model !== undefined) existing.model = p.model;
       }
+      // Already present — still let it be the active target if requested.
+      if (makeActiveMatch?.(p) && existing) activeTarget = existing.id;
       skipped += 1;
       continue;
     }
     seen.add(sig);
     const created: Provider = { ...p, id: genId() };
     list.push(created);
+    byKey.set(sig, created);
     imported += 1;
     if (makeActiveMatch?.(p)) activeTarget = created.id;
   }
@@ -454,6 +544,9 @@ export function importProviders(
   // let an explicit active match override its own category's default.
   const map = loadActiveByKind();
   for (const kind of PROVIDER_KINDS) {
+    // Repoint any default that referenced a folded-away duplicate id.
+    const remapped = map[kind] ? idRemap.get(map[kind]) : undefined;
+    if (remapped) map[kind] = remapped;
     const valid =
       !!map[kind] && list.some((p) => p.kind === kind && p.id === map[kind]);
     if (!valid) {
@@ -478,7 +571,9 @@ export function importProviders(
  */
 export function readApiKey(): string {
   const provider = getActiveProvider();
-  return provider?.kind === 'anthropic' ? provider.apiKey.trim() : '';
+  return provider?.kind === 'anthropic' && provider.transport !== 'cli'
+    ? provider.apiKey.trim()
+    : '';
 }
 
 /**
@@ -487,7 +582,9 @@ export function readApiKey(): string {
  */
 export function readBaseUrl(): string {
   const provider = getActiveProvider();
-  return provider?.kind === 'anthropic' ? provider.baseUrl.trim() : '';
+  return provider?.kind === 'anthropic' && provider.transport !== 'cli'
+    ? provider.baseUrl.trim()
+    : '';
 }
 
 /**
@@ -497,7 +594,7 @@ export function readBaseUrl(): string {
 export function writeApiKey(value: string): void {
   const v = value.trim();
   const active = getActiveProvider();
-  if (active?.kind === 'anthropic') {
+  if (active?.kind === 'anthropic' && active.transport !== 'cli') {
     updateProvider(active.id, { apiKey: v });
   } else if (v) {
     const created = addProvider({
@@ -516,5 +613,7 @@ export function writeApiKey(value: string): void {
  */
 export function writeBaseUrl(value: string): void {
   const active = getActiveProvider();
-  if (active?.kind === 'anthropic') updateProvider(active.id, { baseUrl: value.trim() });
+  if (active?.kind === 'anthropic' && active.transport !== 'cli') {
+    updateProvider(active.id, { baseUrl: value.trim() });
+  }
 }

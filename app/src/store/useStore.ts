@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import {
   DATA,
+  type ConsensusStrategy,
   type IREndpoint,
   type GatewaySelection,
   type IRGraph,
@@ -20,6 +21,18 @@ import {
 import { defaultBlueprint } from '@/core/defaultBlueprint';
 import { isEmptyWorkflow } from '@/core/isEmptyWorkflow';
 import { applyIntent } from '@/core/intentEngine';
+import {
+  generationAngles,
+  isComplexGenerationRequest,
+} from '@/core/consensusHeuristic';
+import { genCandidateCount } from '@/lib/consensusSettings';
+import {
+  effectiveConsensusSamples,
+  effectiveGenerationConsensusPlan,
+  effectiveRunConcurrency,
+  recordModelCall,
+  timeoutPolicyForSelection,
+} from '@/lib/modelSpeed';
 import { appendStartUserInputs } from '@/core/startInputs';
 import { isRunnable, topoOrderExec } from '@/core/topo';
 import { readApiKey, readBaseUrl } from '@/lib/apiConfig';
@@ -494,6 +507,7 @@ const NODE_DEFAULTS: Record<
   log: { label: '日志', params: { message: '' } },
   variable: { label: '变量', params: { value: null } },
   codeblock: { label: '代码块', params: { code: '' } },
+  consensus: { label: '共识', params: { voters: [], strategy: 'multi-lens' } },
 };
 
 /**
@@ -533,10 +547,12 @@ function promptTranslationGatewayOptions(state: StoreState): {
   baseUrl?: string;
   model?: string;
   adapter?: string;
+  selection?: GatewaySelection;
 } {
   const selection = workflowGatewaySelection(state.workflow, state.composer.model);
   const direct = resolveDirectGatewayRoute(selection);
   return {
+    selection,
     apiKey: (direct?.apiKey ?? readApiKey()) || undefined,
     baseUrl: (direct?.baseUrl ?? readBaseUrl()) || undefined,
     model: direct?.model ?? selection.modelClass,
@@ -2050,6 +2066,10 @@ export const useStore = create<StoreState>((set) => ({
         ? `我希望新建一个 workflow，目的如下：\n${trimmed}`
         : `我希望继续修改 workflow，根据下面意见你来优化流程：\n${trimmed}`;
     const userContent = `当前 IRGraph(JSON)：\n${JSON.stringify(ir)}\n\n用户意见：\n${wrapped}`;
+    const generationPlan = effectiveGenerationConsensusPlan(
+      genCandidateCount(),
+      gatewaySelection,
+    );
 
     const aiStartedAt = Date.now();
     const withAiTiming = (body: string, endedAt = Date.now()) =>
@@ -2100,6 +2120,89 @@ export const useStore = create<StoreState>((set) => ({
       aiEditCommitMessages(ch, persist);
     };
     const persistAiMessages = () => aiEditCommitMessages(ch, true);
+    const aiEditViaCliWithSpeed = async (
+      prompt: string,
+      cli: Awaited<ReturnType<typeof resolveCliGatewayRoute>>,
+      opts: {
+        permission: string;
+        model?: string;
+        cliCommand?: string;
+        env?: Record<string, string>;
+        onProgress?: (chunk: string) => void;
+      },
+    ): Promise<string> => {
+      const policy = timeoutPolicyForSelection(cli.selection, prompt);
+      const startedAt = Date.now();
+      let firstProgressAt: number | undefined;
+      try {
+        const text = await aiEditViaCli(prompt, cli.adapter, {
+          ...opts,
+          timeoutSeconds: policy.timeoutSeconds,
+          idleTimeoutSeconds: policy.idleTimeoutSeconds,
+          onProgress: opts.onProgress
+            ? (chunk) => {
+                firstProgressAt ??= Date.now();
+                opts.onProgress?.(chunk);
+              }
+            : undefined,
+        });
+        recordModelCall(cli.selection, {
+          elapsedMs: Date.now() - startedAt,
+          firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+          ok: true,
+        });
+        return text;
+      } catch (err) {
+        const failure = describeRunFailure(err);
+        recordModelCall(cli.selection, {
+          elapsedMs: Date.now() - startedAt,
+          firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+          ok: false,
+          failureCode: failure.code,
+          timeoutSeconds: failure.timeoutSeconds,
+          idleTimeoutSeconds: failure.idleTimeoutSeconds,
+        });
+        throw err;
+      }
+    };
+    const completeDirectWithSpeed = async (request: {
+      system: string;
+      userContent: string;
+      onDelta?: (chunk: string) => void;
+    }): Promise<string> => {
+      if (!directRoute) throw new Error('NO_MODEL_GATEWAY_BACKEND');
+      const startedAt = Date.now();
+      let firstProgressAt: number | undefined;
+      try {
+        const text = await completeGatewayText({
+          route: directRoute,
+          system: request.system,
+          userContent: request.userContent,
+          maxTokens: 8192,
+          onDelta: (chunk) => {
+            firstProgressAt ??= Date.now();
+            request.onDelta?.(chunk);
+          },
+        });
+        recordModelCall(gatewaySelection, {
+          elapsedMs: Date.now() - startedAt,
+          firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+          ok: true,
+        });
+        return text;
+      } catch (err) {
+        const failure = describeRunFailure(err);
+        recordModelCall(gatewaySelection, {
+          elapsedMs: Date.now() - startedAt,
+          firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+          ok: false,
+          failureCode: failure.code,
+          timeoutSeconds: failure.timeoutSeconds,
+          idleTimeoutSeconds: failure.idleTimeoutSeconds,
+        });
+        throw err;
+      }
+    };
 
     // Split a full reply into explanation + optional IRGraph and apply it to the
     // active bubble. Only called once the AI is done asking (no interaction block).
@@ -2195,6 +2298,23 @@ export const useStore = create<StoreState>((set) => ({
     // emit ONE granularity-choice select when the requested scale is ambiguous.
     const directWithEscapeSystem =
       `${unifiedBase}\n\n${INTERACTION_PROTOCOL}\n\n${SIMPLE_TASK_ESCAPE_CONTRACT}`;
+    // Generation-time consensus: for a complex direct request, produce several
+    // candidate blueprints in parallel and let a judge merge the best (the
+    // "tournament" pattern applied to AI 改图 itself). Skipped for grill /
+    // explicit-clarification turns and for simple requests.
+    const complexGenerationRequest = isComplexGenerationRequest(trimmed);
+    const speedLimitedGeneration =
+      (useApi || useCli) &&
+      !isGrill &&
+      !allowClarification &&
+      complexGenerationRequest &&
+      !generationPlan.enabled;
+    const shouldGenConsensus =
+      (useApi || useCli) &&
+      !isGrill &&
+      !allowClarification &&
+      complexGenerationRequest &&
+      generationPlan.enabled;
     let forceBlueprintOnly = false;
     let sawInteraction = false;
     let blueprintRetries = 0;
@@ -2218,7 +2338,7 @@ export const useStore = create<StoreState>((set) => ({
               ? `用户明确要求澄清时才用交互块提问；问清后输出中文说明 + 一个 \`\`\`json IRGraph 代码块。\n\n`
               : `默认直接输出与任务复杂度匹配的中文说明 + 一个完整 \`\`\`json IRGraph 代码块；简单需求优先最小充分结构，复杂需求再展开。仅当你判断当前输入在“最小改动”与“完整多步蓝图”之间真的存在结构性歧义时，可改为只发一个两选项 select（“${SIMPLE_OPT_MINIMAL}” / “${SIMPLE_OPT_FULL}”）让用户选择，不要输出 Markdown 计划。\n\n`) +
           convo;
-        return aiEditViaCli(cliPrompt, cli.adapter, {
+        return aiEditViaCliWithSpeed(cliPrompt, cli, {
           permission: 'full', // -> --dangerously-skip-permissions, no prompts
           model: cli.model,
           cliCommand: cli.cliCommand,
@@ -2226,12 +2346,9 @@ export const useStore = create<StoreState>((set) => ({
         });
       }
       let full = '';
-      if (!directRoute) throw new Error('NO_MODEL_GATEWAY_BACKEND');
-      const returned = await completeGatewayText({
-        route: directRoute,
+      const returned = await completeDirectWithSpeed({
         system,
         userContent: convo,
-        maxTokens: 8192,
         onDelta: (chunk) => {
           full += chunk;
           setActive(liveProse(full) || '⟳ 生成中…');
@@ -2240,14 +2357,156 @@ export const useStore = create<StoreState>((set) => ({
       return full || returned;
     };
 
+    // Generate several candidate blueprints in parallel (each from a distinct
+    // design angle), then judge-merge the best into one. Falls back gracefully
+    // when too few candidates are usable. Reuses finalizeReply to apply the result.
+    const runGenConsensus = async (): Promise<void> => {
+      const angles = generationAngles(generationPlan.count);
+      newBubble(
+        withAiTiming(
+          `⟳ 复杂任务：生成 ${angles.length} 份候选蓝图（并发 ${generationPlan.concurrency}）…`,
+        ),
+      );
+
+      const genOne = async (angle: string): Promise<string> => {
+        const convoA = `${userContent}\n\n【本候选侧重】${angle}\n（据此给出与任务复杂度匹配的完整蓝图。）`;
+        if (useCli) {
+          const cli = await resolveCliGatewayRoute(gatewaySelection);
+          return aiEditViaCliWithSpeed(
+            `${directSystem}\n\n只针对工作流蓝图作答，不要读取或修改任何文件；直接输出中文说明 + 一个完整 \`\`\`json IRGraph 代码块。\n\n${convoA}`,
+            cli,
+            {
+              permission: 'full',
+              model: cli.model,
+              cliCommand: cli.cliCommand,
+              env: cli.env,
+            },
+          );
+        }
+        return completeDirectWithSpeed({
+          system: directSystem,
+          userContent: convoA,
+        });
+      };
+
+      // Candidates fan out only when the current model is fast enough. The
+      // dynamic cap avoids starting several slow CLI processes that all hit the
+      // same no-progress timeout window together.
+      const settled = await runWithConcurrency(
+        angles,
+        generationPlan.concurrency,
+        async (a) => {
+          try {
+            return { full: await genOne(a), failure: null as RunFailure | null };
+          } catch (err) {
+            return { full: '', failure: describeRunFailure(err) };
+          }
+        },
+      );
+
+      const valid = settled
+        .map(({ full }) => {
+          try {
+            const json = extractJsonObject(full);
+            const obj = JSON.parse(json) as IRGraph;
+            if (Array.isArray(obj.nodes) && Array.isArray(obj.edges)) {
+              return { full, json };
+            }
+          } catch {
+            /* skip invalid candidate */
+          }
+          return null;
+        })
+        .filter((v): v is { full: string; json: string } => v !== null);
+
+      if (valid.length === 0) {
+        const failures = settled
+          .map((s) => s.failure)
+          .filter((f): f is RunFailure => f !== null);
+        const allFailed = failures.length === settled.length;
+        const anyTimeout = failures.some(
+          (f) => f.code === 'timeout' || f.code === 'idle_timeout',
+        );
+        // If every candidate timed out, those failures have just updated the
+        // speed profile. Retry once as a single strict generation with the now
+        // larger dynamic timeout, instead of launching another multi-candidate
+        // fan-out.
+        if (allFailed && anyTimeout) {
+          setActive(
+            withAiTiming(
+              `⚠ ${angles.length} 份候选生成均超时，已判定当前模型偏慢：关闭多候选，并用更长的动态超时改为单次生成…`,
+            ),
+          );
+          forceBlueprintOnly = true;
+          finalizeReply(await callOnce(userContent));
+          return;
+        }
+        setActive(
+          withAiTiming(
+            generationPlan.enabled
+              ? '⚠ 候选生成均未产出可用蓝图，回退为单次生成…'
+              : '⚠ 当前模型速度不适合多候选，已改为单次生成…',
+          ),
+        );
+        forceBlueprintOnly = true;
+        finalizeReply(await callOnce(userContent));
+        return;
+      }
+      if (valid.length === 1) {
+        finalizeReply(valid[0].full);
+        return;
+      }
+
+      setActive(withAiTiming(`⟳ 已得 ${valid.length} 份候选，正在评审合并最佳…`));
+      const judgeSystem =
+        `${unifiedBase}\n\n你将收到同一需求的多份候选 workflow 蓝图(IRGraph JSON)。请择优合并：以整体最佳的一份为基底，把其它候选中确实更优的局部（更合理的并行/分支拓扑、遗漏的验收/回退、更贴切的 consensus 用法、更准确的节点划分）合并进去，并纠正明显问题。输出中文说明(2-4 句，说明取舍理由) + 一个完整的 \`\`\`json IRGraph。\n\n` +
+        BLUEPRINT_DIRECT_EDIT_CONTRACT;
+      const judgeConvo =
+        `原始需求：\n${wrapped}\n\n当前 IRGraph：\n${JSON.stringify(ir)}\n\n` +
+        `以下是多份候选蓝图，请评审合并出最佳：\n\n` +
+        valid.map((v, i) => `【候选 ${i + 1}】\n${v.json}`).join('\n\n');
+
+      let merged = '';
+      if (useCli) {
+        const cli = await resolveCliGatewayRoute(gatewaySelection);
+        merged = await aiEditViaCliWithSpeed(`${judgeSystem}\n\n${judgeConvo}`, cli, {
+          permission: 'full',
+          model: cli.model,
+          cliCommand: cli.cliCommand,
+          env: cli.env,
+        });
+      } else if (directRoute) {
+        let judgeFull = '';
+        merged = await completeDirectWithSpeed({
+          system: judgeSystem,
+          userContent: judgeConvo,
+          onDelta: (chunk) => {
+            judgeFull += chunk;
+            setActive(liveProse(judgeFull) || '⟳ 评审合并中…');
+          },
+        });
+        merged = merged || judgeFull;
+      }
+      // If the judge didn't return a graph, keep the best candidate as-is.
+      finalizeReply(replyIncludesIRGraph(merged) ? merged : valid[0].full);
+    };
+
     void (async () => {
       let convo = userContent;
       let finalized = false;
       try {
-        for (let round = 0; round < MAX_INTERACTION_ROUNDS; round += 1) {
+        if (shouldGenConsensus) {
+          await runGenConsensus();
+          finalized = true;
+        }
+        for (let round = 0; round < MAX_INTERACTION_ROUNDS && !finalized; round += 1) {
           newBubble(
             useCli
-              ? `⟳ 通过命令行调用 ${gatewaySelection.adapter}…`
+              ? speedLimitedGeneration
+                ? `⟳ 当前模型速度策略：${generationPlan.reason}，通过命令行单次生成…`
+                : `⟳ 通过命令行调用 ${gatewaySelection.adapter}…`
+              : speedLimitedGeneration
+                ? `⟳ 当前模型速度策略：${generationPlan.reason}，单次生成…`
               : '⟳ 生成中…',
           );
           const full = await callOnce(convo);
@@ -3266,6 +3525,10 @@ function aiEditCommitWorkflow(ch: AiEditChannel | null, persist: boolean): void 
   }
   if (persist) {
     updateAiEditSessionSummary(ch);
+    syncSessionRunStatus(
+      { workspaceId: ch.workspaceId, sessionId: ch.sessionId },
+      undefined,
+    );
     persistAiEditWorkflow(ch);
   }
 }
@@ -3700,6 +3963,8 @@ async function invokeAgentCli(
     env?: Record<string, string>;
     cwd?: string;
     permission?: string;
+    timeoutSeconds?: number;
+    idleTimeoutSeconds?: number;
     onProgress?: (text: string) => void;
     sessionId?: string;
     resume?: boolean;
@@ -3712,6 +3977,8 @@ async function invokeAgentCli(
       ...opts,
       cliCommand: opts.cliCommand ?? ch.config.cliCommand,
       env: opts.env,
+      timeoutSeconds: opts.timeoutSeconds,
+      idleTimeoutSeconds: opts.idleTimeoutSeconds,
       runId,
     });
   } finally {
@@ -3729,6 +3996,8 @@ async function invokeGatewayAgent(
     cliCommand?: string;
     cwd?: string;
     permission?: string;
+    timeoutSeconds?: number;
+    idleTimeoutSeconds?: number;
     onProgress?: (text: string) => void;
     sessionId?: string;
     resume?: boolean;
@@ -3736,31 +4005,79 @@ async function invokeGatewayAgent(
 ): Promise<{ text: string; adapter: string }> {
   const direct = resolveDirectGatewayRoute(selection);
   if (direct) {
-    const text = await completeGatewayText({
-      route: {
-        ...direct,
-        model: opts.omitModel ? undefined : opts.model ?? direct.model,
-      },
-      system: '',
-      userContent: prompt,
-      maxTokens: 8192,
-      onDelta: opts.onProgress,
-    });
-    return { text, adapter: direct.adapter };
+    const startedAt = Date.now();
+    let firstProgressAt: number | undefined;
+    try {
+      const text = await completeGatewayText({
+        route: {
+          ...direct,
+          model: opts.omitModel ? undefined : opts.model ?? direct.model,
+        },
+        system: '',
+        userContent: prompt,
+        maxTokens: 8192,
+        onDelta: (chunk) => {
+          firstProgressAt ??= Date.now();
+          opts.onProgress?.(chunk);
+        },
+      });
+      recordModelCall(selection, {
+        elapsedMs: Date.now() - startedAt,
+        firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+        ok: true,
+      });
+      return { text, adapter: direct.adapter };
+    } catch (err) {
+      const failure = describeRunFailure(err);
+      recordModelCall(selection, {
+        elapsedMs: Date.now() - startedAt,
+        firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+        ok: false,
+        failureCode: failure.code,
+        timeoutSeconds: failure.timeoutSeconds,
+        idleTimeoutSeconds: failure.idleTimeoutSeconds,
+      });
+      throw err;
+    }
   }
 
   const cli = await resolveCliGatewayRoute(selection);
-  const text = await invokeAgentCli(ch, prompt, cli.adapter, {
-    model: opts.omitModel ? undefined : opts.model ?? cli.model,
-    env: cli.env,
-    cwd: opts.cwd,
-    permission: opts.permission,
-    cliCommand: opts.cliCommand ?? cli.cliCommand,
-    onProgress: opts.onProgress,
-    sessionId: opts.sessionId,
-    resume: opts.resume,
-  });
-  return { text, adapter: cli.adapter };
+  const startedAt = Date.now();
+  let firstProgressAt: number | undefined;
+  try {
+    const text = await invokeAgentCli(ch, prompt, cli.adapter, {
+      model: opts.omitModel ? undefined : opts.model ?? cli.model,
+      env: cli.env,
+      cwd: opts.cwd,
+      permission: opts.permission,
+      timeoutSeconds: opts.timeoutSeconds,
+      idleTimeoutSeconds: opts.idleTimeoutSeconds,
+      cliCommand: opts.cliCommand ?? cli.cliCommand,
+      onProgress: (chunk) => {
+        firstProgressAt ??= Date.now();
+        opts.onProgress?.(chunk);
+      },
+      sessionId: opts.sessionId,
+      resume: opts.resume,
+    });
+    recordModelCall(selection, {
+      elapsedMs: Date.now() - startedAt,
+      firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+      ok: true,
+    });
+    return { text, adapter: cli.adapter };
+  } catch (err) {
+    const failure = describeRunFailure(err);
+    recordModelCall(selection, {
+      elapsedMs: Date.now() - startedAt,
+      firstProgressMs: firstProgressAt ? firstProgressAt - startedAt : undefined,
+      ok: false,
+      failureCode: failure.code,
+      timeoutSeconds: failure.timeoutSeconds,
+      idleTimeoutSeconds: failure.idleTimeoutSeconds,
+    });
+    throw err;
+  }
 }
 
 /** A fresh Claude session id (uuid) for chaining warm context across steps. */
@@ -4134,6 +4451,8 @@ async function runCliWithInteraction(opts: {
     cliCommand?: string;
     cwd?: string;
     permission?: string;
+    timeoutSeconds?: number;
+    idleTimeoutSeconds?: number;
   };
   /**
    * Optional Claude session continuity. `id` is the shared session; `resume`
@@ -4154,6 +4473,7 @@ async function runCliWithInteraction(opts: {
       round === 0 ? opts.head : `${opts.head}（已根据你的回答继续）\n`,
     );
     const prompt = `${withNodeExecutionContract(opts.basePrompt)}\n\n${INTERACTION_PROTOCOL}${appendix}`;
+    const timeoutPolicy = timeoutPolicyForSelection(opts.selection, prompt);
 
     let raw: string;
     try {
@@ -4164,6 +4484,9 @@ async function runCliWithInteraction(opts: {
           cliCommand: opts.cli.cliCommand,
           cwd: opts.cli.cwd,
           permission: opts.cli.permission,
+          timeoutSeconds: opts.cli.timeoutSeconds ?? timeoutPolicy.timeoutSeconds,
+          idleTimeoutSeconds:
+            opts.cli.idleTimeoutSeconds ?? timeoutPolicy.idleTimeoutSeconds,
           onProgress: sm.append,
           sessionId: opts.session?.id,
           // First attempt uses the caller's resume intent; any re-ask continues
@@ -4225,8 +4548,13 @@ async function runParallel(
   const upstream = dataContextString(node, workflow, results);
   const baseSelection = runNodeGatewaySelection(ch, workflow, node);
 
-  const settled = await Promise.all(
-    branches.map(async (b, i) => {
+  const settled = await runWithConcurrency(
+    branches,
+    Math.min(
+      branches.length,
+      effectiveRunConcurrency(runConcurrency(), baseSelection),
+    ),
+    async (b, i) => {
       const label = b.label || b.agentType || b.prompt.slice(0, 16) || `分支${i + 1}`;
       const stepLabel = `并行分支 ${i + 1}/${branches.length} · ${label}`;
       const branchSelection = applyGatewayOverride(
@@ -4252,7 +4580,7 @@ async function runParallel(
         const failure = describeRunFailure(err);
         return { ok: false as const, label, out: '', failure };
       }
-    }),
+    },
   );
 
   if (settled.every((s) => !s.ok)) {
@@ -4330,6 +4658,189 @@ async function runPipeline(
   return prev;
 }
 
+/** Default fan-out samples for a consensus node (localStorage owf_consensus_default_samples). */
+function defaultConsensusSamples(): number {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = window.localStorage.getItem('owf_consensus_default_samples');
+      if (raw) {
+        const n = Number.parseInt(raw, 10);
+        if (Number.isFinite(n)) return Math.min(7, Math.max(2, n));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return 3;
+}
+
+/** Clamp a samples value to the supported 2..7 range. */
+function clampSamples(value: unknown): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : defaultConsensusSamples();
+  return Math.min(7, Math.max(2, n || 3));
+}
+
+/** Coerce an arbitrary value into a known ConsensusStrategy (default multi-lens). */
+function consensusStrategy(value: unknown): ConsensusStrategy {
+  return value === 'adversarial' ||
+    value === 'tournament' ||
+    value === 'self-consistency'
+    ? value
+    : 'multi-lens';
+}
+
+/** Run `fn` over `items` with bounded concurrency, preserving result order. */
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next;
+      next += 1;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  const workers = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
+}
+
+type ConsensusSample =
+  | { ok: true; label: string; out: string }
+  | { ok: false; label: string; out: ''; failure?: RunFailure };
+
+/**
+ * Run a `consensus` node: fan out N voters over the SAME target (multi-angle
+ * exploration), then cross-validate + vote per strategy and return the single
+ * winning answer downstream (Claude-Code-style "win by adversarial verification").
+ * Sample concurrency is capped at min(N, runConcurrency()) so an N-way vote can't
+ * spawn unbounded `claude -p` processes. Mirrors runParallel's failure policy:
+ * throws only when too few samples succeed to vote, so node-level auto-retry and
+ * resume-from-failed-node keep working.
+ */
+async function runConsensus(
+  ch: RunChannel,
+  node: IRNode,
+  workflow: IRGraph,
+  results: Map<string, string>,
+): Promise<string> {
+  const voters = specList(node.params.voters);
+  if (voters.length === 0) return '';
+  const strategy = consensusStrategy(node.params.strategy);
+  const upstream = dataContextString(node, workflow, results);
+  const baseSelection = runNodeGatewaySelection(ch, workflow, node);
+
+  // self-consistency replicates the first voter; other strategies use distinct lenses.
+  const samples =
+    strategy === 'self-consistency'
+      ? Array.from(
+          { length: effectiveConsensusSamples(clampSamples(node.params.samples), baseSelection) },
+          () => voters[0],
+        )
+      : voters;
+  const total = samples.length;
+  const quorum =
+    typeof node.params.quorum === 'number' && node.params.quorum > 0
+      ? node.params.quorum
+      : Math.ceil(total / 2);
+
+  const settled = await runWithConcurrency<RunSpec, ConsensusSample>(
+    samples,
+    Math.min(total, effectiveRunConcurrency(runConcurrency(), baseSelection)),
+    async (s, i) => {
+      if (!stillRunning(ch)) return { ok: false, label: `样本${i + 1}`, out: '' };
+      const label = s.label || s.agentType || s.prompt.slice(0, 16) || `样本${i + 1}`;
+      const stepLabel = `共识样本 ${i + 1}/${total} · ${label}`;
+      const sampleSelection = applyGatewayOverride(baseSelection, runSpecGatewayOverride(s));
+      try {
+        const out = (
+          await runCliWithInteraction({
+            ch,
+            head: `【${stepLabel}】\n`,
+            label: stepLabel,
+            basePrompt: s.prompt + upstream,
+            selection: sampleSelection,
+            cli: { cwd: ch.config.cwd, permission: ch.config.permission },
+          })
+        ).trim();
+        return { ok: true, label, out };
+      } catch (err) {
+        return { ok: false, label, out: '', failure: describeRunFailure(err) };
+      }
+    },
+  );
+
+  const oks = settled.filter((s): s is { ok: true; label: string; out: string } => s.ok && !!s.out);
+  if (oks.length < 2) {
+    if (oks.length === 1) return oks[0].out; // single survivor — return rather than dead-end
+    const detail = settled
+      .map((s) => (s.ok ? '' : `${s.label}: ${s.failure?.message ?? '无输出'}`))
+      .filter(Boolean)
+      .join('；');
+    throw new Error(detail ? `共识失败：可用样本不足以投票（${detail}）` : '共识失败：可用样本不足以投票');
+  }
+  if (!stillRunning(ch)) return oks[0].out;
+
+  return resolveConsensus(
+    ch,
+    node,
+    oks.map((s) => s.out),
+    strategy,
+    quorum,
+    baseSelection,
+  );
+}
+
+/** Cross-validate the candidate outputs and return the consensus answer. */
+async function resolveConsensus(
+  ch: RunChannel,
+  node: IRNode,
+  candidates: string[],
+  strategy: ConsensusStrategy,
+  quorum: number,
+  baseSelection: GatewaySelection,
+): Promise<string> {
+  // self-consistency: deterministic majority over normalized text (no model call).
+  if (strategy === 'self-consistency') {
+    const buckets = new Map<string, { rep: string; n: number }>();
+    for (const c of candidates) {
+      const key = c.trim().toLowerCase().replace(/\s+/g, ' ');
+      const b = buckets.get(key);
+      if (b) b.n += 1;
+      else buckets.set(key, { rep: c, n: 1 });
+    }
+    let best = { rep: candidates[0], n: 0 };
+    for (const b of buckets.values()) if (b.n > best.n) best = b;
+    pushRunLog(ch, `共识(自一致投票)：最高一致 ${best.n}/${candidates.length}`, 'system');
+    if (best.n >= quorum) return best.rep;
+    // No quorum → fall through to an arbiter so the node never dead-ends.
+  }
+
+  const instruction =
+    strategy === 'adversarial'
+      ? '下面是多个独立得出的结论。请逐条尝试证伪，丢弃站不住脚的，只综合那些扛住反驳的结论，给出最终答案。'
+      : strategy === 'tournament'
+        ? '下面是多个独立方案。请按质量择优选出最佳方案，并把其它方案中值得借鉴的亮点合并进去，输出最终方案。'
+        : '下面是多个独立角度对同一目标的判定。请按多数意见综合，给出最可信的最终结论，并简述理由。';
+  const block = candidates.map((c, i) => `【候选 ${i + 1}】\n${c}`).join('\n\n');
+  const label = `${node.label ?? '共识'} · 评审/投票`;
+  return (
+    await runCliWithInteraction({
+      ch,
+      head: `【${label}】\n`,
+      label,
+      basePrompt: `${instruction}\n\n${block}`,
+      selection: baseSelection,
+      cli: { cwd: ch.config.cwd, permission: ch.config.permission },
+    })
+  ).trim();
+}
+
 /**
  * Execute one node, returning its result string (stored for downstream data
  * edges), or null when there is nothing to run (control / log / variable /
@@ -4377,6 +4888,8 @@ async function runNode(
       return runParallel(ch, node, workflow, results);
     case 'pipeline':
       return runPipeline(ch, node, workflow, results);
+    case 'consensus':
+      return runConsensus(ch, node, workflow, results);
     case 'log': {
       const msg = String(node.params.message ?? node.params.msg ?? '').trim();
       if (msg) pushRunLog(ch, msg);
@@ -4645,7 +5158,10 @@ async function executeViaCliInterpreter(
     }
   };
 
-  const concurrency = runConcurrency();
+  const concurrency = effectiveRunConcurrency(
+    runConcurrency(),
+    runGlobalGatewaySelection(ch, workflow),
+  );
   const claimed = new Set<string>(done); // nodes already picked or completed
 
   // Bounded-concurrency pump over the dependency DAG.

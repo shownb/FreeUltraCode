@@ -94,12 +94,17 @@ pub fn should_pass_model(adapter: &str, model: &str) -> bool {
     if m.is_empty() {
         return false;
     }
+    let lower = m.to_ascii_lowercase();
     if matches!(adapter_protocol(adapter), "codex" | "gemini") {
-        let lower = m.to_ascii_lowercase();
         return !matches!(lower.as_str(), "haiku" | "sonnet" | "opus")
             && !lower.starts_with("claude-");
     }
-    true
+    // claude-code: only forward genuine Claude model ids or the bare tier
+    // aliases the CLI maps. A non-model label (e.g. a cc-switch plan id like
+    // "kimi-for-coding") must be dropped so the relay uses its own default,
+    // exactly like running bare `claude` with no --model. Defense in depth:
+    // the TS resolver already omits these, this is the last line.
+    matches!(lower.as_str(), "haiku" | "sonnet" | "opus") || lower.starts_with("claude")
 }
 
 pub fn platform() -> CliPlatform {
@@ -404,5 +409,32 @@ mod tests {
         assert!(is_disallowed_launcher("powershell.exe"));
         assert!(is_disallowed_launcher("/bin/sh"));
         assert!(!is_disallowed_launcher("claude"));
+    }
+
+    #[test]
+    fn claude_code_drops_non_model_labels() {
+        // cc-switch plan/label strings are NOT model ids: omit --model.
+        assert!(!should_pass_model("claude-code", "kimi-for-coding"));
+        assert!(!should_pass_model("claude", "glm-4.6"));
+        assert!(!should_pass_model("claude-code", "   "));
+    }
+
+    #[test]
+    fn claude_code_passes_real_models_and_tiers() {
+        assert!(should_pass_model("claude-code", "claude-opus-4-8"));
+        assert!(should_pass_model("claude-code", "claude-sonnet-4-6"));
+        assert!(should_pass_model("claude-code", "sonnet"));
+        assert!(should_pass_model("claude-code", "opus"));
+        assert!(should_pass_model("claude-code", "haiku"));
+    }
+
+    #[test]
+    fn codex_gemini_behaviour_unchanged() {
+        // Real upstream ids pass.
+        assert!(should_pass_model("codex", "gpt-5.5"));
+        assert!(should_pass_model("gemini", "gemini-2.5-pro"));
+        // Claude tiers / ids are filtered out for codex/gemini.
+        assert!(!should_pass_model("codex", "sonnet"));
+        assert!(!should_pass_model("gemini", "claude-opus-4-8"));
     }
 }

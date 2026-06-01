@@ -5,11 +5,26 @@ const mocks = vi.hoisted(() => ({
   importCcSwitchClaude: vi.fn(),
   importProviders: vi.fn(),
   isTauri: vi.fn(),
+  listProviders: vi.fn(),
+  loadGatewayConfig: vi.fn(),
+  modelClassFromModelId: vi.fn(),
   patchConfig: vi.fn(),
+  providerMetadataSignature: vi.fn(),
+  saveGatewayConfig: vi.fn(),
+  setActiveGatewaySelection: vi.fn(),
 }));
 
 vi.mock('@/lib/apiConfig', () => ({
   importProviders: mocks.importProviders,
+  listProviders: mocks.listProviders,
+  providerMetadataSignature: mocks.providerMetadataSignature,
+}));
+
+vi.mock('@/lib/gatewayConfig', () => ({
+  loadGatewayConfig: mocks.loadGatewayConfig,
+  modelClassFromModelId: mocks.modelClassFromModelId,
+  saveGatewayConfig: mocks.saveGatewayConfig,
+  setActiveGatewaySelection: mocks.setActiveGatewaySelection,
 }));
 
 vi.mock('@/lib/tauri', () => ({
@@ -24,13 +39,17 @@ vi.mock('@/store/history/store', () => ({
   },
 }));
 
-import { maybeRunCcSwitchAutoImportOnFirstRun } from '@/lib/ccSwitchAutoImport';
+import {
+  importCcSwitchProviders,
+  maybeRunCcSwitchAutoImportOnFirstRun,
+} from '@/lib/ccSwitchAutoImport';
 
 const ccSwitchProvider = {
   kind: 'anthropic',
   name: 'Claude Team',
   apiKey: 'sk-cc-switch',
   baseUrl: 'https://proxy.example/v1',
+  transport: 'cli',
   model: 'claude-sonnet-4',
   ccId: 'cc_anthropic_team',
 } as const;
@@ -41,7 +60,13 @@ beforeEach(() => {
   mocks.importCcSwitchClaude.mockReset();
   mocks.importProviders.mockReset();
   mocks.isTauri.mockReset();
+  mocks.listProviders.mockReset();
+  mocks.loadGatewayConfig.mockReset();
+  mocks.modelClassFromModelId.mockReset();
   mocks.patchConfig.mockReset();
+  mocks.providerMetadataSignature.mockReset();
+  mocks.saveGatewayConfig.mockReset();
+  mocks.setActiveGatewaySelection.mockReset();
 
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -53,6 +78,35 @@ beforeEach(() => {
     active: { anthropic: ccSwitchProvider.ccId },
   });
   mocks.importProviders.mockReturnValue({ imported: 1, skipped: 0 });
+  mocks.listProviders.mockReturnValue([
+    {
+      id: 'p_cc_switch',
+      kind: 'anthropic',
+      name: 'Claude Team',
+      apiKey: 'sk-cc-switch',
+      baseUrl: 'https://proxy.example/v1',
+      transport: 'cli',
+      model: 'claude-sonnet-4',
+    },
+  ]);
+  mocks.providerMetadataSignature.mockImplementation(
+    (provider: {
+      kind?: string;
+      transport?: string;
+      name: string;
+      baseUrl: string;
+      model?: string;
+    }) =>
+      [
+        provider.kind ?? 'anthropic',
+        provider.transport ?? 'direct',
+        provider.name,
+        provider.baseUrl.replace(/\/+$/, ''),
+        provider.model ?? '',
+      ].join('|'),
+  );
+  mocks.loadGatewayConfig.mockReturnValue({ version: 1, providers: [] });
+  mocks.modelClassFromModelId.mockReturnValue('sonnet');
   mocks.patchConfig.mockImplementation(
     async (patch: Record<string, unknown>) => ({
       schemaVersion: 1,
@@ -81,17 +135,45 @@ describe('maybeRunCcSwitchAutoImportOnFirstRun', () => {
           name: 'Claude Team',
           apiKey: 'sk-cc-switch',
           baseUrl: 'https://proxy.example/v1',
+          transport: 'cli',
           model: 'claude-sonnet-4',
         },
       ],
       undefined,
+      { collapseTransport: true },
     );
+    expect(mocks.saveGatewayConfig).toHaveBeenCalledWith({
+      version: 1,
+      providers: [
+        expect.objectContaining({
+          id: 'p_cc_switch',
+          adapter: 'claude-code',
+          channels: [
+            expect.objectContaining({
+              route: expect.objectContaining({ transport: 'cli' }),
+            }),
+          ],
+        }),
+      ],
+    });
     expect(mocks.patchConfig).toHaveBeenNthCalledWith(2, {
       ccSwitchAutoImport: expect.objectContaining({
         version: 1,
         status: 'imported',
         importedCount: 1,
       }),
+    });
+  });
+
+  it('promotes the active cc-switch Claude provider into the gateway selector on manual import', async () => {
+    const outcome = await importCcSwitchProviders({ promoteActiveAnthropic: true });
+
+    expect(outcome.status).toBe('imported');
+    expect(mocks.setActiveGatewaySelection).toHaveBeenCalledWith({
+      adapter: 'claude-code',
+      modelClass: 'sonnet',
+      providerId: 'p_cc_switch',
+      channelId: 'default',
     });
   });
 

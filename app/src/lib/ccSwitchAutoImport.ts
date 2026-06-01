@@ -1,12 +1,21 @@
 import {
   importProviders,
+  listProviders,
+  providerMetadataSignature,
   type Provider,
 } from '@/lib/apiConfig';
+import {
+  loadGatewayConfig,
+  modelClassFromModelId,
+  saveGatewayConfig,
+  setActiveGatewaySelection,
+} from '@/lib/gatewayConfig';
 import {
   importCcSwitchClaude,
   isTauri,
   type ImportedProvider,
 } from '@/lib/tauri';
+import type { GatewayProvider } from '@/lib/modelGateway/types';
 import { historyStore } from '@/store/history/store';
 import type {
   CcSwitchAutoImportRecord,
@@ -39,8 +48,96 @@ function importedProviderDraft(provider: ImportedProvider): ProviderDraft {
     name: provider.name,
     apiKey: provider.apiKey,
     baseUrl: provider.baseUrl,
+    transport: 'cli',
     model: provider.model,
   };
+}
+
+function providerToGatewayProvider(provider: Provider): GatewayProvider {
+  const adapter =
+    provider.kind === 'codex'
+      ? 'codex'
+      : provider.kind === 'gemini'
+        ? 'gemini'
+        : 'claude-code';
+  const transport =
+    provider.transport === 'cli' || provider.kind !== 'anthropic'
+      ? 'cli'
+      : 'anthropic';
+  const model = provider.model?.trim() || undefined;
+  return {
+    id: provider.id,
+    kind: provider.kind,
+    name: provider.name,
+    adapter,
+    channels: [
+      {
+        id: 'default',
+        name: model ?? 'Default',
+        apiKey: provider.apiKey,
+        baseUrl: provider.baseUrl,
+        model,
+        models: undefined,
+        route: {
+          transport,
+          baseUrl: provider.baseUrl,
+          model,
+          models: undefined,
+        },
+      },
+    ],
+  };
+}
+
+function syncGatewayProviders(
+  imported: ProviderDraft[],
+  activeDraft?: ProviderDraft,
+): void {
+  const importedProviders = listProviders();
+  const lookup = new Map(
+    importedProviders.map((provider) => [providerMetadataSignature(provider), provider]),
+  );
+  const nextImported = imported
+    .map((draft) => lookup.get(providerMetadataSignature(draft)))
+    .filter((provider): provider is Provider => provider !== undefined);
+  if (nextImported.length === 0) return;
+
+  const current = loadGatewayConfig();
+  // Drop gateway entries whose provider no longer exists in the (now deduped)
+  // provider list — e.g. a stale duplicate folded away by importProviders'
+  // collapseTransport. Gateway providers mirror provider ids, so an id that is
+  // absent here is an orphan that would otherwise linger in the run selector.
+  const validIds = new Set(importedProviders.map((provider) => provider.id));
+  const nextProviders = current.providers.filter((provider) =>
+    validIds.has(provider.id),
+  );
+
+  for (const provider of nextImported) {
+    const gatewayProvider = providerToGatewayProvider(provider);
+    const index = nextProviders.findIndex((candidate) => candidate.id === gatewayProvider.id);
+    if (index >= 0) {
+      nextProviders[index] = gatewayProvider;
+    } else {
+      nextProviders.push(gatewayProvider);
+    }
+  }
+
+  saveGatewayConfig({
+    version: 1,
+    providers: nextProviders,
+  });
+
+  const active = activeDraft
+    ? lookup.get(providerMetadataSignature(activeDraft))
+    : undefined;
+  if (active) {
+    setActiveGatewaySelection({
+      adapter: providerToGatewayProvider(active).adapter,
+      modelClass: modelClassFromModelId(active.model),
+      providerId: active.id,
+      channelId: 'default',
+    });
+  }
 }
 
 function normalizeErrorReason(error: unknown): string {
@@ -137,9 +234,19 @@ export async function importCcSwitchProviders(
               provider.apiKey === incoming.apiKey,
           )
       : undefined;
-    const { imported, skipped } = importProviders(
-      providers.map(importedProviderDraft),
-      activeMatch,
+    const drafts = providers.map(importedProviderDraft);
+    const { imported, skipped } = importProviders(drafts, activeMatch, {
+      // cc-switch providers are CLI-backed; collapse a stale pre-`transport`
+      // `direct` entry for the same relay instead of importing a duplicate.
+      collapseTransport: true,
+    });
+    syncGatewayProviders(
+      drafts,
+      activeAnthropic
+        ? providers
+            .filter((provider) => provider.ccId === activeAnthropic)
+            .map(importedProviderDraft)[0]
+        : undefined,
     );
 
     return {

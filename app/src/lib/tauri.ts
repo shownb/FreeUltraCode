@@ -136,6 +136,10 @@ export interface CliOpts {
   permission?: string;
   /** Per-call environment overrides used by the model gateway route. */
   env?: Record<string, string>;
+  /** Per-call hard timeout override, in seconds. Backend keeps the larger of env/default and this value. */
+  timeoutSeconds?: number;
+  /** Per-call no-progress timeout override, in seconds. Backend keeps the larger of env/default and this value. */
+  idleTimeoutSeconds?: number;
   /** Stable id used to stream progress and cancel the process from the UI. */
   runId?: string;
   /** Live progress callback — receives streamed text/tool-use chunks. */
@@ -186,6 +190,8 @@ export async function aiEditViaCli(
       cwd: opts.cwd ?? null,
       permission: opts.permission ?? null,
       envVars: opts.env ?? null,
+      timeoutSeconds: opts.timeoutSeconds ?? null,
+      idleTimeoutSeconds: opts.idleTimeoutSeconds ?? null,
       runId,
       sessionId: opts.sessionId ?? null,
       resume: opts.resume ?? null,
