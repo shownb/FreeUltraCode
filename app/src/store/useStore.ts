@@ -46,6 +46,7 @@ import {
   modelClassFromModelId,
   nodeParamsWithGatewayOverride,
   normalizeGatewayWorkflow as migrateWorkflowGateway,
+  systemDefaultGatewaySelection,
   workflowDefaultGatewaySelection,
   workflowGatewaySelection,
   withWorkflowGatewaySelection as withGatewayDefaults,
@@ -1885,10 +1886,10 @@ export const useStore = create<StoreState>((set) => ({
   setAdapter: (adapter) => {
     applyWorkflowEdit('user', (state) => ({
       workflow: workflowWithoutRunSnapshot(
-        withGatewayDefaults(state.workflow, {
-          ...workflowGatewaySelection(state.workflow, state.composer.model),
-          adapter,
-        }),
+        withGatewayDefaults(
+          state.workflow,
+          systemDefaultGatewaySelection(adapter),
+        ),
       ),
       ...emptyRunProgress(),
     }));
@@ -4901,11 +4902,12 @@ async function runNode(
 }
 
 /** Default number of workflow nodes executed concurrently (see runConcurrency). */
-const DEFAULT_RUN_CONCURRENCY = 4;
+const DEFAULT_RUN_CONCURRENCY = 10;
 
 /**
  * How many runnable nodes may execute at once. Each node is a heavy `claude -p`
- * process, so this is deliberately modest; tune it per machine via localStorage
+ * process, so this absolute cap is combined with the model-speed tier caps from
+ * Settings > Consensus. Tune it per machine via localStorage
  * (`owf_run_concurrency`, clamped 1–16) or force the old strictly-sequential
  * behaviour with `owf_sequential=1`. Linear chains stay sequential regardless
  * (a node still waits for its predecessors); the cap only bounds how many

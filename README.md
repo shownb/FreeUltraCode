@@ -1,7 +1,7 @@
 # OpenWorkflows
 
 <div align="center">
-  English | <a href="README.zh-CN.md">中文</a>
+  English | <a href="app/doc/README.zh-CN.md">中文</a> | <a href="app/doc/README.fr.md">Français</a> | <a href="app/doc/README.de.md">Deutsch</a> | <a href="app/doc/README.es.md">Español</a> | <a href="app/doc/README.pt.md">Português</a> | <a href="app/doc/README.ru.md">Русский</a> | <a href="app/doc/README.ja.md">日本語</a> | <a href="app/doc/README.hi.md">हिन्दी</a> | <a href="app/doc/README.ar.md">العربية</a>
 </div>
 
 Claude Code introduced a Workflow feature for orchestrating multi-agent steps, parallel branches, and pipelines as executable scripts. OpenWorkflows turns that pattern into a visual, multi-model editor: build one Workflow graph, then run or adapt it across Claude Code, Codex, Gemini, and future local or cloud model runtimes.
@@ -85,7 +85,7 @@ build.bat              Build the Windows installer
 
 ## More Docs
 
-- [Chinese README](README.zh-CN.md)
+- [Chinese README](app/doc/README.zh-CN.md)
 - [Chinese usage tutorial](app/doc/claude-code-workflow-openworkflow.md)
 
 ## Verification

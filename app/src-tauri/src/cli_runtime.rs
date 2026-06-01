@@ -100,10 +100,9 @@ pub fn should_pass_model(adapter: &str, model: &str) -> bool {
             && !lower.starts_with("claude-");
     }
     // claude-code: only forward genuine Claude model ids or the bare tier
-    // aliases the CLI maps. A non-model label (e.g. a cc-switch plan id like
-    // "kimi-for-coding") must be dropped so the relay uses its own default,
-    // exactly like running bare `claude` with no --model. Defense in depth:
-    // the TS resolver already omits these, this is the last line.
+    // aliases the CLI maps. A relay route label (e.g. a cc-switch id like
+    // "kimi-for-coding") may still be present in ANTHROPIC_MODEL, but must not
+    // be passed as a `--model` flag to the claude CLI.
     matches!(lower.as_str(), "haiku" | "sonnet" | "opus") || lower.starts_with("claude")
 }
 
@@ -413,7 +412,7 @@ mod tests {
 
     #[test]
     fn claude_code_drops_non_model_labels() {
-        // cc-switch plan/label strings are NOT model ids: omit --model.
+        // cc-switch route labels are not safe CLI --model values.
         assert!(!should_pass_model("claude-code", "kimi-for-coding"));
         assert!(!should_pass_model("claude", "glm-4.6"));
         assert!(!should_pass_model("claude-code", "   "));

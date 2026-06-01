@@ -1,4 +1,5 @@
 import type { GatewaySelection } from '@/core/ir';
+import { runConcurrencyCapForTier } from '@/lib/consensusSettings';
 
 export type ModelSpeedTier = 'fast' | 'standard' | 'slow';
 
@@ -265,9 +266,7 @@ export function effectiveRunConcurrency(
 ): number {
   const n = Math.max(1, Math.min(16, Math.floor(configured) || 1));
   const tier = modelSpeedProfile(selection).tier;
-  if (tier === 'slow') return 1;
-  if (tier === 'standard') return Math.min(n, 2);
-  return n;
+  return Math.min(n, runConcurrencyCapForTier(tier));
 }
 
 export function effectiveConsensusSamples(

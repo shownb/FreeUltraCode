@@ -12,19 +12,10 @@ import Select from '@/components/Select';
 import WorkspaceSelect from '@/components/WorkspaceSelect';
 import { summarizeAnswer, type InteractionAnswer } from '@/core/interaction';
 import {
-  bestAvailableSelection,
-  listGatewayRunOptions,
-  selectionFromKey,
-  selectionKey,
+  systemDefaultGatewaySelection,
   workflowGatewaySelection,
 } from '@/lib/modelGateway/resolver';
-import type { GatewayRunOption } from '@/lib/modelGateway/types';
-import {
-  RUNTIME_ADAPTERS,
-  runtimeAdapterLabel,
-  type RuntimeAdapterId,
-} from '@/lib/adapters';
-import { hasExplicitGatewayPin } from '@/lib/gatewayConfig';
+import { RUNTIME_ADAPTERS } from '@/lib/adapters';
 import type { ModelStrategy, SelectOption } from '@/store/types';
 import { localizeSelectOption, t, type Locale } from '@/lib/i18n';
 import type { Message } from '@/store/types';
@@ -37,26 +28,9 @@ import {
 import { shouldRefocusComposerAfterAppend } from '@/lib/composerEntryPolicy';
 import { tauriAvailable } from '@/lib/tauri';
 import { useStore } from '@/store/useStore';
-import { primeCliRuntime, subscribeCliRuntime } from '@/lib/cliConfig';
 
 const DEFAULT_DOCK_HEIGHT = 208; // matches the former h-52
 const MIN_DOCK_HEIGHT = 120;
-
-/**
- * Order in which the model dropdown groups channels by runtime adapter. Each
- * group gets a divider + header (Claude Code / Codex / Gemini) in the menu.
- */
-const ADAPTER_GROUP_ORDER: RuntimeAdapterId[] = RUNTIME_ADAPTERS.map(
-  (adapter) => adapter.id,
-);
-
-function adapterGroupRank(adapter: string): number {
-  const index = ADAPTER_GROUP_ORDER.indexOf(adapter as RuntimeAdapterId);
-  return index === -1 ? ADAPTER_GROUP_ORDER.length : index;
-}
-
-/** Sentinel id for the "inherit global selection" option in the model dropdown. */
-const INHERIT_SELECTION_ID = '__inherit__';
 
 /** localStorage key + bounds for the AI-input pane width (right column). */
 const INPUT_WIDTH_KEY = 'openworkflow.aiInputWidth.v1';
@@ -457,7 +431,6 @@ export default function AIDock() {
   const sendPrompt = useStore((s) => s.sendPrompt);
   const runSelection = useStore((s) => workflowGatewaySelection(s.workflow));
   const setGlobalRunSelection = useStore((s) => s.setGlobalRunSelection);
-  const clearGlobalRunSelection = useStore((s) => s.clearGlobalRunSelection);
   const composer = useStore((s) => s.composer);
   const draft = useStore((s) => s.composerDraft);
   const composerFocusVersion = useStore((s) => s.composerFocusVersion);
@@ -486,31 +459,6 @@ export default function AIDock() {
   const [dropActive, setDropActive] = useState(false);
   const [returnSearch, setReturnSearch] = useState('');
   const [activeSearchMatchIndex, setActiveSearchMatchIndex] = useState(0);
-  const [gatewayRevision, setGatewayRevision] = useState(0);
-  const availableGatewayOptions = useMemo(() => {
-    void gatewayRevision;
-    return listGatewayRunOptions();
-  }, [gatewayRevision]);
-  const noGatewayOptions = availableGatewayOptions.length === 0;
-  const gatewayOptions = useMemo<GatewayRunOption[]>(
-    () =>
-      noGatewayOptions
-        ? [
-            {
-              id: selectionKey(runSelection),
-              label: t(locale, 'settings.models.noRuntimeTitle'),
-              hint: t(locale, 'settings.tabs.models'),
-              selection: runSelection,
-              transport: 'simulator' as const,
-            },
-          ]
-        : availableGatewayOptions,
-    [noGatewayOptions, availableGatewayOptions, runSelection, locale],
-  );
-  const displayedRunSelection = bestAvailableSelection(
-    runSelection,
-    gatewayOptions,
-  );
   const normalizedSearch = useMemo(
     () => normalizeSearchQuery(returnSearch),
     [returnSearch],
@@ -527,49 +475,17 @@ export default function AIDock() {
     () => new Set(searchMatches.map((match) => match.messageId)),
     [searchMatches],
   );
-
-  // Split the flat channel list into the three runtime categories (Claude Code
-  // / Codex / Gemini) so the dropdown renders a divider + header per group. The
-  // synthetic "no runtime" fallback stays ungrouped.
-  const groupedGatewayOptions = useMemo(() => {
-    if (noGatewayOptions) return gatewayOptions;
-    return [...gatewayOptions]
-      .sort(
-        (a, b) =>
-          adapterGroupRank(a.selection.adapter) -
-          adapterGroupRank(b.selection.adapter),
-      )
-      .map((option) => ({
-        ...option,
-        group: runtimeAdapterLabel(option.selection.adapter),
-      }));
-  }, [gatewayOptions, noGatewayOptions]);
-
-  // "Inherit global selection": when no explicit pin is stored, the composer
-  // follows the Settings-active provider. A sentinel option at the top of the
-  // dropdown represents this default state; picking a concrete channel pins it.
-  const isInheriting = useMemo(() => {
-    void gatewayRevision;
-    return !hasExplicitGatewayPin();
-  }, [gatewayRevision]);
-
-  const modelSelectOptions = useMemo<SelectOption[]>(() => {
-    if (noGatewayOptions) return groupedGatewayOptions;
-    const resolvedLabel = groupedGatewayOptions.find(
-      (option) => option.id === selectionKey(displayedRunSelection),
-    )?.label;
-    const inheritOption: SelectOption = {
-      id: INHERIT_SELECTION_ID,
-      label: t(locale, 'dock.inheritGlobal'),
-      hint: resolvedLabel,
-    };
-    return [inheritOption, ...groupedGatewayOptions];
-  }, [groupedGatewayOptions, noGatewayOptions, displayedRunSelection, locale]);
-
-  const modelSelectValue =
-    isInheriting && !noGatewayOptions
-      ? INHERIT_SELECTION_ID
-      : selectionKey(displayedRunSelection);
+  const runtimeSelectOptions = useMemo<SelectOption[]>(
+    () =>
+      RUNTIME_ADAPTERS.map((adapter) => ({
+        id: adapter.id,
+        label: adapter.label,
+      })),
+    [],
+  );
+  const runtimeSelectValue =
+    RUNTIME_ADAPTERS.find((adapter) => adapter.id === runSelection.adapter)?.id ??
+    RUNTIME_ADAPTERS[0].id;
 
   const modelStrategyOptions = useMemo<SelectOption[]>(
     () => [
@@ -624,24 +540,24 @@ export default function AIDock() {
   }, [draft]);
 
   useEffect(() => {
-    void primeCliRuntime().finally(() =>
-      setGatewayRevision((revision) => revision + 1),
+    if (
+      runSelection.systemDefault &&
+      !runSelection.providerId &&
+      !runSelection.channelId
+    ) {
+      return;
+    }
+    setGlobalRunSelection(
+      systemDefaultGatewaySelection(runSelection.adapter),
     );
-    const unsubscribeCli = subscribeCliRuntime(() =>
-      setGatewayRevision((revision) => revision + 1),
-    );
-    const onGatewayConfigChanged = () =>
-      setGatewayRevision((revision) => revision + 1);
-    window.addEventListener('owf:gateway-config-changed', onGatewayConfigChanged);
-    return () =>
-      {
-        unsubscribeCli();
-        window.removeEventListener(
-        'owf:gateway-config-changed',
-        onGatewayConfigChanged,
-        );
-      };
-  }, []);
+  }, [
+    runSelection.adapter,
+    runSelection.channelId,
+    runSelection.modelClass,
+    runSelection.providerId,
+    runSelection.systemDefault,
+    setGlobalRunSelection,
+  ]);
 
   const rememberSelection = useCallback(
     (target: HTMLTextAreaElement | null = inputRef.current) => {
@@ -1203,17 +1119,12 @@ export default function AIDock() {
             />
             <Select
               title={t(locale, 'dock.modelTitle')}
-              options={modelSelectOptions}
-              value={modelSelectValue}
+              options={runtimeSelectOptions}
+              value={runtimeSelectValue}
               onChange={(id) => {
-                if (id === INHERIT_SELECTION_ID) {
-                  clearGlobalRunSelection();
-                  return;
-                }
-                const selection = selectionFromKey(id);
-                if (selection) setGlobalRunSelection(selection);
+                setGlobalRunSelection(systemDefaultGatewaySelection(id));
               }}
-              disabled={isReadOnly || noGatewayOptions}
+              disabled={isReadOnly}
               className="min-w-0"
               icon="▣"
             />

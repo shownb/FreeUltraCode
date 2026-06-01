@@ -16,12 +16,21 @@ export interface ConsensusSettings {
   autoSuggest: boolean;
   /** Max independent calls run at once — also caps consensus fan-out (owf_run_concurrency). */
   concurrency: number;
+  /** Max concurrent calls after a route is classified as slow. */
+  slowConcurrency: number;
+  /** Max concurrent calls after a route is classified as standard speed. */
+  standardConcurrency: number;
+  /** Max concurrent calls after a route is classified as fast. */
+  fastConcurrency: number;
 }
 
 export const CONSENSUS_LIMITS = {
   genCandidates: { min: 2, max: 5, def: 3 },
   voteSamples: { min: 2, max: 7, def: 3 },
-  concurrency: { min: 1, max: 16, def: 4 },
+  concurrency: { min: 1, max: 16, def: 10 },
+  slowConcurrency: { min: 1, max: 16, def: 2 },
+  standardConcurrency: { min: 1, max: 16, def: 5 },
+  fastConcurrency: { min: 1, max: 16, def: 10 },
 } as const;
 
 const KEYS = {
@@ -30,6 +39,9 @@ const KEYS = {
   voteSamples: 'owf_consensus_default_samples',
   autoSuggest: 'owf_consensus_autosuggest',
   concurrency: 'owf_run_concurrency',
+  slowConcurrency: 'owf_run_concurrency_slow',
+  standardConcurrency: 'owf_run_concurrency_standard',
+  fastConcurrency: 'owf_run_concurrency_fast',
 } as const;
 
 /** Fired after any consensus setting changes, so open UI / consumers can refresh. */
@@ -64,6 +76,18 @@ export function getConsensusSettings(): ConsensusSettings {
     voteSamples: readInt(KEYS.voteSamples, CONSENSUS_LIMITS.voteSamples),
     autoSuggest: readBool(KEYS.autoSuggest, true),
     concurrency: readInt(KEYS.concurrency, CONSENSUS_LIMITS.concurrency),
+    slowConcurrency: readInt(
+      KEYS.slowConcurrency,
+      CONSENSUS_LIMITS.slowConcurrency,
+    ),
+    standardConcurrency: readInt(
+      KEYS.standardConcurrency,
+      CONSENSUS_LIMITS.standardConcurrency,
+    ),
+    fastConcurrency: readInt(
+      KEYS.fastConcurrency,
+      CONSENSUS_LIMITS.fastConcurrency,
+    ),
   };
 }
 
@@ -77,6 +101,36 @@ export function autoSuggestEnabled(): boolean {
   return readBool(KEYS.autoSuggest, true);
 }
 
+function limitsForSetting(key: keyof ConsensusSettings): {
+  min: number;
+  max: number;
+  def: number;
+} {
+  return key === 'genCandidates'
+    ? CONSENSUS_LIMITS.genCandidates
+    : key === 'voteSamples'
+      ? CONSENSUS_LIMITS.voteSamples
+      : key === 'slowConcurrency'
+        ? CONSENSUS_LIMITS.slowConcurrency
+        : key === 'standardConcurrency'
+          ? CONSENSUS_LIMITS.standardConcurrency
+          : key === 'fastConcurrency'
+            ? CONSENSUS_LIMITS.fastConcurrency
+            : CONSENSUS_LIMITS.concurrency;
+}
+
+export function runConcurrencyCapForTier(
+  tier: 'slow' | 'standard' | 'fast',
+): number {
+  const key =
+    tier === 'slow'
+      ? 'slowConcurrency'
+      : tier === 'standard'
+        ? 'standardConcurrency'
+        : 'fastConcurrency';
+  return readInt(KEYS[key], CONSENSUS_LIMITS[key]);
+}
+
 export function setConsensusSetting<K extends keyof ConsensusSettings>(
   key: K,
   value: ConsensusSettings[K],
@@ -86,12 +140,7 @@ export function setConsensusSetting<K extends keyof ConsensusSettings>(
   if (key === 'genEnabled' || key === 'autoSuggest') {
     store.setItem(KEYS[key], value ? '1' : '0');
   } else {
-    const lim =
-      key === 'genCandidates'
-        ? CONSENSUS_LIMITS.genCandidates
-        : key === 'voteSamples'
-          ? CONSENSUS_LIMITS.voteSamples
-          : CONSENSUS_LIMITS.concurrency;
+    const lim = limitsForSetting(key);
     const n = Math.min(lim.max, Math.max(lim.min, Math.floor(value as number) || lim.def));
     store.setItem(KEYS[key], String(n));
   }

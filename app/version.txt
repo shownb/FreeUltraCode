@@ -1,6 +1,6 @@
 {
-  "version": "0.1.7",
-  "url": "https://github.com/wellingfeng/OpenWorkflows/releases/download/v0.1.7/OpenWorkflows_0.1.7_x64-setup.exe",
-  "notes": "OpenWorkflows v0.1.7",
+  "version": "0.1.8",
+  "url": "https://github.com/wellingfeng/OpenWorkflows/releases/download/v0.1.8/OpenWorkflows_0.1.8_x64-setup.exe",
+  "notes": "OpenWorkflows v0.1.8",
   "pubDate": "2026-06-01"
 }

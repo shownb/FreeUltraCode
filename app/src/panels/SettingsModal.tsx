@@ -11,7 +11,6 @@ import {
   Globe,
   Info,
   Keyboard,
-  KeyRound,
   Palette,
   Pencil,
   Plus,
@@ -110,7 +109,6 @@ type LanguageOption = (typeof LANGUAGE_SELECT_OPTIONS)[number];
 
 const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = [
   { id: 'general', labelKey: 'settings.tabs.general', Icon: SlidersHorizontal },
-  { id: 'models', labelKey: 'settings.tabs.models', Icon: KeyRound },
   { id: 'consensus', labelKey: 'settings.tabs.consensus', Icon: Sparkles },
   { id: 'shortcuts', labelKey: 'settings.tabs.shortcuts', Icon: Keyboard },
   { id: 'appearance', labelKey: 'settings.tabs.appearance', Icon: Palette },
@@ -392,31 +390,13 @@ function GeneralSettings({
         title={t(locale, 'settings.languageLabel')}
         description={t(locale, 'settings.languageDescription')}
       >
-        <div className="flex flex-wrap gap-2">
-          {languageOptions.map((option) => {
-            const active = option.id === locale;
-            return (
-              <button
-                key={option.id}
-                type="button"
-                aria-pressed={active}
-                onClick={() => setLocale(option.id)}
-                className={cn(
-                  'flex min-w-[9.5rem] items-center justify-between gap-2 rounded-md border px-3 py-2 text-left text-sm transition-colors',
-                  active
-                    ? 'border-accent bg-accent/15 text-fg'
-                    : 'border-border bg-panel text-fg-dim hover:border-accent hover:text-fg',
-                )}
-              >
-                <span className="truncate">{option.label}</span>
-                {option.hint && (
-                  <span className="rounded bg-border-soft px-1.5 py-0.5 font-mono text-[10px] text-fg-faint">
-                    {option.hint}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+        <div className="w-full max-w-[20rem]">
+          <SelectControl
+            value={locale}
+            options={languageOptions}
+            onChange={(id) => setLocale(id)}
+            icon={<Globe size={15} strokeWidth={2.1} />}
+          />
         </div>
       </SettingRow>
 
@@ -564,6 +544,96 @@ interface CliSelectOption {
   hint?: string;
   note?: string;
   disabled?: boolean;
+}
+
+function SelectControl<T extends string>({
+  value,
+  options,
+  onChange,
+  icon,
+}: {
+  value: T;
+  options: { id: T; label: string; hint?: string }[];
+  onChange: (id: T) => void;
+  icon?: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  const selected = options.find((o) => o.id === value);
+
+  return (
+    <div ref={rootRef} className="relative w-full">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          'flex min-h-9 w-full items-center gap-2 rounded-md border px-3 py-2 text-left text-sm transition-colors',
+          open
+            ? 'border-accent bg-border-soft text-fg'
+            : 'border-border bg-panel text-fg-dim hover:border-accent hover:text-fg',
+        )}
+      >
+        {icon && <span className="shrink-0 text-fg-faint">{icon}</span>}
+        <span className="min-w-0 flex-1 truncate text-fg">{selected?.label}</span>
+        <ChevronDown
+          size={15}
+          strokeWidth={2.1}
+          className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-180')}
+        />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full z-20 mt-1 w-full min-w-[16rem] max-w-[20rem] overflow-hidden rounded-md border border-border bg-panel py-1 shadow-xl">
+          <ul role="listbox">
+            {options.map((option) => {
+              const active = option.id === value;
+              return (
+                <li key={option.id}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onClick={() => {
+                      onChange(option.id);
+                      setOpen(false);
+                    }}
+                    className={cn(
+                      'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+                      active
+                        ? 'bg-border-soft text-fg'
+                        : 'text-fg-dim hover:bg-border-soft hover:text-fg',
+                    )}
+                  >
+                    <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                      {active && <Check size={14} strokeWidth={2.4} className="text-accent" />}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                    {option.hint && (
+                      <span className="shrink-0 font-mono text-[10px] text-fg-faint">
+                        {option.hint}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function CliSelectControl({
@@ -2264,6 +2334,42 @@ function ConsensusSettings({ locale }: { locale: Locale }) {
           min={CONSENSUS_LIMITS.concurrency.min}
           max={CONSENSUS_LIMITS.concurrency.max}
           onChange={(v) => update('concurrency', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.slowConcurrencyLabel')}
+        description={t(locale, 'settings.consensus.slowConcurrencyDesc')}
+      >
+        <StepperControl
+          value={s.slowConcurrency}
+          min={CONSENSUS_LIMITS.slowConcurrency.min}
+          max={CONSENSUS_LIMITS.slowConcurrency.max}
+          onChange={(v) => update('slowConcurrency', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.standardConcurrencyLabel')}
+        description={t(locale, 'settings.consensus.standardConcurrencyDesc')}
+      >
+        <StepperControl
+          value={s.standardConcurrency}
+          min={CONSENSUS_LIMITS.standardConcurrency.min}
+          max={CONSENSUS_LIMITS.standardConcurrency.max}
+          onChange={(v) => update('standardConcurrency', v)}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.consensus.fastConcurrencyLabel')}
+        description={t(locale, 'settings.consensus.fastConcurrencyDesc')}
+      >
+        <StepperControl
+          value={s.fastConcurrency}
+          min={CONSENSUS_LIMITS.fastConcurrency.min}
+          max={CONSENSUS_LIMITS.fastConcurrency.max}
+          onChange={(v) => update('fastConcurrency', v)}
         />
       </SettingRow>
 

@@ -1,5 +1,9 @@
 import type { IRGraph, IRNode } from '@/core/ir';
-import { runtimeAdapterLabel, type RuntimeAdapterId } from '@/lib/adapters';
+import {
+  RUNTIME_ADAPTERS,
+  runtimeAdapterLabel,
+  type RuntimeAdapterId,
+} from '@/lib/adapters';
 import {
   getActiveProviderId,
   isProviderBaseUrlValid,
@@ -33,11 +37,10 @@ import {
 const CLI_TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
 
 /**
- * True only for strings the claude CLI / Anthropic relay will accept as a
- * --model value: a genuine `claude-*` model id, or a bare tier alias the CLI
- * maps. Plan/label strings imported from cc-switch (e.g. "kimi-for-coding")
- * return false so we omit --model and let the relay use its default — matching
- * the working bare `claude` CLI, which passes no --model at all.
+ * True only for strings that are safe to pass as a claude CLI `--model` value:
+ * a genuine `claude-*` model id, or a bare tier alias the CLI maps. cc-switch
+ * route labels such as `kimi-for-coding` are still meaningful as
+ * `ANTHROPIC_MODEL`, but should not be sent as a CLI flag.
  */
 export function looksLikeClaudeModelId(model: unknown): boolean {
   if (typeof model !== 'string') return false;
@@ -62,14 +65,30 @@ export function normalizeGatewaySelection(
   value: Partial<GatewaySelection> | null | undefined,
 ): GatewaySelection {
   const adapter = normalizeAdapter(value?.adapter);
+  const systemDefault = value?.systemDefault === true;
   return {
     adapter,
     modelClass:
       typeof value?.modelClass === 'string' && value.modelClass
         ? value.modelClass
         : DEFAULT_GATEWAY_SELECTION.modelClass,
-    providerId: value?.providerId || undefined,
-    channelId: value?.channelId || undefined,
+    ...(systemDefault ? { systemDefault: true } : {}),
+    ...(systemDefault
+      ? {}
+      : {
+          providerId: value?.providerId || undefined,
+          channelId: value?.channelId || undefined,
+        }),
+  };
+}
+
+export function systemDefaultGatewaySelection(
+  adapterValue: unknown,
+): GatewaySelection {
+  return {
+    adapter: normalizeAdapter(adapterValue),
+    modelClass: 'default',
+    systemDefault: true,
   };
 }
 
@@ -284,6 +303,8 @@ export function mergeGatewaySelection(
   override?: NodeGatewayOverride,
 ): GatewaySelection {
   if (!override) return normalizeGatewaySelection(global);
+  const hasProviderOverride =
+    override.providerId !== undefined || override.channelId !== undefined;
   const providerId =
     override.providerId !== undefined
       ? override.providerId
@@ -295,6 +316,7 @@ export function mergeGatewaySelection(
     modelClass: override.modelClass ?? global.modelClass,
     providerId,
     channelId: override.channelId ?? global.channelId,
+    systemDefault: hasProviderOverride ? undefined : global.systemDefault,
   });
 }
 
@@ -305,6 +327,9 @@ export function resolveGatewayRoute(
   const workflowSelection = workflowDefaultGatewaySelection(workflow);
   const selection = mergeGatewaySelection(workflowSelection, override);
   const source: ResolvedGatewayRoute['source'] = override ? 'node' : 'global';
+  if (selection.systemDefault) {
+    return cliFallbackRoute(selection, source);
+  }
   const providers = listGatewayProviders();
   const provider = resolveProvider(providers, selection);
   const channel = provider
@@ -354,6 +379,22 @@ export function listGatewayRunOptions(): GatewayRunOption[] {
   const providers = listGatewayProviders();
   const options: GatewayRunOption[] = [];
   const cliRuntime = getCliRuntimeSnapshot();
+
+  for (const adapter of RUNTIME_ADAPTERS) {
+    const selection = {
+      adapter: adapter.id,
+      modelClass: 'default',
+      systemDefault: true,
+    };
+    options.push({
+      id: selectionKey(selection),
+      label: runtimeAdapterLabel(adapter.id),
+      hint: 'System default',
+      selection,
+      transport: 'cli',
+      channelName: 'System CLI',
+    });
+  }
 
   for (const provider of providers) {
     for (const channel of provider.channels) {
@@ -459,6 +500,7 @@ export function selectionKey(selection: GatewaySelection): string {
     selection.modelClass,
     selection.providerId ?? '',
     selection.channelId ?? '',
+    selection.systemDefault ? 'system' : '',
   ].join('|');
 }
 
@@ -477,13 +519,15 @@ export function bestAvailableSelection(
 }
 
 export function selectionFromKey(key: string): GatewaySelection | null {
-  const [adapter, modelClass, providerId, channelId] = key.split('|');
+  const [adapter, modelClass, providerId, channelId, systemDefault] =
+    key.split('|');
   if (!adapter || !modelClass) return null;
   return normalizeGatewaySelection({
     adapter: normalizeAdapter(adapter),
     modelClass,
     providerId: providerId || undefined,
     channelId: channelId || undefined,
+    systemDefault: systemDefault === 'system' || systemDefault === 'true',
   });
 }
 
@@ -604,21 +648,24 @@ function resolveChannelModel(
     channel.route.models?.[modelClass] ?? channel.models?.[modelClass];
   if (tierModel) return tierModel;
 
-  const channelModel = channel.route.model ?? channel.model;
+  const channelModel = (channel.route.model ?? channel.model)?.trim() || undefined;
 
   if (provider.adapter === 'claude-code') {
     if (channelModel) {
-      // A channel model IS configured (typically a cc-switch import or a
-      // custom relay). Pass it only when it's a genuine Claude model id; a plan
-      // label (e.g. "kimi-for-coding") is NOT a model and must be dropped so the
-      // relay falls back to its own default — exactly like bare `claude`, which
-      // sends no --model against a custom endpoint.
-      return looksLikeClaudeModelId(channelModel) ? channelModel : undefined;
+      // A channel model from cc-switch may be a relay route label rather than a
+      // Claude model id. Preserve it so gatewayRouteEnv can export
+      // ANTHROPIC_MODEL and the selected relay/channel is actually used; the
+      // Rust launcher still filters non-Claude labels out of the `--model` CLI
+      // flag via should_pass_model().
+      return channelModel;
     }
-    // No channel model configured (e.g. the official Anthropic endpoint): ship
-    // the bare tier alias so sonnet/opus/haiku selection still works; the CLI
-    // maps it. An arbitrary (non-tier) modelClass -> omit --model.
-    return CLI_TIER_ALIASES.has(modelClass) ? modelClass : undefined;
+    // No channel model configured. For CLI launches the bare tier aliases are
+    // safe and useful because the claude CLI maps them. For browser-direct
+    // Anthropic calls, omit the model so streamAnthropic uses its concrete
+    // default instead of sending an invalid tier alias like "sonnet".
+    return channel.route.transport === 'cli' && looksLikeClaudeModelId(modelClass)
+      ? modelClass
+      : undefined;
   }
 
   // codex / gemini: their model ids are real upstream ids; pass through.
@@ -631,7 +678,9 @@ function cliFallbackRoute(
 ): ResolvedGatewayRoute {
   const adapter = normalizeAdapter(selection.adapter);
   const model =
-    adapter === 'claude-code'
+    selection.systemDefault || selection.modelClass === 'default'
+      ? undefined
+      : adapter === 'claude-code'
       ? // Tier alias (sonnet/opus/haiku) -> let the CLI map it; any other
         // modelClass (a custom label) -> omit --model and use the relay default.
         CLI_TIER_ALIASES.has(selection.modelClass)
@@ -647,7 +696,9 @@ function cliFallbackRoute(
     channelId: selection.channelId,
     transport: 'cli',
     mode: 'cli',
-    label: `${runtimeAdapterLabel(adapter)} CLI · ${selection.modelClass}`,
+    label: `${runtimeAdapterLabel(adapter)} CLI · ${
+      selection.systemDefault ? 'system default' : selection.modelClass
+    }`,
     source,
   };
 }

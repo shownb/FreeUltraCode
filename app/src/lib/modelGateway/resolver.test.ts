@@ -187,16 +187,49 @@ describe('model gateway compatibility', () => {
     workflow.meta.gateway = { defaults: selection };
     const route = resolveGatewayRoute(workflow);
 
-    // Credentials + base url still route through the local CLI, but a non-claude
-    // import label ("custom-model") is NOT forwarded as a model: like bare
-    // `claude`, we let the relay pick its default. A user who needs a specific
-    // model id configures a real claude-* id or a per-tier map (see below).
+    // Credentials + base url route through the local CLI, and the imported
+    // channel model is preserved as ANTHROPIC_MODEL so the relay can select the
+    // cc-switch channel. The Rust launcher filters it out of the `--model` flag
+    // when it is not a genuine claude-* id.
     expect(route.env).toMatchObject({
       ANTHROPIC_API_KEY: 'sk-imported',
       ANTHROPIC_AUTH_TOKEN: 'sk-imported',
       ANTHROPIC_BASE_URL: 'https://relay.example/v1/',
+      ANTHROPIC_MODEL: 'custom-model',
     });
-    expect(route.env).not.toHaveProperty('ANTHROPIC_MODEL');
+    expect(route.model).toBe('custom-model');
+  });
+
+  it('uses system CLI defaults without provider env when systemDefault is selected', () => {
+    window.localStorage.setItem(
+      PROVIDERS_STORAGE,
+      JSON.stringify([
+        {
+          id: 'relay_provider',
+          kind: 'anthropic',
+          transport: 'cli',
+          name: 'Claude Code Import',
+          apiKey: 'sk-imported',
+          baseUrl: 'https://relay.example/v1/',
+          model: 'custom-model',
+        },
+      ]),
+    );
+
+    const workflow = buildWorkflow([]);
+    workflow.meta.gateway = {
+      defaults: {
+        adapter: 'claude-code',
+        modelClass: 'default',
+        systemDefault: true,
+      },
+    };
+    const route = resolveGatewayRoute(workflow);
+
+    expect(route.transport).toBe('cli');
+    expect(route.providerId).toBeUndefined();
+    expect(route.channelId).toBeUndefined();
+    expect(route.env).toBeUndefined();
     expect(route.model).toBeUndefined();
   });
 
@@ -231,17 +264,17 @@ describe('model gateway compatibility', () => {
     const route = resolveGatewayRoute(workflow);
     expect(route.providerId).toBe('cc_switch_cli');
     expect(route.transport).toBe('cli');
-    // The relay rejects the plan label "kimi-for-coding"; like bare `claude`,
-    // we must NOT export it as a model. credentials still flow.
+    // The selected cc-switch route label must be exported as ANTHROPIC_MODEL;
+    // the Rust launcher still avoids passing it as a CLI --model flag.
     expect(route.env).toMatchObject({
       ANTHROPIC_AUTH_TOKEN: 'sk-new',
       ANTHROPIC_BASE_URL: 'https://api.kimi.com/coding/',
+      ANTHROPIC_MODEL: 'kimi-for-coding',
     });
-    expect(route.env).not.toHaveProperty('ANTHROPIC_MODEL');
-    expect(route.model).toBeUndefined();
+    expect(route.model).toBe('kimi-for-coding');
   });
 
-  it('omits the model for claude-code when the channel model is a non-claude label', () => {
+  it('exports non-claude cc-switch labels as ANTHROPIC_MODEL for claude-code', () => {
     window.localStorage.setItem(
       PROVIDERS_STORAGE,
       JSON.stringify([
@@ -267,8 +300,8 @@ describe('model gateway compatibility', () => {
     };
 
     const route = resolveGatewayRoute(workflow);
-    expect(route.model).toBeUndefined();
-    expect(route.env ?? {}).not.toHaveProperty('ANTHROPIC_MODEL');
+    expect(route.model).toBe('kimi-for-coding');
+    expect(route.env).toMatchObject({ ANTHROPIC_MODEL: 'kimi-for-coding' });
   });
 
   it('passes a genuine claude-* channel model through for claude-code', () => {

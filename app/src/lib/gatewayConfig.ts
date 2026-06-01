@@ -90,17 +90,23 @@ function normalizeSelection(value: unknown): GatewaySelection | null {
       : modelClassFromModelId(
           typeof raw.model === 'string' ? raw.model : undefined,
         );
+  const systemDefault = raw.systemDefault === true;
   return {
     adapter: normalizeAdapter(raw.adapter),
     modelClass,
-    providerId:
-      typeof raw.providerId === 'string' && raw.providerId
-        ? raw.providerId
-        : undefined,
-    channelId:
-      typeof raw.channelId === 'string' && raw.channelId
-        ? raw.channelId
-        : undefined,
+    ...(systemDefault ? { systemDefault: true } : {}),
+    ...(systemDefault
+      ? {}
+      : {
+          providerId:
+            typeof raw.providerId === 'string' && raw.providerId
+              ? raw.providerId
+              : undefined,
+          channelId:
+            typeof raw.channelId === 'string' && raw.channelId
+              ? raw.channelId
+              : undefined,
+        }),
   };
 }
 

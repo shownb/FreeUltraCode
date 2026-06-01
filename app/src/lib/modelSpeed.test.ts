@@ -11,6 +11,7 @@ import {
 
 afterEach(() => {
   __resetModelSpeedForTests();
+  window.localStorage.clear();
 });
 
 describe('model speed policy', () => {
@@ -26,9 +27,10 @@ describe('model speed policy', () => {
       count: 5,
     });
     expect(effectiveRunConcurrency(4, selection)).toBe(4);
+    expect(effectiveRunConcurrency(16, selection)).toBe(10);
   });
 
-  it('disables multi-candidate generation and relaxes timeouts for slow tiers', () => {
+  it('disables multi-candidate generation and keeps limited runtime parallelism for slow tiers', () => {
     const selection: GatewaySelection = {
       adapter: 'claude-code',
       modelClass: 'opus',
@@ -40,7 +42,8 @@ describe('model speed policy', () => {
       count: 1,
       concurrency: 1,
     });
-    expect(effectiveRunConcurrency(4, selection)).toBe(1);
+    expect(effectiveRunConcurrency(16, selection)).toBe(2);
+    expect(effectiveRunConcurrency(1, selection)).toBe(1);
 
     const timeout = timeoutPolicyForSelection(selection, 'x'.repeat(12_000));
     expect(timeout.timeoutSeconds).toBeGreaterThan(1800);
@@ -56,6 +59,7 @@ describe('model speed policy', () => {
     };
 
     expect(modelSpeedProfile(selection).tier).toBe('standard');
+    expect(effectiveRunConcurrency(16, selection)).toBe(5);
     recordModelCall(selection, {
       elapsedMs: 35_000,
       firstProgressMs: 4_000,
@@ -63,7 +67,39 @@ describe('model speed policy', () => {
     });
 
     expect(modelSpeedProfile(selection).tier).toBe('fast');
+    expect(effectiveRunConcurrency(16, selection)).toBe(10);
     expect(effectiveGenerationConsensusPlan(3, selection).enabled).toBe(true);
+  });
+
+  it('uses configured per-tier concurrency caps', () => {
+    window.localStorage.setItem('owf_run_concurrency_slow', '3');
+    window.localStorage.setItem('owf_run_concurrency_standard', '6');
+    window.localStorage.setItem('owf_run_concurrency_fast', '12');
+
+    expect(
+      effectiveRunConcurrency(16, {
+        adapter: 'claude-code',
+        modelClass: 'opus',
+      }),
+    ).toBe(3);
+    expect(
+      effectiveRunConcurrency(16, {
+        adapter: 'claude-code',
+        modelClass: 'sonnet',
+      }),
+    ).toBe(6);
+    expect(
+      effectiveRunConcurrency(16, {
+        adapter: 'claude-code',
+        modelClass: 'haiku',
+      }),
+    ).toBe(12);
+    expect(
+      effectiveRunConcurrency(8, {
+        adapter: 'claude-code',
+        modelClass: 'haiku',
+      }),
+    ).toBe(8);
   });
 
   it('marks a route slow after repeated idle timeouts', () => {

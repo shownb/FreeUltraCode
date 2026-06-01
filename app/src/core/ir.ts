@@ -99,6 +99,8 @@ export type ModelClass = 'haiku' | 'sonnet' | 'opus' | string;
 export interface GatewaySelection {
   adapter: 'claude-code' | 'codex' | 'gemini' | string;
   modelClass: ModelClass;
+  /** Use the selected runtime CLI exactly as configured on the machine. */
+  systemDefault?: boolean;
   providerId?: string;
   channelId?: string;
 }
