@@ -60,6 +60,34 @@ Für komplexe mehrstufige Programmieraufgaben generiert `/ultracode <Aufgabe>` s
 - Ausführung über die Desktop-App oder CLI: `fuc ultracode "<Aufgabe>" --json --interactive --cwd <workspace>`.
 - Null Konfiguration — verwendet die lokalen `claude` CLI-Anmeldeinformationen.
 
+#### Free Auto — Automatische Mehrkanal-Umschaltung
+
+Der **Auto**-Kanal (`freecc:auto` im Channel-Menü) leitet jede Anfrage automatisch an den besten verfügbaren kostenlosen Kanal weiter — ohne manuelles Umschalten.
+
+- Rotiert durch alle konfigurierten kostenlosen Kanäle und überspringt automatisch Kanäle mit Ratenbegrenzung (429) oder Upstream-Fehlern (5xx).
+- Verfolgt kanalspezifische Abkühlzeiten mit Backoff: nach einem Fehler pausiert ein Kanal für eine gewisse Zeit.
+- Unterstützt optionale Modell-Überschreibung, sodass alle automatisch gerouteten Anfragen dasselbe Modell nutzen.
+- Wenn alle Kanäle erschöpft sind, wird ein 503 mit Fehlerprotokoll zurückgegeben.
+
+#### Multi-Provider-Kette: DeepSeek → CodeX
+
+Mit `/ultracode` kann das Harness mehrere Provider über die Planschritte hinweg automatisch verketten. Typisches Muster: DeepSeek erzeugt kostengünstige Entwürfe, CodeX übernimmt die Verfeinerung zur finalen Qualität.
+
+- Der **dynamische Harness-Plan** unterstützt `model`-Überschreibungen pro Schritt — DeepSeek für Brainstorming/Klassifikation, CodeX/Gemini für Implementierung/Verifikation.
+- **cc-switch-Kompatibilität**: FreeUltraCode liest die `cc-switch` CLI-Konfiguration; jeder für Claude Code konfigurierte Provider ist sofort für Ultracode-Schritte verfügbar.
+- Die **Fächer-und-Synthese**-Strategie parallelisiert DeepSeek-Worker über unabhängige Teilaufgaben, ein Konsens-Gate (CodeX) synthetisiert und verifiziert die Ergebnisse.
+
+#### Geschwindigkeitsbewusste Kanalauswahl
+
+Der Auto-Kanal des Free-Proxy priorisiert Kanäle basierend auf Echtzeit-Verfügbarkeitssignalen:
+
+- **Ratenbegrenzungs-Bewusstsein**: Kanäle mit 429 werden für 30+ Sekunden abgekühlt, um vergebliche Versuche zu vermeiden.
+- **Schnelles Fehlschlagen bei Fehlern**: Nicht-wiederholbare Fehler (4xx Auth, 5xx Upstream) werden mit Cooldowns verfolgt; der Auto-Router überspringt sie.
+- **Verbindungszeit-Budget**: Jeder Kanalversuch unterliegt dem Upstream-Timeout; der Auto-Router blockiert nicht an einem einzigen langsamen Upstream.
+- **Natürliche Reaktivitäts-Reihenfolge**: Erfolgreiche Kanäle werden zuerst versucht; fehlerhafte Kanäle ans Ende der Liste verschoben.
+
+Diese Funktionen sorgen für resiliente `/ultracode`-Harness-Läufe, selbst wenn einzelne kostenlose Provider langsam, ratenbegrenzt oder vorübergehend nicht verfügbar sind.
+
 ## Schnellstart
 
 ```bash

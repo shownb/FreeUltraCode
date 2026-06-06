@@ -60,6 +60,34 @@ Para tarefas complexas de programação com várias etapas, `/ultracode <tarefa>
 - Execute pelo app desktop ou pela CLI: `fuc ultracode "<tarefa>" --json --interactive --cwd <workspace>`.
 - Configuração zero — reutiliza as credenciais de login do `claude` CLI local.
 
+#### Free Auto — Troca automática multicanal
+
+O canal **Auto** (`freecc:auto` no menu Channel) roteia automaticamente cada requisição para o melhor canal gratuito disponível, sem trocas manuais.
+
+- Alterna entre todos os canais gratuitos configurados, pulando automaticamente os que atingem limites de taxa (429) ou retornam erros upstream (5xx).
+- Rastreia cooldowns por canal com backoff: quando um canal falha, ele é pausado antes de ser tentado novamente.
+- Suporta substituição opcional de modelo para que todas as requisições usem o mesmo modelo.
+- Se todos os canais estiverem esgotados, retorna um 503 com o log de falhas para diagnóstico.
+
+#### Cadeia multi-provedor: DeepSeek → CodeX
+
+Com `/ultracode`, o harness pode encadear vários provedores entre as etapas do plano automaticamente. Padrão típico: DeepSeek produz rascunhos com baixo custo, CodeX refina até a qualidade final.
+
+- O **plano de harness dinâmico** suporta substituição de `model` por etapa — atribua DeepSeek para brainstorming/classificação e CodeX/Gemini para implementação/verificação.
+- **Compatibilidade cc-switch**: O FreeUltraCode lê a configuração CLI `cc-switch`; qualquer provedor já configurado para Claude Code está disponível imediatamente.
+- A estratégia **leque-e-síntese** paraleliza workers DeepSeek em subtarefas independentes, depois um portão de consenso (CodeX) sintetiza e verifica os resultados.
+
+#### Seleção de canal sensível à velocidade
+
+O canal Auto do proxy gratuito prioriza canais com base em sinais de disponibilidade em tempo real:
+
+- **Consciente de limites de taxa**: canais retornando 429 são resfriados por 30+ segundos antes de nova tentativa.
+- **Falha rápida em erros**: erros não-reintentáveis (falhas de autenticação 4xx, quedas upstream 5xx) são rastreados com cooldown; o roteador Auto os pula.
+- **Orçamento de tempo de conexão**: cada tentativa de canal está sujeita ao timeout upstream; o roteador Auto não bloqueia em um único upstream lento.
+- **Ordem natural por responsividade**: canais bem-sucedidos são tentados primeiro; canais com erro vão para o final da lista.
+
+Esses recursos garantem execuções resilientes do harness `/ultracode`, mesmo quando provedores gratuitos individuais estão lentos, limitados ou temporariamente indisponíveis.
+
 ## Início rápido
 
 ```bash

@@ -107,6 +107,34 @@ For complex multi-step coding tasks, `/ultracode <task>` generates a purpose-bui
 - Run from the desktop app or the CLI: `fuc ultracode "<task>" --json --interactive --cwd <workspace>`.
 - Zero config — reuses local `claude` CLI login credentials.
 
+#### Free Auto — Multi-Channel Auto-Switching
+
+The **Auto** channel (`freecc:auto` in the Channel menu) routes each request through the best currently available free channel without manual switching.
+
+- Rotates through all configured free channels, automatically skipping channels that hit rate limits (429) or return upstream errors (5xx).
+- Tracks per-channel cooldowns with backoff: when a channel returns an error, it is paused for a cooling period before being retried.
+- Supports an optional model override so all auto-routed requests use the same model regardless of which channel handles them.
+- If all channels are exhausted, returns a 503 with the failure log so you can diagnose the outage.
+
+#### Multi-Provider Chain: DeepSeek → CodeX
+
+When using `/ultracode`, the harness can chain multiple providers across plan steps automatically. A typical pattern: let DeepSeek produce responsive drafts with low cost, then let CodeX pick up and refine the output for final quality.
+
+- The **Dynamic Harness plan** supports per-step `model` overrides — assign DeepSeek to brainstorming/classification steps and CodeX/Gemini to implementation/verification steps.
+- **cc-switch compatibility**: FreeUltraCode reads `cc-switch` CLI config so any provider already configured for Claude Code routing is immediately available for ultracode steps.
+- **Fan-out-and-synthesize** strategy parallelizes DeepSeek workers across independent subtasks, then a consensus gate (CodeX) synthesizes and verifies the results.
+
+#### Speed-Aware Channel Selection
+
+The free proxy auto channel prioritizes channels based on real-world availability signals:
+
+- **Rate-limit awareness**: Channels returning 429 are cooling for 30+ seconds before retry, preventing wasted attempts on saturated upstreams.
+- **Fail-fast on errors**: Non-retryable errors (4xx auth failures, 5xx upstream down) are tracked per-channel with cooldowns; the auto router skips them for the current request.
+- **Connection-time budget**: Each channel attempt is subject to the upstream's timeout; the auto router cycles through candidates without blocking on a single slow upstream.
+- **Natural ordering by responsiveness**: Channels that succeed leave the cooldown registry empty and are naturally tried first; channels with errors are deferred to the end of the candidate list.
+
+These features work together so `/ultracode` harness runs stay resilient even when individual free providers are slow, rate-limited, or temporarily unavailable.
+
 ### Local-First Workspace
 
 - Sessions, favorites, scheduled prompts, API keys, and workspace history are stored locally.

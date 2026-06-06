@@ -60,6 +60,34 @@ Pour les tâches de programmation complexes en plusieurs étapes, `/ultracode <t
 - Lancement depuis l'application desktop ou en CLI : `fuc ultracode "<tâche>" --json --interactive --cwd <workspace>`.
 - Zéro configuration — réutilise les identifiants de connexion locaux de la CLI `claude`.
 
+#### Free Auto — Basculement automatique multi-canal
+
+Le canal **Auto** (`freecc:auto` dans le menu Channel) achemine automatiquement chaque requête vers le meilleur canal gratuit disponible, sans intervention manuelle.
+
+- Alterne entre tous les canaux gratuits configurés, en sautant automatiquement ceux qui atteignent les limites de débit (429) ou retournent des erreurs upstream (5xx).
+- Suivi des refroidissements par canal avec backoff : quand un canal retourne une erreur, il est mis en pause avant d'être réessayé.
+- Prend en charge un remplacement de modèle optionnel pour que toutes les requêtes auto-routées utilisent le même modèle.
+- Si tous les canaux sont épuisés, retourne un 503 avec le journal des échecs pour diagnostiquer la panne.
+
+#### Chaîne multi-fournisseur : DeepSeek → CodeX
+
+Avec `/ultracode`, le harness peut enchaîner automatiquement plusieurs fournisseurs à travers les étapes du plan. Un schéma typique : laisser DeepSeek produire des ébauches rapides à faible coût, puis laisser CodeX reprendre et raffiner le résultat.
+
+- Le **plan de harness dynamique** prend en charge les remplacements de `model` par étape — attribuez DeepSeek aux étapes de brainstorming/classification et CodeX/Gemini aux étapes d'implémentation/vérification.
+- **Compatibilité cc-switch** : FreeUltraCode lit la configuration CLI `cc-switch`, tout fournisseur déjà configuré pour le routage Claude Code est immédiatement disponible pour les étapes ultracode.
+- La stratégie **éventail-synthèse** parallélise les workers DeepSeek sur des sous-tâches indépendantes, puis une porte de consensus (CodeX) synthétise et vérifie les résultats.
+
+#### Sélection de canal sensible à la vitesse
+
+Le canal Auto du proxy gratuit priorise les canaux selon des signaux de disponibilité en temps réel :
+
+- **Conscience des limites de débit** : les canaux retournant 429 sont refroidis pendant 30+ secondes avant réessai, évitant les tentatives inutiles sur des upstreams saturés.
+- **Échec rapide sur erreurs** : les erreurs non-réessayables (échecs d'authentification 4xx, pannes upstream 5xx) sont suivies par canal avec refroidissement ; le routeur Auto les saute.
+- **Budget de temps de connexion** : chaque tentative de canal est soumise au timeout upstream ; le routeur Auto parcourt les candidats sans bloquer sur un seul upstream lent.
+- **Ordre naturel par réactivité** : les canaux qui réussissent restent sans refroidissement et sont essayés en premier ; les canaux en erreur sont repoussés en fin de liste.
+
+Ces fonctionnalités assurent la résilience des exécutions de harness `/ultracode`, même lorsque certains fournisseurs gratuits sont lents, limités en débit ou temporairement indisponibles.
+
 ## Démarrage rapide
 
 ```bash
