@@ -30,6 +30,12 @@
 - 스트리밍 응답, 명령 로그, 파일 참조, 요약을 한 채팅 화면에서 확인할 수 있습니다.
 - 같은 세션에서 후속 요청을 이어갈 수 있습니다.
 
+### 이미지 생성 + 프로그래밍
+
+- 같은 로컬 대화 안에서 이미지 생성 모델과 프로그래밍 모델을 함께 사용할 수 있습니다.
+- 시각 자료, 아이콘, 포스터, 디자인 레퍼런스가 필요할 때 이미지 모드로 전환하고, 생성 후 다시 프로그래밍 모델로 돌아와 프로젝트에 적용할 수 있습니다.
+- 생성 이미지, 프롬프트, Provider 정보, 로그, 이후 코드 변경이 같은 세션 기록에 남습니다.
+
 ### 무료 모델 라우팅
 
 - **20+ 원격 채널과 로컬 runtime**: NVIDIA NIM, OpenRouter, GitHub Models, Hugging Face Router, SambaNova Cloud, Together AI, Google Gemini, DeepSeek, Mistral, Mistral Codestral, OpenCode, Wafer, Kimi, Cerebras, Groq, Fireworks, Z.ai, LLM7, Kilo Gateway, 그리고 Ollama, LM Studio, llama.cpp.
@@ -146,13 +152,25 @@ npm run package
 
 채널이 준비되면 하단 입력창에서 해당 경로로 대화할 수 있습니다.
 
-### Chat으로 프로그래밍하기
+### 이미지 모드 사용
 
-1. 왼쪽 사이드바에서 **+ New Session**을 클릭합니다.
-2. 하단 컨트롤에서 runtime, channel, permission mode, workspace를 선택합니다.
-3. 목표 동작, 관련 파일, 승인 기준, 제약 조건을 포함해 요청을 작성합니다.
-4. 실행 중에는 파일 읽기, 검색, 수정, 검증 단계가 별도 항목으로 표시됩니다.
-5. 결과를 조정해야 하면 같은 채팅에서 후속 요청을 이어가면 됩니다.
+이미지 모드는 같은 세션 기록을 유지한 채 채팅 입력창을 텍스트-이미지 생성 입력으로 바꿉니다. UI 에셋, 아이콘, 포스터, 디자인 레퍼런스를 만든 뒤 다시 코드 작업으로 돌아갈 때 유용합니다.
+
+1. **Settings** -> **Images**를 열고 기본 이미지 Provider를 선택한 뒤 필요한 API key, Account ID, Base URL 또는 로컬 ComfyUI endpoint를 입력합니다.
+2. 채팅 세션에서 `/image-mode-start`를 입력합니다. 첫 프롬프트를 같은 메시지에 붙일 수도 있습니다.
+
+```text
+/image-mode-start 로컬 코딩 에이전트용 깔끔한 앱 아이콘, 유리 효과, 1024x1024
+```
+
+3. 모드가 켜져 있는 동안 일반 메시지는 코드 편집 대신 이미지를 생성합니다. **Channel** 선택기는 이미지 Provider로 전환됩니다.
+4. 원하는 이미지를 설명합니다. FreeUltraCode는 먼저 프로그래밍 모델로 이미지 프롬프트를 다듬고, 설정된 Provider로 보냅니다.
+
+<p align="center">
+  <img src="images/生图/image-mode-session.ko.png" alt="이미지 모드는 같은 FreeUltraCode 세션 안에서 이미지를 생성합니다" width="720">
+</p>
+
+5. `/image-mode-end`를 보내면 프로그래밍 channel과 model로 돌아갑니다. 지속 모드 없이 한 장만 만들려면 `/image`, `/img`, `/draw`, `/生图`, `/画图` 뒤에 프롬프트를 입력합니다.
 
 ## 동작 방식
 

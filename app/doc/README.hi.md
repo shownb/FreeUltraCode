@@ -30,6 +30,12 @@ Coding agents काम आते हैं, लेकिन premium model quota
 - streamed output, command logs, file references और summaries एक ही chat surface में देखें।
 - उसी session में follow-up requests जारी रखें।
 
+### Image generation + programming
+
+- उसी local conversation में image-generation model और programming model दोनों इस्तेमाल करें।
+- visual assets, icons, posters या design references चाहिए हों तो image mode में जाएं, फिर वापस programming model पर आकर उन्हें project में apply करें।
+- generated image, prompt, provider details, logs और बाद के code changes उसी session history में रहते हैं।
+
 ### Free-model routing
 
 - **20+ remote channels और local runtimes**: NVIDIA NIM, OpenRouter, GitHub Models, Hugging Face Router, SambaNova Cloud, Together AI, Google Gemini, DeepSeek, Mistral, Mistral Codestral, OpenCode, Wafer, Kimi, Cerebras, Groq, Fireworks, Z.ai, LLM7, Kilo Gateway, साथ में Ollama, LM Studio और llama.cpp।
@@ -146,13 +152,25 @@ npm run package
 
 Channel ready होने के बाद नीचे के input से उसी route पर chat करें।
 
-### Chat से programming करें
+### Image mode इस्तेमाल करें
 
-1. left sidebar में **+ New Session** click करें।
-2. नीचे runtime, channel, permission mode और workspace चुनें।
-3. expected behavior, affected files, acceptance criteria और constraints के साथ task लिखें।
-4. चलने के दौरान FreeUltraCode file reads, searches, edits और checks को अलग entries में दिखाता है।
-5. result adjust करना हो तो उसी chat में follow-up request भेजें।
+Image mode chat composer को text-to-image input में बदल देता है और वही session history रखता है। यह UI assets, icons, posters और design references बनाने के बाद code work पर लौटने के लिए उपयोगी है।
+
+1. **Settings** -> **Images** खोलें, default image provider चुनें, और required API key, Account ID, Base URL या local ComfyUI endpoint भरें।
+2. chat session में `/image-mode-start` लिखें। आप पहली prompt उसी message में भी जोड़ सकते हैं:
+
+```text
+/image-mode-start local coding agent के लिए clean app icon, glass effect, 1024x1024
+```
+
+3. mode on रहने पर normal messages code edits की जगह images generate करते हैं। **Channel** selector image providers पर switch हो जाता है।
+4. desired image describe करें। FreeUltraCode पहले programming model से image prompt polish करवाता है, फिर configured provider को भेजता है।
+
+<p align="center">
+  <img src="images/生图/image-mode-session.hi.png" alt="Image mode उसी FreeUltraCode session में images generate करता है" width="720">
+</p>
+
+5. programming channel और model पर लौटने के लिए `/image-mode-end` भेजें। Persistent mode के बिना एक image चाहिए तो `/image`, `/img`, `/draw`, `/生图` या `/画图` के बाद prompt लिखें।
 
 ## कैसे काम करता है
 

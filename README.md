@@ -57,7 +57,7 @@
 
 <p align="center">
   <strong>Image generation and coding in one session</strong><br>
-  <img src="app/doc/images/生图/session-2026-06-07-2209.png" alt="FreeUltraCode switches from image generation to coding in one chat session" width="720">
+  <img src="app/doc/images/生图/image-mode-session.en.png" alt="FreeUltraCode switches from image generation to coding in one chat session" width="720">
 </p>
 
 > [!IMPORTANT]
@@ -223,28 +223,25 @@ build.bat       # Windows: package the NSIS installer
 
 After the channel is ready, use the bottom input to chat through that route. See the [free channel registration guide](app/doc/register-free-channel.md) for the full Chinese walkthrough.
 
-### Use Chat for Programming
+### Use Image Mode
 
-1. Click **+ New Session** in the left sidebar.
-2. Choose the runtime, permission mode, and workspace from the bottom controls. For code edits, make sure the selected workspace is the repository you want to modify.
-3. Describe the programming request with enough implementation context: target behavior, affected UI or files, acceptance criteria, and any constraints. Press `Ctrl+Enter` or click the send button.
+Image mode turns the chat composer into a text-to-image surface while keeping the same session history. It is useful for generating UI assets, icons, posters, design references, and then switching back to coding in the same conversation.
 
-<p align="center">
-  <img src="app/doc/images/chat/h-新建chat.png" alt="Create a new chat session and enter a coding request" width="960">
-</p>
+1. Open **Settings** -> **Images**, choose a default image provider, and fill in the required API key, account ID, base URL, or local ComfyUI endpoint. Providers with complete configuration are available from the composer in image mode.
+2. Start a chat session and type `/image-mode-start`. You can also start and generate in one message, for example:
 
-4. While the task is running, watch the message stream and command rows. FreeUltraCode shows file reads, searches, edits, checks, and tool calls as separate entries, so you can see what the assistant is doing. Click **Stop** if the request is going in the wrong direction.
+```text
+/image-mode-start a clean app icon for a local coding agent, glass effect, 1024x1024
+```
 
-<p align="center">
-  <img src="app/doc/images/chat/i-等待完成.png" alt="Wait for chat mode to inspect, edit, and verify the coding task" width="960">
-</p>
-
-5. After completion, review the summary, changed behavior, and verification commands. If the result needs adjustment, continue in the same chat with a follow-up request.
-6. For UI changes, run the app and check the feature directly. In this example, the chat request adds a scheduled task dialog for favorites, then verifies the modal and saved weekly schedule.
+3. While image mode is on, ordinary messages generate images instead of running coding edits. The bottom **Channel** selector switches to image providers, and the model selector appears when image model selection is enabled.
+4. Describe the image you want. FreeUltraCode first asks the coding model to polish the image prompt, then sends it to the configured image provider. The generated image appears in the chat stream with the prompt and provider details.
 
 <p align="center">
-  <img src="app/doc/images/chat/j-周报.png" alt="Chat mode result showing a scheduled task dialog added to the app" width="960">
+  <img src="app/doc/images/生图/image-mode-session.en.png" alt="Image mode generates images and keeps them in the same FreeUltraCode session" width="720">
 </p>
+
+5. Send `/image-mode-end` to return to the normal coding channel and model. If you only need one image without staying in image mode, send `/image`, `/img`, `/draw`, `/生图`, or `/画图` followed by the prompt.
 
 ## How It Works
 

@@ -30,6 +30,12 @@ Los agentes de programación son útiles, pero la cuota de modelos premium se co
 - Revisa salida en streaming, logs de comandos, referencias de archivos y resúmenes en una sola superficie de chat.
 - Continúa con peticiones de seguimiento en la misma sesión.
 
+### Generación de imágenes + programación
+
+- Usa un modelo de generación de imágenes y un modelo de programación dentro de la misma conversación local.
+- Entra en el modo de imagen cuando necesites assets visuales, iconos, pósteres o referencias de diseño; luego vuelve al modelo de programación para aplicar esos assets al proyecto.
+- La imagen generada, el prompt, los datos del proveedor, los logs y los cambios de código posteriores quedan en el mismo historial.
+
 ### Enrutamiento de modelos gratuitos
 
 - **20+ canales remotos y runtimes locales**: NVIDIA NIM, OpenRouter, GitHub Models, Hugging Face Router, SambaNova Cloud, Together AI, Google Gemini, DeepSeek, Mistral, Mistral Codestral, OpenCode, Wafer, Kimi, Cerebras, Groq, Fireworks, Z.ai, LLM7, Kilo Gateway, además de Ollama, LM Studio y llama.cpp.
@@ -146,13 +152,25 @@ npm run package
 
 Cuando el canal esté listo, usa la entrada inferior para chatear por esa ruta.
 
-### Usar Chat para programar
+### Usar el modo de imagen
 
-1. Haz clic en **+ New Session** en la barra lateral.
-2. Elige runtime, canal, modo de permisos y workspace desde los controles inferiores.
-3. Describe la tarea con el comportamiento esperado, archivos afectados, criterios de aceptación y restricciones.
-4. Durante la ejecución, FreeUltraCode muestra lecturas de archivos, búsquedas, ediciones y verificaciones como entradas separadas.
-5. Si necesitas ajustar el resultado, continúa en el mismo chat con una petición de seguimiento.
+El modo de imagen convierte el compositor en una entrada de texto a imagen sin salir del historial de la sesión. Sirve para crear assets de UI, iconos, pósteres y referencias de diseño antes de volver a programar.
+
+1. Abre **Settings** -> **Images**, elige el proveedor de imagen predeterminado y completa la API key, Account ID, Base URL o endpoint local de ComfyUI que pida ese proveedor.
+2. En una sesión de chat, escribe `/image-mode-start`. También puedes iniciar y generar en el mismo mensaje:
+
+```text
+/image-mode-start un icono limpio para una app local de agente de código, efecto vidrio, 1024x1024
+```
+
+3. Mientras esté activo, los mensajes normales generan imágenes en vez de ejecutar ediciones de código. El selector **Channel** cambia a proveedores de imagen.
+4. Describe la imagen. FreeUltraCode primero mejora el prompt con el modelo de programación y luego lo envía al proveedor configurado.
+
+<p align="center">
+  <img src="images/生图/image-mode-session.es.png" alt="El modo de imagen genera imágenes dentro de la misma sesión de FreeUltraCode" width="720">
+</p>
+
+5. Envía `/image-mode-end` para volver al canal y modelo de programación. Para una sola imagen sin modo persistente, usa `/image`, `/img`, `/draw`, `/生图` o `/画图` seguido del prompt.
 
 ## Cómo funciona
 

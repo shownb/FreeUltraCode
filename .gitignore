@@ -11,6 +11,7 @@ app/*.tsbuildinfo
 # Local agent/browser/debug state
 .omc/
 .gstack/
+.codex/
 .claude/
 memory/
 app/.gstack/
@@ -20,6 +21,7 @@ app/src-tauri/.gstack/
 # Local scratch / test outputs / screenshots
 /test100/
 /images/
+tmp_icon/
 
 # Published docs and notes
 /docs/

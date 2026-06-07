@@ -30,6 +30,12 @@ Coding Agents sind nützlich, aber Premium-Kontingente sind schnell aufgebraucht
 - Sieh gestreamte Antworten, Befehlslogs, Dateireferenzen und Zusammenfassungen in einer Chat-Oberfläche.
 - Stelle Folgefragen in derselben Sitzung.
 
+### Bildgenerierung + Programmieren
+
+- Nutze ein Bildgenerierungsmodell und ein Programmiermodell in derselben lokalen Unterhaltung.
+- Wechsle in den Bildmodus, wenn du visuelle Assets, Icons, Poster oder Designreferenzen brauchst, und danach zurück zum Programmiermodell, um sie im Projekt zu verwenden.
+- Generierte Bilder, Prompts, Provider-Daten, Logs und spätere Codeänderungen bleiben im selben Sitzungsverlauf.
+
 ### Routing kostenloser Modelle
 
 - **20+ Remote-Kanäle plus lokale Runtimes**: NVIDIA NIM, OpenRouter, GitHub Models, Hugging Face Router, SambaNova Cloud, Together AI, Google Gemini, DeepSeek, Mistral, Mistral Codestral, OpenCode, Wafer, Kimi, Cerebras, Groq, Fireworks, Z.ai, LLM7, Kilo Gateway, plus Ollama, LM Studio und llama.cpp.
@@ -146,13 +152,25 @@ npm run package
 
 Sobald der Kanal bereit ist, kannst du über die untere Eingabe über diese Route chatten.
 
-### Chat fürs Programmieren nutzen
+### Bildmodus nutzen
 
-1. Klicke in der Sidebar auf **+ New Session**.
-2. Wähle Runtime, Kanal, Berechtigungsmodus und Workspace in den unteren Steuerelementen.
-3. Beschreibe die Programmieraufgabe mit Zielverhalten, betroffenen Dateien, Akzeptanzkriterien und Einschränkungen.
-4. Während der Ausführung zeigt FreeUltraCode Dateizugriffe, Suchen, Änderungen und Prüfungen als separate Einträge.
-5. Wenn das Ergebnis angepasst werden muss, fahre in derselben Unterhaltung fort.
+Der Bildmodus macht den Chat Composer zur Texteingabe für Bildgenerierung, ohne den Sitzungsverlauf zu verlassen. Das ist praktisch für UI-Assets, Icons, Poster und Designreferenzen, bevor du wieder zum Programmieren wechselst.
+
+1. Öffne **Settings** -> **Images**, wähle den Standard-Bildprovider und trage API-Key, Account ID, Base URL oder lokalen ComfyUI-Endpunkt ein.
+2. Schreibe in einer Chat-Sitzung `/image-mode-start`. Du kannst den ersten Prompt direkt anhängen:
+
+```text
+/image-mode-start ein sauberes App-Icon für einen lokalen Coding-Agenten, Glaseffekt, 1024x1024
+```
+
+3. Solange der Modus aktiv ist, erzeugen normale Nachrichten Bilder statt Codeänderungen. Der **Channel**-Selector zeigt dann Bildprovider.
+4. Beschreibe das gewünschte Bild. FreeUltraCode lässt zuerst das Programmiermodell den Bildprompt verbessern und sendet ihn danach an den konfigurierten Provider.
+
+<p align="center">
+  <img src="images/生图/image-mode-session.de.png" alt="Der Bildmodus erzeugt Bilder in derselben FreeUltraCode-Sitzung" width="720">
+</p>
+
+5. Sende `/image-mode-end`, um zum Programmierkanal und Modell zurückzukehren. Für ein einzelnes Bild ohne dauerhaften Modus nutze `/image`, `/img`, `/draw`, `/生图` oder `/画图` plus Prompt.
 
 ## Funktionsweise
 
