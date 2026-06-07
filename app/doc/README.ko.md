@@ -167,7 +167,7 @@ npm run package
 4. 원하는 이미지를 설명합니다. FreeUltraCode는 먼저 프로그래밍 모델로 이미지 프롬프트를 다듬고, 설정된 Provider로 보냅니다.
 
 <p align="center">
-  <img src="images/生图/image-mode-session.ko.png" alt="이미지 모드는 같은 FreeUltraCode 세션 안에서 이미지를 생성합니다" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="이미지 모드는 같은 FreeUltraCode 세션 안에서 이미지를 생성합니다" width="720">
 </p>
 
 5. `/image-mode-end`를 보내면 프로그래밍 channel과 model로 돌아갑니다. 지속 모드 없이 한 장만 만들려면 `/image`, `/img`, `/draw`, `/生图`, `/画图` 뒤에 프롬프트를 입력합니다.

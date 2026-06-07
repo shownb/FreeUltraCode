@@ -167,7 +167,7 @@ Le mode image transforme la zone de chat en entrée texte-vers-image tout en gar
 4. Décrivez l'image voulue. FreeUltraCode fait d'abord améliorer le prompt par le modèle de programmation, puis l'envoie au fournisseur configuré.
 
 <p align="center">
-  <img src="images/生图/image-mode-session.fr.png" alt="Le mode image génère des images dans la même session FreeUltraCode" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="Le mode image génère des images dans la même session FreeUltraCode" width="720">
 </p>
 
 5. Envoyez `/image-mode-end` pour revenir au canal et au modèle de programmation. Pour générer une seule image sans mode persistant, utilisez `/image`, `/img`, `/draw`, `/生图` ou `/画图` suivi du prompt.

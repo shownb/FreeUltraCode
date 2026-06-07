@@ -167,7 +167,7 @@ Der Bildmodus macht den Chat Composer zur Texteingabe für Bildgenerierung, ohne
 4. Beschreibe das gewünschte Bild. FreeUltraCode lässt zuerst das Programmiermodell den Bildprompt verbessern und sendet ihn danach an den konfigurierten Provider.
 
 <p align="center">
-  <img src="images/生图/image-mode-session.de.png" alt="Der Bildmodus erzeugt Bilder in derselben FreeUltraCode-Sitzung" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="Der Bildmodus erzeugt Bilder in derselben FreeUltraCode-Sitzung" width="720">
 </p>
 
 5. Sende `/image-mode-end`, um zum Programmierkanal und Modell zurückzukehren. Für ein einzelnes Bild ohne dauerhaften Modus nutze `/image`, `/img`, `/draw`, `/生图` oder `/画图` plus Prompt.

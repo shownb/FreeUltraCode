@@ -167,7 +167,7 @@ Image mode chat composer को text-to-image input में बदल दे�
 4. desired image describe करें। FreeUltraCode पहले programming model से image prompt polish करवाता है, फिर configured provider को भेजता है।
 
 <p align="center">
-  <img src="images/生图/image-mode-session.hi.png" alt="Image mode उसी FreeUltraCode session में images generate करता है" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="Image mode उसी FreeUltraCode session में images generate करता है" width="720">
 </p>
 
 5. programming channel और model पर लौटने के लिए `/image-mode-end` भेजें। Persistent mode के बिना एक image चाहिए तो `/image`, `/img`, `/draw`, `/生图` या `/画图` के बाद prompt लिखें।

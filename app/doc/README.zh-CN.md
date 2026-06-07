@@ -186,7 +186,7 @@ build.bat       # Windows：打包 NSIS 安装器
 4. 描述你想要的图片。FreeUltraCode 会先让编程模型扩写生图提示词，再调用配置好的生图 Provider 出图。生成结果会和提示词、Provider 信息一起显示在聊天流里。
 
 <p align="center">
-  <img src="images/生图/image-mode-session.zh-CN.png" alt="生图模式在同一个 FreeUltraCode 会话中生成图片并保留上下文" width="720">
+  <img src="images/生图/session-2026-06-07-2209.png" alt="生图模式在同一个 FreeUltraCode 会话中生成图片并保留上下文" width="720">
 </p>
 
 5. 输入 `/image-mode-end` 退出生图模式，回到普通 AI 编程渠道和模型。如果只想临时生成一张图，不需要进入常驻模式，可以直接发送 `/image`、`/img`、`/draw`、`/生图` 或 `/画图` 加上提示词。

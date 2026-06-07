@@ -167,7 +167,7 @@ npm run package
 4. صف الصورة المطلوبة. يطلب FreeUltraCode أولًا من نموذج البرمجة تحسين prompt الصورة، ثم يرسله إلى المزود المضبوط.
 
 <p align="center">
-  <img src="images/生图/image-mode-session.ar.png" alt="وضع الصور يولد صورًا داخل جلسة FreeUltraCode نفسها" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="وضع الصور يولد صورًا داخل جلسة FreeUltraCode نفسها" width="720">
 </p>
 
 5. أرسل `/image-mode-end` للعودة إلى قناة ونموذج البرمجة. لصورة واحدة بدون وضع مستمر، استخدم `/image` أو `/img` أو `/draw` أو `/生图` أو `/画图` متبوعًا بالprompt.

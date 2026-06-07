@@ -167,7 +167,7 @@ El modo de imagen convierte el compositor en una entrada de texto a imagen sin s
 4. Describe la imagen. FreeUltraCode primero mejora el prompt con el modelo de programación y luego lo envía al proveedor configurado.
 
 <p align="center">
-  <img src="images/生图/image-mode-session.es.png" alt="El modo de imagen genera imágenes dentro de la misma sesión de FreeUltraCode" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="El modo de imagen genera imágenes dentro de la misma sesión de FreeUltraCode" width="720">
 </p>
 
 5. Envía `/image-mode-end` para volver al canal y modelo de programación. Para una sola imagen sin modo persistente, usa `/image`, `/img`, `/draw`, `/生图` o `/画图` seguido del prompt.

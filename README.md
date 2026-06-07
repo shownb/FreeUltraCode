@@ -57,7 +57,7 @@
 
 <p align="center">
   <strong>Image generation and coding in one session</strong><br>
-  <img src="app/doc/images/生图/image-mode-session.en.png" alt="FreeUltraCode switches from image generation to coding in one chat session" width="720">
+  <img src="app/doc/images/生图/session-2026-06-07-2351.png" alt="FreeUltraCode switches from image generation to coding in one chat session" width="720">
 </p>
 
 > [!IMPORTANT]
@@ -238,7 +238,7 @@ Image mode turns the chat composer into a text-to-image surface while keeping th
 4. Describe the image you want. FreeUltraCode first asks the coding model to polish the image prompt, then sends it to the configured image provider. The generated image appears in the chat stream with the prompt and provider details.
 
 <p align="center">
-  <img src="app/doc/images/生图/image-mode-session.en.png" alt="Image mode generates images and keeps them in the same FreeUltraCode session" width="720">
+  <img src="app/doc/images/生图/session-2026-06-07-2351.png" alt="Image mode generates images and keeps them in the same FreeUltraCode session" width="720">
 </p>
 
 5. Send `/image-mode-end` to return to the normal coding channel and model. If you only need one image without staying in image mode, send `/image`, `/img`, `/draw`, `/生图`, or `/画图` followed by the prompt.

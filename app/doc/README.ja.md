@@ -167,7 +167,7 @@ npm run package
 4. 作りたい画像を説明します。FreeUltraCode はまずプログラミングモデルで画像 prompt を整え、その後設定済みプロバイダーへ送信します。
 
 <p align="center">
-  <img src="images/生图/image-mode-session.ja.png" alt="画像モードは同じ FreeUltraCode セッション内で画像を生成します" width="720">
+  <img src="images/生图/session-2026-06-07-2351.png" alt="画像モードは同じ FreeUltraCode セッション内で画像を生成します" width="720">
 </p>
 
 5. `/image-mode-end` を送ると、プログラミング用の channel と model に戻ります。常駐モードにせず 1 枚だけ生成する場合は、`/image`、`/img`、`/draw`、`/生图`、`/画图` の後に prompt を続けます。
