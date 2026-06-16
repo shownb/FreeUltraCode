@@ -1,4 +1,4 @@
-export type MusicProviderId =
+export type BuiltInMusicProviderId =
   | 'elevenlabs-music'
   | 'google-lyria'
   | 'minimax-music'
@@ -30,6 +30,9 @@ export type MusicProviderId =
   | 'local-tango2'
   | 'local-music-server';
 
+export type CustomMusicProviderId = `custom:${string}`;
+export type MusicProviderId = BuiltInMusicProviderId | CustomMusicProviderId;
+
 export type MusicProviderCategory = 'commercial' | 'free';
 
 type MusicProviderApiKind =
@@ -45,7 +48,10 @@ type MusicProviderApiKind =
   | 'sonauto-music'
   | 'fal-music'
   | 'huggingface-inference'
+  | 'generic-online-music'
   | 'generic-local-music';
+
+export type CustomMusicProviderApiKind = 'generic-online-music' | 'generic-local-music';
 
 export interface MusicProviderDefinition {
   id: MusicProviderId;
@@ -64,11 +70,31 @@ export interface MusicProviderDefinition {
   keyLabel?: string;
   keyPlaceholder?: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomMusicProviderDefinition {
+  id: CustomMusicProviderId;
+  label: string;
+  category: MusicProviderCategory;
+  apiKind: CustomMusicProviderApiKind;
+  defaultModel: string;
+  models: string[];
+  needsKey: boolean;
+  local: boolean;
+  defaultBaseUrl: string;
+  supportsBaseUrl: true;
+  endpointPlaceholder: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  note: string;
 }
 
 export interface MusicGenerationSettings {
   enabled: boolean;
   preferredProviderId: MusicProviderId;
+  customProviders: CustomMusicProviderDefinition[];
   providerKeys: Partial<Record<MusicProviderId, string>>;
   providerBaseUrls: Partial<Record<MusicProviderId, string>>;
   providerModels: Partial<Record<MusicProviderId, string>>;
@@ -628,6 +654,7 @@ const MUSIC_PROVIDER_BY_ID = new Map<MusicProviderId, MusicProviderDefinition>(
 export const DEFAULT_MUSIC_GENERATION_SETTINGS: MusicGenerationSettings = {
   enabled: true,
   preferredProviderId: 'elevenlabs-music',
+  customProviders: [],
   providerKeys: {},
   providerBaseUrls: {},
   providerModels: {},
@@ -637,8 +664,134 @@ function hasStorage(): boolean {
   return typeof window !== 'undefined' && !!window.localStorage;
 }
 
-function isMusicProviderId(value: unknown): value is MusicProviderId {
-  return typeof value === 'string' && MUSIC_PROVIDER_BY_ID.has(value as MusicProviderId);
+function isKnownMusicProviderId(
+  value: unknown,
+  providers: readonly MusicProviderDefinition[],
+): value is MusicProviderId {
+  return typeof value === 'string' && providers.some((provider) => provider.id === value);
+}
+
+function slugifyCustomMusicProviderId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || cryptoRandomMusicId();
+}
+
+function cryptoRandomMusicId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomMusicProviderId(label: string): CustomMusicProviderId {
+  return `custom:${slugifyCustomMusicProviderId(label)}`;
+}
+
+function normalizeMusicModels(value: unknown, fallback: string): string[] {
+  const models = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [fallback, ...models]) {
+    const model = raw.trim();
+    const key = model.toLowerCase();
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    out.push(model);
+  }
+  return out.length > 0 ? out : ['custom-music-model'];
+}
+
+function normalizeCustomMusicProvider(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomMusicProviderDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomMusicProviderDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomMusicProviderId(rawId || label || `provider-${index + 1}`)}`;
+  let id = baseId as CustomMusicProviderId;
+  let suffix = 2;
+  while (usedIds.has(id) || MUSIC_PROVIDER_BY_ID.has(id as MusicProviderId)) {
+    id = `${baseId}-${suffix}` as CustomMusicProviderId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const apiKind: CustomMusicProviderApiKind =
+    source.apiKind === 'generic-local-music' ? 'generic-local-music' : 'generic-online-music';
+  const defaultModel =
+    typeof source.defaultModel === 'string' && source.defaultModel.trim()
+      ? source.defaultModel.trim()
+      : 'custom-music-model';
+  const defaultBaseUrl =
+    typeof source.defaultBaseUrl === 'string' ? source.defaultBaseUrl.trim().replace(/\/+$/, '') : '';
+  const endpointPlaceholder =
+    typeof source.endpointPlaceholder === 'string' && source.endpointPlaceholder.trim()
+      ? source.endpointPlaceholder.trim()
+      : apiKind === 'generic-local-music'
+        ? 'http://127.0.0.1:8000/generate'
+        : 'https://api.example.com/v1/audio/generations';
+  return {
+    id,
+    label,
+    category: source.category === 'free' ? 'free' : 'commercial',
+    apiKind,
+    defaultModel,
+    models: normalizeMusicModels(source.models, defaultModel),
+    needsKey: source.needsKey === true,
+    local: source.local === true || apiKind === 'generic-local-music',
+    defaultBaseUrl,
+    supportsBaseUrl: true,
+    endpointPlaceholder,
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : apiKind === 'generic-local-music'
+          ? '自定义本地/自托管音乐生成渠道。'
+          : '自定义 OpenAI-compatible 在线音乐生成渠道。',
+  };
+}
+
+function normalizeCustomMusicProviders(value: unknown): CustomMusicProviderDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomMusicProvider(item, index, usedIds))
+    .filter((item): item is CustomMusicProviderDefinition => !!item);
+}
+
+export function musicProviders(
+  settings = loadMusicGenerationSettings(),
+): MusicProviderDefinition[] {
+  return [
+    ...MUSIC_PROVIDERS,
+    ...settings.customProviders.map(
+      (provider): MusicProviderDefinition => ({ ...provider, custom: true }),
+    ),
+  ];
 }
 
 function cleanRecord<T extends string>(
@@ -662,18 +815,26 @@ export function normalizeMusicGenerationSettings(
     return DEFAULT_MUSIC_GENERATION_SETTINGS;
   }
   const source = value as Partial<MusicGenerationSettings>;
-  const preferredProviderId = isMusicProviderId(source.preferredProviderId)
+  const customProviders = normalizeCustomMusicProviders(source.customProviders);
+  const providers = [
+    ...MUSIC_PROVIDERS,
+    ...customProviders.map((provider) => ({ ...provider, custom: true })),
+  ];
+  const preferredProviderId = isKnownMusicProviderId(source.preferredProviderId, providers)
     ? source.preferredProviderId
     : DEFAULT_MUSIC_GENERATION_SETTINGS.preferredProviderId;
+  const validKey = (key: unknown): key is MusicProviderId =>
+    isKnownMusicProviderId(key, providers);
   return {
     enabled:
       typeof source.enabled === 'boolean'
         ? source.enabled
         : DEFAULT_MUSIC_GENERATION_SETTINGS.enabled,
     preferredProviderId,
-    providerKeys: cleanRecord(source.providerKeys, isMusicProviderId),
-    providerBaseUrls: cleanRecord(source.providerBaseUrls, isMusicProviderId),
-    providerModels: cleanRecord(source.providerModels, isMusicProviderId),
+    customProviders,
+    providerKeys: cleanRecord(source.providerKeys, validKey),
+    providerBaseUrls: cleanRecord(source.providerBaseUrls, validKey),
+    providerModels: cleanRecord(source.providerModels, validKey),
   };
 }
 
@@ -700,15 +861,18 @@ export function saveMusicGenerationSettings(settings: MusicGenerationSettings): 
   }
 }
 
-export function musicProviderById(id: MusicProviderId): MusicProviderDefinition {
-  return MUSIC_PROVIDER_BY_ID.get(id) ?? MUSIC_PROVIDERS[0];
+export function musicProviderById(
+  id: MusicProviderId,
+  settings = loadMusicGenerationSettings(),
+): MusicProviderDefinition {
+  return musicProviders(settings).find((provider) => provider.id === id) ?? MUSIC_PROVIDERS[0];
 }
 
 export function musicProviderModel(
   providerId: MusicProviderId,
   settings = loadMusicGenerationSettings(),
 ): string {
-  const provider = musicProviderById(providerId);
+  const provider = musicProviderById(providerId, settings);
   return settings.providerModels[providerId]?.trim() || provider.defaultModel;
 }
 
@@ -718,14 +882,14 @@ export function musicProviderBaseUrl(
 ): string {
   const custom = settings.providerBaseUrls[providerId]?.trim();
   if (custom) return custom.replace(/\/+$/, '');
-  return musicProviderById(providerId).defaultBaseUrl.replace(/\/+$/, '');
+  return musicProviderById(providerId, settings).defaultBaseUrl.replace(/\/+$/, '');
 }
 
 function musicProviderKey(
   providerId: MusicProviderId,
   settings = loadMusicGenerationSettings(),
 ): string {
-  const provider = musicProviderById(providerId);
+  const provider = musicProviderById(providerId, settings);
   const keyProviderId = provider.keyProviderId ?? providerId;
   return settings.providerKeys[keyProviderId]?.trim() || settings.providerKeys[providerId]?.trim() || '';
 }
@@ -734,7 +898,7 @@ export function musicProviderReady(
   providerId: MusicProviderId,
   settings = loadMusicGenerationSettings(),
 ): boolean {
-  const provider = musicProviderById(providerId);
+  const provider = musicProviderById(providerId, settings);
   if (provider.needsKey && !musicProviderKey(providerId, settings)) return false;
   if (provider.local && !settings.providerBaseUrls[providerId]?.trim()) return false;
   return !!musicProviderBaseUrl(providerId, settings);
@@ -743,9 +907,9 @@ export function musicProviderReady(
 export function configuredMusicProviderIds(
   settings = loadMusicGenerationSettings(),
 ): MusicProviderId[] {
-  return MUSIC_PROVIDERS.filter((provider) => musicProviderReady(provider.id, settings)).map(
-    (provider) => provider.id,
-  );
+  return musicProviders(settings)
+    .filter((provider) => musicProviderReady(provider.id, settings))
+    .map((provider) => provider.id);
 }
 
 export function preferredReadyMusicProviderId(
@@ -831,7 +995,7 @@ export async function generateMusic(
   if (!musicProviderReady(providerId, settings)) {
     throw new Error(`MUSIC_PROVIDER_NOT_READY:${providerId}`);
   }
-  const provider = musicProviderById(providerId);
+  const provider = musicProviderById(providerId, settings);
   const prompt = stripMusicCommand(request.prompt);
   const model = request.model?.trim() || musicProviderModel(providerId, settings);
   const requestedDurationSeconds =
@@ -864,7 +1028,7 @@ async function generateWithProvider(
   targetDurationSeconds: number,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  switch (musicProviderById(providerId).apiKind) {
+  switch (musicProviderById(providerId, settings).apiKind) {
     case 'elevenlabs-music':
       return generateElevenLabsMusic(prompt, model, settings, targetDurationSeconds, signal);
     case 'google-lyria':
@@ -889,6 +1053,8 @@ async function generateWithProvider(
       return generateFalMusic(providerId, prompt, model, settings, targetDurationSeconds, signal);
     case 'huggingface-inference':
       return generateHuggingFaceMusic(providerId, prompt, model, settings, targetDurationSeconds, signal);
+    case 'generic-online-music':
+      return generateGenericOnlineMusic(providerId, prompt, model, settings, targetDurationSeconds, signal);
     case 'generic-local-music':
       return generateGenericLocalMusic(providerId, prompt, model, settings, targetDurationSeconds, signal);
   }
@@ -1413,6 +1579,39 @@ async function generateGenericLocalMusic(
     },
     body: JSON.stringify({
       prompt,
+      model,
+      duration: targetDurationSeconds,
+      output_format: 'mp3',
+    }),
+    signal,
+  });
+  return audiosFromResponse(response);
+}
+
+async function generateGenericOnlineMusic(
+  providerId: MusicProviderId,
+  prompt: string,
+  model: string,
+  settings: MusicGenerationSettings,
+  targetDurationSeconds: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const provider = musicProviderById(providerId, settings);
+  const apiKey = musicProviderKey(providerId, settings);
+  if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
+  const headers: Record<string, string> = {
+    Accept: 'audio/mpeg, audio/*, application/json',
+    'Content-Type': 'application/json',
+  };
+  if (apiKey) {
+    headers.Authorization = apiKey.toLowerCase().startsWith('bearer ') ? apiKey : `Bearer ${apiKey}`;
+  }
+  const response = await fetch(musicProviderBaseUrl(providerId, settings), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      prompt,
+      input: prompt,
       model,
       duration: targetDurationSeconds,
       output_format: 'mp3',

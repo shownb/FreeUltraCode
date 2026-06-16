@@ -182,7 +182,6 @@ export default function LocalModelSetupDialog({
   return (
     <div
       className="fixed inset-0 z-[80] bg-black/60 sm:flex sm:items-center sm:justify-center sm:p-6"
-      onClick={onClose}
     >
       <div
         role="dialog"

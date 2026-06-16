@@ -314,6 +314,30 @@ export const SLASH_COMMANDS = [
     },
   },
   {
+    name: '/blueprint-mode-start',
+    label: { 'zh-CN': '开始 UE 蓝图模式', 'en-US': 'Start UE Blueprint Mode' },
+    detail: {
+      'zh-CN': '进入 UE 蓝图模式：之后每条消息都按 Unreal Blueprint 创建、修改、编译和校验来处理',
+      'en-US': 'Enter UE Blueprint mode: every message is handled as Unreal Blueprint creation, editing, compilation, or verification',
+    },
+    text: {
+      'zh-CN': '',
+      'en-US': '',
+    },
+  },
+  {
+    name: '/blueprint-mode-end',
+    label: { 'zh-CN': '结束 UE 蓝图模式', 'en-US': 'End UE Blueprint Mode' },
+    detail: {
+      'zh-CN': '退出 UE 蓝图模式；可带 --commit、--discard、--verify、--compile 等收尾参数',
+      'en-US': 'Leave UE Blueprint mode; accepts closing options like --commit, --discard, --verify, or --compile',
+    },
+    text: {
+      'zh-CN': '',
+      'en-US': '',
+    },
+  },
+  {
     name: '/deep-research',
     label: { 'zh-CN': '深度调研', 'en-US': 'Deep Research' },
     detail: {
@@ -453,9 +477,6 @@ export const PROJECT_COMMAND_NAMES = [
   '/music',
   '/music-mode-start',
   '/music-mode-end',
-  '/sprite',
-  '/sprite-mode-start',
-  '/sprite-mode-end',
   '/image-mode-start',
   '/image-mode-end',
   '/comfyui-mode-start',
@@ -464,11 +485,20 @@ export const PROJECT_COMMAND_NAMES = [
   '/screenshot-gif',
 ] as const;
 
+// Game-only slash commands surfaced under Project Settings > Commands. Grouped
+// by feature to mirror the project sidebar tabs (Game Experts, Mesh, online
+// model library, Sprite, UI). Sprite lives here (not in PROJECT_COMMAND_NAMES)
+// because the Sprite tab is gated behind game projects in GAME_FEATURE_TABS.
 export const GAME_PROJECT_COMMAND_NAMES = [
   '/game',
   '/mesh-mode-start',
   '/mesh-mode-end',
   '/mesh-search',
+  '/sprite',
+  '/sprite-mode-start',
+  '/sprite-mode-end',
+  '/blueprint-mode-start',
+  '/blueprint-mode-end',
   '/ui-mode-start',
   '/ui-mode-end',
 ] as const;

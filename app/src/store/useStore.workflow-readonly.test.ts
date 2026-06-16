@@ -814,6 +814,7 @@ describe('workflow read-only guard', () => {
         spriteMode: false,
         comfyMode: false,
         uiMode: false,
+        blueprintMode: false,
       },
     });
 
@@ -893,7 +894,35 @@ describe('workflow read-only guard', () => {
     resetStore('running', false);
     const before = workflowSnapshot();
 
-    useStore.getState().setGlobalRunSelection({
+    useStore.getState().setDefaultRunSelection({
+      adapter: 'claude-code',
+      modelClass: 'claude-opus-4-8',
+      providerId: 'p_sss',
+      channelId: 'default',
+    });
+
+    expect(getActiveProviderId('anthropic')).toBe('p_sss');
+    expect(
+      JSON.parse(window.localStorage.getItem(ACTIVE_GATEWAY_SELECTION_STORAGE)!),
+    ).toEqual({
+      adapter: 'claude-code',
+      modelClass: 'claude-opus-4-8',
+      providerId: 'p_sss',
+      channelId: 'default',
+    });
+    expect(workflowSnapshot()).toBe(before);
+    expect(workflowDefaultGatewaySelection(useStore.getState().workflow)).toEqual({
+      adapter: 'claude-code',
+      modelClass: 'sonnet',
+    });
+  });
+
+  it('keeps Settings default channel changes separate from active session selection', () => {
+    seedDefaultChannelProviders();
+    resetStore('design', false);
+    const before = workflowSnapshot();
+
+    useStore.getState().setDefaultRunSelection({
       adapter: 'claude-code',
       modelClass: 'claude-opus-4-8',
       providerId: 'p_sss',

@@ -2614,6 +2614,62 @@ describe('simple-workflow chat mode', () => {
     );
   });
 
+  it('drops transient runtime heartbeat cards from the finalized CLI chat message', async () => {
+    resetStore(simpleBlueprint('Simple chat'));
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.tauriAvailable.mockReturnValue(true);
+    gatewayMocks.resolveDirectGatewayRoute.mockReturnValue(null);
+    gatewayMocks.resolveCliGatewayRoute.mockResolvedValue({
+      selection: { adapter: 'claude-code', modelClass: 'sonnet' },
+      adapter: 'claude-code',
+      modelClass: 'sonnet',
+      model: 'sonnet',
+      transport: 'cli',
+      mode: 'cli',
+      label: 'Claude Code',
+      source: 'fallback',
+      cliCommand: 'claude',
+    });
+    tauriMocks.aiEditViaCli.mockImplementation(async (_prompt, _adapter, opts) => {
+      opts.onProgress?.(
+        encodeToolPatch({
+          id: 'runtime-status-run1',
+          name: '运行状态',
+          subject: '仍在运行…（已 12s）',
+          status: 'running',
+          ephemeral: true,
+        }),
+      );
+      opts.onProgress?.(
+        encodeToolPatch({
+          id: 'runtime-status-run1',
+          name: '运行状态',
+          subject: '仍在运行…（已 24s）',
+          status: 'running',
+          ephemeral: true,
+        }),
+      );
+      opts.onProgress?.('结论：处理完成。');
+      return '结论：处理完成。';
+    });
+
+    useStore.getState().sendPrompt('跑一个较慢任务');
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        useStore
+          .getState()
+          .messages.some((m) => m.role === 'assistant' && m.text.includes('处理完成')),
+      'CLI final message without runtime heartbeat',
+    );
+
+    const assistant = useStore
+      .getState()
+      .messages.find((m) => m.role === 'assistant' && m.text.includes('处理完成'));
+    expect(assistant?.text).not.toContain('仍在运行');
+    expect(assistant?.text).not.toContain('runtime-status-run1');
+  });
+
   it('places streamed tool cards before final CLI prose when live text lacks the final answer', async () => {
     resetStore(simpleBlueprint('Simple chat'));
     tauriMocks.isTauri.mockReturnValue(true);
@@ -2659,5 +2715,180 @@ describe('simple-workflow chat mode', () => {
     expect(assistant?.text.indexOf('<<FUC_TOOL>>')).toBeLessThan(
       assistant?.text.indexOf('结论：仓库状态已经检查完。') ?? -1,
     );
+  });
+
+  it('does not splice tool cards through final prose streamed around tools', async () => {
+    resetStore(simpleBlueprint('Simple chat'));
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.tauriAvailable.mockReturnValue(true);
+    gatewayMocks.resolveDirectGatewayRoute.mockReturnValue(null);
+    gatewayMocks.resolveCliGatewayRoute.mockResolvedValue({
+      selection: { adapter: 'codex-cli', modelClass: 'gpt-5' },
+      adapter: 'codex-cli',
+      modelClass: 'gpt-5',
+      model: 'gpt-5',
+      transport: 'cli',
+      mode: 'cli',
+      label: 'Codex',
+      source: 'fallback',
+      cliCommand: 'codex',
+    });
+    const finalAnswer =
+      'HTTP 健康检查。只验证页面能加载；桌面文件预览仍以组件测试覆盖。✅ 已优化。';
+    tauriMocks.aiEditViaCli.mockImplementation(async (_prompt, _adapter, opts) => {
+      opts.onProgress?.('HT');
+      opts.onProgress?.(
+        encodeToolPatch({
+          id: 'tool_http',
+          name: 'command_execution',
+          subject: 'npm test -- --run src/components/ai/FilePreviewDrawer.test.tsx',
+          args: {
+            command:
+              'npm test -- --run src/components/ai/FilePreviewDrawer.test.tsx',
+          },
+          status: 'done',
+        }),
+      );
+      opts.onProgress?.('TP 健');
+      opts.onProgress?.(
+        encodeToolPatch({
+          id: 'tool_typecheck',
+          name: 'command_execution',
+          subject: 'npm run typecheck',
+          args: { command: 'npm run typecheck' },
+          status: 'done',
+        }),
+      );
+      opts.onProgress?.(
+        '康检查。只验证页面能加载；桌面文件预览仍以组件测试覆盖。✅ 已优化。',
+      );
+      return finalAnswer;
+    });
+
+    useStore.getState().sendPrompt('跑检查后告诉我结论');
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        useStore
+          .getState()
+          .messages.some((m) => m.role === 'assistant' && m.text.includes(finalAnswer)),
+      'CLI final prose stays contiguous',
+    );
+
+    const assistant = useStore
+      .getState()
+      .messages.find((m) => m.role === 'assistant' && m.text.includes(finalAnswer));
+    const firstToolIdx = assistant?.text.indexOf('<<FUC_TOOL>>') ?? -1;
+    const proseIdx = assistant?.text.indexOf(finalAnswer) ?? -1;
+    expect(firstToolIdx).toBeGreaterThanOrEqual(0);
+    expect(proseIdx).toBeGreaterThanOrEqual(0);
+    expect(firstToolIdx).toBeLessThan(proseIdx);
+  });
+
+  it('places an earlier interaction round tool card before the final conclusion', async () => {
+    resetStore(simpleBlueprint('Simple chat'));
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.tauriAvailable.mockReturnValue(true);
+    gatewayMocks.resolveDirectGatewayRoute.mockReturnValue(null);
+    gatewayMocks.resolveCliGatewayRoute.mockResolvedValue({
+      selection: { adapter: 'claude-code', modelClass: 'sonnet' },
+      adapter: 'claude-code',
+      modelClass: 'sonnet',
+      model: 'sonnet',
+      transport: 'cli',
+      mode: 'cli',
+      label: 'Claude Code',
+      source: 'fallback',
+      cliCommand: 'claude',
+    });
+    let round = 0;
+    tauriMocks.aiEditViaCli.mockImplementation(async (_prompt, _adapter, opts) => {
+      round += 1;
+      if (round === 1) {
+        // First round: run a tool, then ask the user to choose. The tool's
+        // sentinel streams here but the round resolves to an interaction block,
+        // so it is captured in `streamedToolSentinels` rather than the final
+        // round's live stream.
+        opts.onProgress?.(
+          encodeToolPatch({
+            id: 'tool_round1',
+            name: 'Read',
+            subject: 'src/diagnose.ts',
+            args: { file_path: 'src/diagnose.ts' },
+            status: 'done',
+          }),
+        );
+        return [
+          '<<FUC_ASK>>',
+          JSON.stringify({
+            type: 'select',
+            prompt: '用哪种修复方式？',
+            options: ['方案A', '方案B'],
+            multi: false,
+          }),
+          '<<FUC_ASK_END>>',
+        ].join('\n');
+      }
+      // Second round (after the user picks): stream this round's own tool, then
+      // the conclusion. The round-1 tool is now a "missing" sentinel that must
+      // still land ABOVE the conclusion, not after it.
+      opts.onProgress?.(
+        encodeToolPatch({
+          id: 'tool_round2',
+          name: 'Edit',
+          subject: 'src/fix.ts',
+          args: { file_path: 'src/fix.ts' },
+          status: 'done',
+        }),
+      );
+      opts.onProgress?.('结论：已按方案B修复完成。');
+      return '结论：已按方案B修复完成。';
+    });
+
+    useStore.getState().sendPrompt('诊断并修复');
+    await waitFor(
+      () =>
+        useStore
+          .getState()
+          .messages.some(
+            (m) => m.interaction?.prompt === '用哪种修复方式？',
+          ),
+      'first round interaction widget',
+    );
+
+    const interactionMessage = useStore
+      .getState()
+      .messages.find((m) => m.interaction);
+    useStore.getState().answerInteraction(interactionMessage!.id, {
+      kind: 'select',
+      values: ['方案B'],
+    });
+
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        useStore
+          .getState()
+          .messages.some(
+            (m) => m.role === 'assistant' && m.text.includes('已按方案B修复完成'),
+          ),
+      'final conclusion after interaction',
+    );
+
+    const assistant = useStore
+      .getState()
+      .messages.find(
+        (m) => m.role === 'assistant' && m.text.includes('已按方案B修复完成'),
+      );
+    // The round-1 tool ran chronologically before the conclusion the model
+    // emitted last, so its card must render ABOVE the final prose.
+    const round1Idx = assistant?.text.indexOf('src/diagnose.ts') ?? -1;
+    const round2Idx = assistant?.text.indexOf('src/fix.ts') ?? -1;
+    const proseIdx = assistant?.text.indexOf('结论：已按方案B修复完成。') ?? -1;
+    expect(round1Idx).toBeGreaterThanOrEqual(0);
+    expect(round2Idx).toBeGreaterThanOrEqual(0);
+    expect(proseIdx).toBeGreaterThanOrEqual(0);
+    expect(round1Idx).toBeLessThan(proseIdx);
+    expect(round2Idx).toBeLessThan(proseIdx);
   });
 });

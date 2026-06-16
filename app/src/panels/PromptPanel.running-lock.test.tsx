@@ -390,6 +390,35 @@ describe('PromptPanel running lock', () => {
     }
   });
 
+  it('opens the add channel dialog from the top of the bottom channel selector', async () => {
+    seedDefaultChannels();
+    resetStoreForPromptLock('design');
+    const view = await renderChatDock();
+
+    try {
+      await act(async () => {
+        channelButton(view.container).click();
+      });
+
+      const options = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>('button[role="option"]'),
+      );
+      expect(options[0]?.textContent).toContain('添加新渠道');
+
+      await act(async () => {
+        options[0]?.click();
+      });
+
+      expect(
+        view.container.querySelector('[data-provider-editor="true"]'),
+      ).toBeInstanceOf(HTMLElement);
+      expect(view.container.textContent).toContain('添加渠道');
+      expect(view.container.textContent).toContain('来源 / 类型');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
   it('switches configured default channels and a free channel from the same selector', async () => {
     seedDefaultChannels();
     resetStoreForPromptLock('design');

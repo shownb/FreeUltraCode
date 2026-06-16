@@ -162,6 +162,7 @@ export interface SelectOption {
   id: string;
   label: string;
   hint?: string;
+  action?: boolean;
   /**
    * Optional category label. When consecutive options carry different `group`
    * values, the dropdown renders a divider + header before the first option of
@@ -272,6 +273,15 @@ export interface ComposerSettings {
   uiMode: boolean;
   /** Epoch ms when sticky UI mode started; used to merge mode-local prompts. */
   uiModeStartedAt?: number | null;
+  /**
+   * 粘性 UE 蓝图模式。true 时输入框里的裸文本走 UE 蓝图编排提示，而不是普通
+   * AI 编程;由 /blueprint-mode-start 开启、/blueprint-mode-end 关闭。
+   */
+  blueprintMode: boolean;
+  /** Epoch ms when sticky UE Blueprint mode started. */
+  blueprintModeStartedAt?: number | null;
+  /** Raw /blueprint-mode-start options, e.g. --target BP_Player --context full. */
+  blueprintModeArgs?: string | null;
 }
 
 export interface SessionComposerSettings {

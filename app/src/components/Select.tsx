@@ -90,7 +90,9 @@ export default function Select({
           {options.map((opt, index) => {
             const active = opt.id === selected?.id;
             const showGroupHeader =
-              !!opt.group && opt.group !== options[index - 1]?.group;
+              !opt.action &&
+              !!opt.group &&
+              opt.group !== options[index - 1]?.group;
             return (
               <Fragment key={opt.id}>
                 {showGroupHeader && (
@@ -106,32 +108,38 @@ export default function Select({
                 )}
                 <li>
                   <button
-                  type="button"
-                  role="option"
-                  aria-selected={active}
-                  onClick={() => {
-                    onChange(opt.id);
-                    setOpen(false);
-                  }}
-                  className={cn(
-                    'flex w-full items-center gap-2 whitespace-nowrap px-3 py-1.5 text-left text-xs transition-colors',
-                    active
-                      ? 'bg-border-soft text-fg'
-                      : 'text-fg-dim hover:bg-border-soft hover:text-fg',
-                  )}
-                >
-                  <span
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onClick={() => {
+                      onChange(opt.id);
+                      setOpen(false);
+                    }}
                     className={cn(
-                      'text-[10px] leading-none',
-                      active ? 'text-accent' : 'text-transparent',
+                      'flex w-full items-center gap-2 whitespace-nowrap px-3 py-1.5 text-left text-xs transition-colors',
+                      opt.action
+                        ? 'border-b border-border-soft text-accent hover:bg-accent/10 hover:text-accent'
+                        : active
+                          ? 'bg-border-soft text-fg'
+                          : 'text-fg-dim hover:bg-border-soft hover:text-fg',
                     )}
                   >
-                    ●
-                  </span>
-                  <span className="flex-1">{opt.label}</span>
-                  {opt.hint && (
-                    <span className="text-[10px] text-fg-faint">{opt.hint}</span>
-                  )}
+                    <span
+                      className={cn(
+                        'text-[10px] leading-none',
+                        opt.action
+                          ? 'text-accent'
+                          : active
+                            ? 'text-accent'
+                            : 'text-transparent',
+                      )}
+                    >
+                      {opt.action ? '+' : '●'}
+                    </span>
+                    <span className="flex-1">{opt.label}</span>
+                    {opt.hint && (
+                      <span className="text-[10px] text-fg-faint">{opt.hint}</span>
+                    )}
                   </button>
                 </li>
               </Fragment>

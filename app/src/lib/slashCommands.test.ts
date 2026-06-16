@@ -75,6 +75,7 @@ describe('withAppOnlyStaticEntries', () => {
     // App-only feature commands are folded back in.
     expect(names).toContain('/image-mode-start');
     expect(names).toContain('/sprite-mode-start');
+    expect(names).toContain('/blueprint-mode-start');
     expect(names).toContain('/screenshot');
   });
 
@@ -105,10 +106,14 @@ describe('project command allowlist', () => {
   it('matches names case-insensitively and trims whitespace', () => {
     expect(isProjectCommandName('/ultracode')).toBe(true);
     expect(isProjectCommandName('  /Deep-Research ')).toBe(true);
-    expect(isProjectCommandName('/sprite-mode-start')).toBe(true);
-    expect(isProjectCommandName('  /SPRITE ')).toBe(true);
+    expect(isGameProjectCommandName('/sprite-mode-start')).toBe(true);
+    expect(isGameProjectCommandName('/blueprint-mode-start')).toBe(true);
+    expect(isGameProjectCommandName('  /BLUEPRINT-MODE-END ')).toBe(true);
+    expect(isGameProjectCommandName('  /SPRITE ')).toBe(true);
+    expect(isProjectCommandName('/sprite-mode-start')).toBe(false);
     expect(isGameProjectCommandName('/game')).toBe(true);
     expect(isGameProjectCommandName('  /MESH-MODE-START ')).toBe(true);
+    expect(isGameProjectCommandName('  /UI-MODE-START ')).toBe(true);
     expect(isProjectCommandName('/game')).toBe(false);
     expect(isProjectCommandName('/help')).toBe(false);
     expect(isProjectCommandName('/plan')).toBe(false);
@@ -133,11 +138,28 @@ describe('project command allowlist', () => {
     const names = projectOnly.map((item) => item.name);
     expect(names).toContain('/ultracode');
     expect(names).toContain('/deep-research');
-    expect(names).toContain('/sprite');
-    expect(names).toContain('/sprite-mode-start');
-    expect(names).toContain('/sprite-mode-end');
+    expect(names).not.toContain('/sprite');
+    expect(names).not.toContain('/sprite-mode-start');
+    expect(names).not.toContain('/sprite-mode-end');
     expect(names).not.toContain('/game');
     expect(names).not.toContain('/help');
     expect(names).not.toContain('/review');
+  });
+
+  it('groups sprite, mesh, and ui commands under the game project list', () => {
+    const gameOnly = buildSlashSuggestions([], 'en-US').filter((item) =>
+      isGameProjectCommandName(item.name),
+    );
+    const names = gameOnly.map((item) => item.name);
+    expect(names).toContain('/game');
+    expect(names).toContain('/mesh-mode-start');
+    expect(names).toContain('/mesh-search');
+    expect(names).toContain('/sprite');
+    expect(names).toContain('/sprite-mode-start');
+    expect(names).toContain('/sprite-mode-end');
+    expect(names).toContain('/blueprint-mode-start');
+    expect(names).toContain('/blueprint-mode-end');
+    expect(names).toContain('/ui-mode-start');
+    expect(names).toContain('/ui-mode-end');
   });
 });

@@ -1,4 +1,4 @@
-export type ImageProviderId =
+export type BuiltInImageProviderId =
   | 'agnes-image'
   | 'siliconflow'
   | 'cloudflare'
@@ -26,6 +26,9 @@ export type ImageProviderId =
   | 'fal-ai'
   | 'runware';
 
+export type CustomImageProviderId = `custom:${string}`;
+export type ImageProviderId = BuiltInImageProviderId | CustomImageProviderId;
+
 export type ImageProviderCategory = 'commercial' | 'free-credit';
 
 type ImageProviderApiKind =
@@ -51,6 +54,8 @@ type ImageProviderApiKind =
   | 'minimax'
   | 'volcengine-openai';
 
+export type CustomImageProviderApiKind = 'openai-images';
+
 export interface ImageProviderDefinition {
   id: ImageProviderId;
   label: string;
@@ -70,6 +75,25 @@ export interface ImageProviderDefinition {
   accountIdLabel?: string;
   accountIdPlaceholder?: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomImageProviderDefinition {
+  id: CustomImageProviderId;
+  label: string;
+  category: ImageProviderCategory;
+  apiKind: CustomImageProviderApiKind;
+  defaultModel: string;
+  models: string[];
+  needsKey: boolean;
+  local: boolean;
+  defaultBaseUrl: string;
+  supportsBaseUrl: true;
+  endpointPlaceholder: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  note: string;
 }
 
 /**
@@ -86,6 +110,7 @@ export interface ImageGenerationSettings {
   enabled: boolean;
   showComposerModelSelect: boolean;
   preferredProviderId: ImageProviderId;
+  customProviders: CustomImageProviderDefinition[];
   providerKeys: Partial<Record<ImageProviderId, string>>;
   providerAccountIds: Partial<Record<ImageProviderId, string>>;
   providerBaseUrls: Partial<Record<ImageProviderId, string>>;
@@ -644,7 +669,9 @@ export const IMAGE_PROVIDERS: ImageProviderDefinition[] = [
   },
 ];
 
-const IMAGE_PROVIDER_BY_ID = new Map(IMAGE_PROVIDERS.map((provider) => [provider.id, provider]));
+const IMAGE_PROVIDER_BY_ID = new Map<BuiltInImageProviderId, ImageProviderDefinition>(
+  IMAGE_PROVIDERS.map((provider) => [provider.id as BuiltInImageProviderId, provider]),
+);
 
 function encodeModelPath(model: string): string {
   return model.split('/').map((part) => encodeURIComponent(part)).join('/');
@@ -655,7 +682,7 @@ function requestHeaders(
   settings: ImageGenerationSettings,
   contentType = 'application/json',
 ): Record<string, string> {
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   const apiKey = settings.providerKeys[providerId]?.trim();
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const headers: Record<string, string> = {};
@@ -683,6 +710,7 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
   enabled: true,
   showComposerModelSelect: false,
   preferredProviderId: 'siliconflow',
+  customProviders: [],
   providerKeys: {},
   providerAccountIds: {},
   providerBaseUrls: {},
@@ -693,8 +721,127 @@ function hasStorage(): boolean {
   return typeof window !== 'undefined' && !!window.localStorage;
 }
 
-function isImageProviderId(value: unknown): value is ImageProviderId {
-  return typeof value === 'string' && IMAGE_PROVIDER_BY_ID.has(value as ImageProviderId);
+function isKnownImageProviderId(
+  value: unknown,
+  providers: readonly ImageProviderDefinition[],
+): value is ImageProviderId {
+  return typeof value === 'string' && providers.some((provider) => provider.id === value);
+}
+
+function slugifyCustomImageProviderId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  if (normalized) return normalized;
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomImageProviderId(label: string): CustomImageProviderId {
+  return `custom:${slugifyCustomImageProviderId(label)}`;
+}
+
+function normalizeImageModels(value: unknown, fallback: string): string[] {
+  const models = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [fallback, ...models]) {
+    const model = raw.trim();
+    const key = model.toLowerCase();
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    out.push(model);
+  }
+  return out.length > 0 ? out : ['custom-image-model'];
+}
+
+function normalizeCustomImageProvider(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomImageProviderDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomImageProviderDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomImageProviderId(rawId || label || `provider-${index + 1}`)}`;
+  let id = baseId as CustomImageProviderId;
+  let suffix = 2;
+  while (usedIds.has(id) || IMAGE_PROVIDER_BY_ID.has(id as BuiltInImageProviderId)) {
+    id = `${baseId}-${suffix}` as CustomImageProviderId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const defaultModel =
+    typeof source.defaultModel === 'string' && source.defaultModel.trim()
+      ? source.defaultModel.trim()
+      : 'custom-image-model';
+  const defaultBaseUrl =
+    typeof source.defaultBaseUrl === 'string'
+      ? source.defaultBaseUrl.trim().replace(/\/+$/, '')
+      : '';
+  const endpointPlaceholder =
+    typeof source.endpointPlaceholder === 'string' && source.endpointPlaceholder.trim()
+      ? source.endpointPlaceholder.trim()
+      : 'https://api.example.com/v1';
+  return {
+    id,
+    label,
+    category: source.category === 'free-credit' ? 'free-credit' : 'commercial',
+    apiKind: 'openai-images',
+    defaultModel,
+    models: normalizeImageModels(source.models, defaultModel),
+    needsKey: source.needsKey !== false,
+    local: false,
+    defaultBaseUrl,
+    supportsBaseUrl: true,
+    endpointPlaceholder,
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : '自定义 OpenAI-compatible 生图渠道。',
+  };
+}
+
+function normalizeCustomImageProviders(value: unknown): CustomImageProviderDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomImageProvider(item, index, usedIds))
+    .filter((item): item is CustomImageProviderDefinition => !!item);
+}
+
+export function imageProviders(
+  settings = loadImageGenerationSettings(),
+): ImageProviderDefinition[] {
+  return [
+    ...IMAGE_PROVIDERS,
+    ...settings.customProviders.map(
+      (provider): ImageProviderDefinition => ({ ...provider, custom: true }),
+    ),
+  ];
 }
 
 function cleanRecord<T extends string>(
@@ -718,9 +865,16 @@ export function normalizeImageGenerationSettings(
     return DEFAULT_IMAGE_GENERATION_SETTINGS;
   }
   const source = value as Partial<ImageGenerationSettings>;
-  const preferredProviderId = isImageProviderId(source.preferredProviderId)
+  const customProviders = normalizeCustomImageProviders(source.customProviders);
+  const providers = [
+    ...IMAGE_PROVIDERS,
+    ...customProviders.map((provider) => ({ ...provider, custom: true })),
+  ];
+  const preferredProviderId = isKnownImageProviderId(source.preferredProviderId, providers)
     ? source.preferredProviderId
     : DEFAULT_IMAGE_GENERATION_SETTINGS.preferredProviderId;
+  const validKey = (key: unknown): key is ImageProviderId =>
+    isKnownImageProviderId(key, providers);
   return {
     enabled:
       typeof source.enabled === 'boolean'
@@ -731,10 +885,11 @@ export function normalizeImageGenerationSettings(
         ? source.showComposerModelSelect
         : DEFAULT_IMAGE_GENERATION_SETTINGS.showComposerModelSelect,
     preferredProviderId,
-    providerKeys: cleanRecord(source.providerKeys, isImageProviderId),
-    providerAccountIds: cleanRecord(source.providerAccountIds, isImageProviderId),
-    providerBaseUrls: cleanRecord(source.providerBaseUrls, isImageProviderId),
-    providerModels: cleanRecord(source.providerModels, isImageProviderId),
+    customProviders,
+    providerKeys: cleanRecord(source.providerKeys, validKey),
+    providerAccountIds: cleanRecord(source.providerAccountIds, validKey),
+    providerBaseUrls: cleanRecord(source.providerBaseUrls, validKey),
+    providerModels: cleanRecord(source.providerModels, validKey),
   };
 }
 
@@ -763,15 +918,16 @@ export function saveImageGenerationSettings(settings: ImageGenerationSettings): 
 
 export function imageProviderById(
   id: ImageProviderId,
+  settings = loadImageGenerationSettings(),
 ): ImageProviderDefinition {
-  return IMAGE_PROVIDER_BY_ID.get(id) ?? IMAGE_PROVIDERS[0];
+  return imageProviders(settings).find((provider) => provider.id === id) ?? IMAGE_PROVIDERS[0];
 }
 
 export function imageProviderModel(
   providerId: ImageProviderId,
   settings = loadImageGenerationSettings(),
 ): string {
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   return settings.providerModels[providerId]?.trim() || provider.defaultModel;
 }
 
@@ -781,13 +937,13 @@ export function imageProviderBaseUrl(
 ): string {
   const custom = settings.providerBaseUrls[providerId]?.trim();
   if (custom) return custom.replace(/\/+$/, '');
-  return (imageProviderById(providerId).defaultBaseUrl ?? '').replace(/\/+$/, '');
+  return (imageProviderById(providerId, settings).defaultBaseUrl ?? '').replace(/\/+$/, '');
 }
 
 export function configuredImageProviderIds(
   settings = loadImageGenerationSettings(),
 ): ImageProviderId[] {
-  return IMAGE_PROVIDERS.filter((provider) => imageProviderReady(provider.id, settings)).map(
+  return imageProviders(settings).filter((provider) => imageProviderReady(provider.id, settings)).map(
     (provider) => provider.id,
   );
 }
@@ -796,7 +952,7 @@ export function imageProviderReady(
   providerId: ImageProviderId,
   settings = loadImageGenerationSettings(),
 ): boolean {
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   if (provider.needsKey && !settings.providerKeys[providerId]?.trim()) return false;
   if (
     provider.needsAccountId &&
@@ -859,7 +1015,7 @@ export async function generateImage(
   if (!imageProviderReady(providerId, settings)) {
     throw new Error(`IMAGE_PROVIDER_NOT_READY:${providerId}`);
   }
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   const prompt = stripImageCommand(request.prompt);
   const model = request.model?.trim() || imageProviderModel(providerId, settings);
   const images = await generateWithProvider(providerId, prompt, model, settings, request.signal);
@@ -879,7 +1035,7 @@ async function generateWithProvider(
   settings: ImageGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  switch (imageProviderById(providerId).apiKind) {
+  switch (imageProviderById(providerId, settings).apiKind) {
     case 'cloudflare':
       return generateCloudflare(prompt, model, settings, signal);
     case 'pollinations':
@@ -1012,7 +1168,7 @@ async function generateOpenAiImages(
   settings: ImageGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   const apiKey = settings.providerKeys[providerId]?.trim();
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const headers: Record<string, string> = {
@@ -1489,7 +1645,7 @@ async function generateVolcengineSeedream(
   settings: ImageGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = imageProviderById(providerId);
+  const provider = imageProviderById(providerId, settings);
   const apiKey = settings.providerKeys[providerId]?.trim();
   if (!apiKey) throw new Error(`${provider.label} API key is missing.`);
   const response = await fetch(

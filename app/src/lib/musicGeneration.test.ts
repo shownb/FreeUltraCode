@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_MUSIC_GENERATION_SETTINGS,
   MUSIC_PROVIDERS,
+  createCustomMusicProviderId,
   generateMusic,
   musicDurationSecondsFromPrompt,
   musicProviderBaseUrl,
   musicProviderById,
+  musicProviders,
   musicProviderReady,
   normalizeMusicGenerationSettings,
   preferredReadyMusicProviderId,
@@ -748,6 +750,63 @@ describe('music generation settings and routing', () => {
           output_format: 'mp3',
         }),
       }),
+    );
+  });
+});
+
+describe('custom music providers', () => {
+  it('normalizes and exposes a custom commercial channel', () => {
+    const settings = normalizeMusicGenerationSettings({
+      ...DEFAULT_MUSIC_GENERATION_SETTINGS,
+      customProviders: [
+        {
+          id: createCustomMusicProviderId('My Music'),
+          label: 'My Music',
+          category: 'commercial',
+          apiKind: 'generic-online-music',
+          defaultModel: 'my-model',
+          models: ['my-model'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://api.example.com/v1/audio/generations',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'https://api.example.com/v1/audio/generations',
+          note: 'custom',
+        },
+      ],
+    });
+    const id = createCustomMusicProviderId('My Music');
+    expect(settings.customProviders).toHaveLength(1);
+    expect(musicProviders(settings).some((p) => p.id === id)).toBe(true);
+    expect(musicProviderById(id, settings).label).toBe('My Music');
+  });
+
+  it('reports readiness for a custom online channel once a key is set', () => {
+    const id = createCustomMusicProviderId('Need Key');
+    const settings = normalizeMusicGenerationSettings({
+      ...DEFAULT_MUSIC_GENERATION_SETTINGS,
+      customProviders: [
+        {
+          id,
+          label: 'Need Key',
+          category: 'free',
+          apiKind: 'generic-online-music',
+          defaultModel: 'm',
+          models: ['m'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://api.example.com/v1/audio/generations',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'x',
+          note: 'n',
+        },
+      ],
+    });
+    expect(musicProviderReady(id, settings)).toBe(false);
+    const withKey = { ...settings, providerKeys: { [id]: 'sk-test' } };
+    expect(musicProviderReady(id, withKey)).toBe(true);
+    expect(musicProviderBaseUrl(id, withKey)).toBe(
+      'https://api.example.com/v1/audio/generations',
     );
   });
 });

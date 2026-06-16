@@ -76,7 +76,7 @@ import {
 } from '@/lib/freeChannels';
 import LocalModelSetupDialog from '@/components/LocalModelSetupDialog';
 import {
-  IMAGE_PROVIDERS,
+  imageProviders,
   imageProviderModel,
   imageProviderReady,
   loadImageGenerationSettings,
@@ -2148,7 +2148,7 @@ export default function AIDock({
   }, []);
   const imageChannelOptions = useMemo<SelectOption[]>(
     () =>
-      IMAGE_PROVIDERS.map((provider) => ({
+      imageProviders(imageSettings).map((provider) => ({
         id: provider.id,
         label:
           provider.label +
@@ -2170,7 +2170,7 @@ export default function AIDock({
   );
   const imageChannelValue = imageSettings.preferredProviderId;
   const imageModelOptions = useMemo<SelectOption[]>(() => {
-    const provider = IMAGE_PROVIDERS.find(
+    const provider = imageProviders(imageSettings).find(
       (item) => item.id === imageSettings.preferredProviderId,
     );
     if (!provider) return [];

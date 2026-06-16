@@ -36,6 +36,8 @@ export interface ToolEvent {
   truncated?: boolean;
   /** Parent tool id for nested sub-agent (task) calls. */
   parentId?: string;
+  /** Transient runtime status; render live but do not persist into final answers. */
+  ephemeral?: boolean;
 }
 
 /** A partial update to a {@link ToolEvent}; `id` is required, rest optional. */

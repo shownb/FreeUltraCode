@@ -8,6 +8,7 @@ import {
   THREE_D_ANIMATION_LIBRARY_LINKS,
   THREE_D_RIGGING_LIBRARY_LINKS,
   assessThreeDRigging,
+  createCustomThreeDProviderId,
   generateThreeD,
   looksLikeThreeDGenerationRequest,
   matchThreeDCommonAnimation,
@@ -21,6 +22,7 @@ import {
   threeDProviderBaseUrl,
   threeDProviderById,
   threeDProviderReady,
+  threeDProviders,
 } from './threeDGeneration';
 
 afterEach(() => {
@@ -217,6 +219,67 @@ describe('3D generation settings and routing', () => {
     };
     expect(threeDProviderReady('local-hunyuan3d', settings)).toBe(false);
     expect(preferredReadyThreeDProviderId(settings)).toBeNull();
+  });
+
+  it('normalizes and routes custom Mesh generation providers', async () => {
+    const id = createCustomThreeDProviderId('My Mesh');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          model_urls: {
+            glb: 'https://assets.example.com/custom.glb',
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+    const settings = normalizeThreeDGenerationSettings({
+      enabled: true,
+      preferredProviderId: id,
+      customProviders: [
+        {
+          id,
+          label: 'My Mesh',
+          category: 'commercial',
+          apiKind: 'generic-3d-api',
+          defaultModel: 'mesh-model',
+          models: ['mesh-model'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://mesh.example.com/v1/generate/',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'https://mesh.example.com/v1/generate',
+          note: 'Custom Mesh route.',
+        },
+      ],
+      providerKeys: { [id]: 'mesh-key' },
+      providerBaseUrls: {},
+      providerModels: {},
+    });
+
+    expect(settings.preferredProviderId).toBe(id);
+    expect(settings.customProviders).toHaveLength(1);
+    expect(threeDProviders(settings).some((provider) => provider.id === id)).toBe(true);
+    expect(threeDProviderById(id, settings).label).toBe('My Mesh');
+    expect(threeDProviderBaseUrl(id, settings)).toBe('https://mesh.example.com/v1/generate');
+    expect(threeDProviderReady(id, settings)).toBe(true);
+
+    const result = await generateThreeD({ prompt: '/3d low poly chest' }, settings);
+    expect(result.providerId).toBe(id);
+    expect(result.assets).toEqual(['https://assets.example.com/custom.glb']);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://mesh.example.com/v1/generate',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer mesh-key',
+          'Content-Type': 'application/json',
+        }),
+      }),
+    );
   });
 
   it('uses direct credential and endpoint links for 3D providers', () => {

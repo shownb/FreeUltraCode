@@ -18,6 +18,7 @@ memory/
 app/.gstack/
 app/src-tauri/.gstack/
 .fuc-run/
+runner/
 
 # Local scratch / test outputs / screenshots
 /test100/

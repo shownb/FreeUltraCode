@@ -15,7 +15,7 @@
 //                   search page with the query so the user can browse there
 //                   (Fab, Unity Asset Store, CGTrader, TurboSquid, Free3D, ...).
 
-export type MeshLibraryId =
+export type BuiltInMeshLibraryId =
   | 'polyhaven'
   | 'sketchfab'
   | 'poly-pizza'
@@ -26,6 +26,9 @@ export type MeshLibraryId =
   | 'free3d'
   | 'thingiverse'
   | 'quaternius';
+
+export type CustomMeshLibraryId = `custom:${string}`;
+export type MeshLibraryId = BuiltInMeshLibraryId | CustomMeshLibraryId;
 
 export type MeshLibrarySearchKind = 'public-api' | 'api-key' | 'link-out';
 export type MeshLibraryCategory = 'free' | 'marketplace' | 'community';
@@ -47,11 +50,29 @@ export interface MeshLibraryDefinition {
   /** Link-out search URL template; {query} is replaced with the encoded query. */
   searchUrlTemplate: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomMeshLibraryDefinition {
+  id: CustomMeshLibraryId;
+  label: string;
+  category: MeshLibraryCategory;
+  searchKind: 'link-out';
+  needsKey: boolean;
+  supportsDownload: boolean;
+  homepageUrl: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  searchUrlTemplate: string;
+  note: string;
 }
 
 export interface MeshLibraryAccountSettings {
   /** Libraries the user opted into for /mesh-search. */
   enabledIds: MeshLibraryId[];
+  /** User-added custom libraries (commercial/marketplace or free link-out). */
+  customLibraries: CustomMeshLibraryDefinition[];
   /** Per-library API key/token. */
   apiKeys: Partial<Record<MeshLibraryId, string>>;
   /** Auto-download direct-downloadable results into the workspace cache. */
@@ -262,17 +283,125 @@ const MESH_LIBRARY_BY_ID = new Map<MeshLibraryId, MeshLibraryDefinition>(
 
 export const DEFAULT_MESH_LIBRARY_SETTINGS: MeshLibraryAccountSettings = {
   enabledIds: ['polyhaven', 'sketchfab'],
+  customLibraries: [],
   apiKeys: {},
   autoDownload: true,
   perLibraryLimit: 6,
 };
 
-export function meshLibraryById(id: MeshLibraryId): MeshLibraryDefinition | undefined {
-  return MESH_LIBRARY_BY_ID.get(id);
+export function meshLibraryById(
+  id: MeshLibraryId,
+  settings?: MeshLibraryAccountSettings,
+): MeshLibraryDefinition | undefined {
+  const builtIn = MESH_LIBRARY_BY_ID.get(id as BuiltInMeshLibraryId);
+  if (builtIn) return builtIn;
+  const custom = settings?.customLibraries.find((library) => library.id === id);
+  return custom ? { ...custom, custom: true } : undefined;
 }
 
-function isMeshLibraryId(value: unknown): value is MeshLibraryId {
-  return typeof value === 'string' && MESH_LIBRARY_BY_ID.has(value as MeshLibraryId);
+export function meshLibraries(
+  settings = loadMeshLibrarySettings(),
+): MeshLibraryDefinition[] {
+  return [
+    ...MESH_LIBRARIES,
+    ...settings.customLibraries.map(
+      (library): MeshLibraryDefinition => ({ ...library, custom: true }),
+    ),
+  ];
+}
+
+function isBuiltInMeshLibraryId(value: unknown): value is BuiltInMeshLibraryId {
+  return typeof value === 'string' && MESH_LIBRARY_BY_ID.has(value as BuiltInMeshLibraryId);
+}
+
+function slugifyCustomMeshLibraryId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  if (normalized) return normalized;
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomMeshLibraryId(label: string): CustomMeshLibraryId {
+  return `custom:${slugifyCustomMeshLibraryId(label)}`;
+}
+
+function normalizeCustomMeshLibrary(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomMeshLibraryDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomMeshLibraryDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomMeshLibraryId(rawId || label || `library-${index + 1}`)}`;
+  let id = baseId as CustomMeshLibraryId;
+  let suffix = 2;
+  while (usedIds.has(id) || MESH_LIBRARY_BY_ID.has(id as BuiltInMeshLibraryId)) {
+    id = `${baseId}-${suffix}` as CustomMeshLibraryId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const category: MeshLibraryCategory =
+    source.category === 'free' || source.category === 'community'
+      ? source.category
+      : 'marketplace';
+  const homepageUrl =
+    typeof source.homepageUrl === 'string' && source.homepageUrl.trim()
+      ? source.homepageUrl.trim()
+      : '';
+  const searchUrlTemplate =
+    typeof source.searchUrlTemplate === 'string' && source.searchUrlTemplate.trim()
+      ? source.searchUrlTemplate.trim()
+      : homepageUrl
+        ? `${homepageUrl.replace(/\/+$/, '')}/search?q={query}`
+        : 'https://example.com/search?q={query}';
+  return {
+    id,
+    label,
+    category,
+    searchKind: 'link-out',
+    needsKey: source.needsKey === true,
+    supportsDownload: source.supportsDownload === true,
+    homepageUrl: homepageUrl || searchUrlTemplate.replace(/\{query\}.*$/, ''),
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    searchUrlTemplate,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : category === 'free'
+          ? '自定义免费 3D 模型渠道（深链搜索）。'
+          : '自定义商用 3D 模型渠道（深链搜索）。',
+  };
+}
+
+function normalizeCustomMeshLibraries(value: unknown): CustomMeshLibraryDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomMeshLibrary(item, index, usedIds))
+    .filter((item): item is CustomMeshLibraryDefinition => !!item);
 }
 
 function hasStorage(): boolean {
@@ -284,13 +413,17 @@ export function normalizeMeshLibrarySettings(value: unknown): MeshLibraryAccount
     return { ...DEFAULT_MESH_LIBRARY_SETTINGS };
   }
   const source = value as Partial<MeshLibraryAccountSettings>;
+  const customLibraries = normalizeCustomMeshLibraries(source.customLibraries);
+  const customIds = new Set<string>(customLibraries.map((library) => library.id));
+  const validId = (id: unknown): id is MeshLibraryId =>
+    isBuiltInMeshLibraryId(id) || (typeof id === 'string' && customIds.has(id));
   const enabledIds = Array.isArray(source.enabledIds)
-    ? Array.from(new Set(source.enabledIds.filter(isMeshLibraryId)))
+    ? Array.from(new Set(source.enabledIds.filter(validId)))
     : [...DEFAULT_MESH_LIBRARY_SETTINGS.enabledIds];
   const apiKeys: Partial<Record<MeshLibraryId, string>> = {};
   if (source.apiKeys && typeof source.apiKeys === 'object' && !Array.isArray(source.apiKeys)) {
     for (const [key, raw] of Object.entries(source.apiKeys)) {
-      if (!isMeshLibraryId(key) || typeof raw !== 'string') continue;
+      if (!validId(key) || typeof raw !== 'string') continue;
       const trimmed = raw.trim();
       if (trimmed) apiKeys[key] = trimmed;
     }
@@ -301,6 +434,7 @@ export function normalizeMeshLibrarySettings(value: unknown): MeshLibraryAccount
       : DEFAULT_MESH_LIBRARY_SETTINGS.perLibraryLimit;
   return {
     enabledIds,
+    customLibraries,
     apiKeys,
     autoDownload:
       typeof source.autoDownload === 'boolean'
@@ -337,7 +471,7 @@ export function meshLibraryReady(
   id: MeshLibraryId,
   settings = loadMeshLibrarySettings(),
 ): boolean {
-  const library = meshLibraryById(id);
+  const library = meshLibraryById(id, settings);
   if (!library) return false;
   if (library.needsKey) return !!settings.apiKeys[id]?.trim();
   return true;
@@ -358,7 +492,7 @@ export function meshLibraryUsability(
   id: MeshLibraryId,
   settings = loadMeshLibrarySettings(),
 ): MeshLibraryUsability {
-  const library = meshLibraryById(id);
+  const library = meshLibraryById(id, settings);
   if (!library) return 'link-only';
   if (library.searchKind === 'link-out') return 'link-only';
   if (library.needsKey && !settings.apiKeys[id]?.trim()) return 'needs-key';
@@ -639,7 +773,7 @@ export async function searchMeshLibraries(
   signal?: AbortSignal,
 ): Promise<MeshSearchResult> {
   const trimmed = query.trim();
-  const enabled = MESH_LIBRARIES.filter((library) =>
+  const enabled = meshLibraries(settings).filter((library) =>
     settings.enabledIds.includes(library.id),
   );
   const items: MeshSearchResultItem[] = [];

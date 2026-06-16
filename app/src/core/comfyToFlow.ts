@@ -19,6 +19,8 @@ export interface ComfyFlowNodeData extends Record<string, unknown> {
   classType: string;
   /** Literal (non-link) inputs, shown as a compact key/value list. */
   fields: Array<{ key: string; value: string }>;
+  /** When true, the card hides its inline field list (properties live in a side panel). */
+  compact?: boolean;
 }
 
 export type ComfyFlowNode = Node<ComfyFlowNodeData>;
@@ -74,11 +76,15 @@ function computeColumns(graph: ComfyPromptGraph): Map<string, number> {
   return depth;
 }
 
-export function comfyToFlow(graph: ComfyPromptGraph | null): {
+export function comfyToFlow(
+  graph: ComfyPromptGraph | null,
+  options: { compact?: boolean } = {},
+): {
   nodes: ComfyFlowNode[];
   edges: ComfyFlowEdge[];
 } {
   if (!graph) return { nodes: [], edges: [] };
+  const { compact = false } = options;
   const columns = computeColumns(graph);
   const rowCursor = new Map<number, number>();
 
@@ -98,6 +104,7 @@ export function comfyToFlow(graph: ComfyPromptGraph | null): {
         title: node._meta?.title?.trim() || node.class_type,
         classType: node.class_type,
         fields,
+        compact,
       },
     };
   });
@@ -114,7 +121,8 @@ export function comfyToFlow(graph: ComfyPromptGraph | null): {
         target: id,
         label: key,
         animated: false,
-        markerEnd: { type: MarkerType.ArrowClosed },
+        style: { stroke: 'var(--accent, #6ea8fe)', strokeWidth: 1.5 },
+        markerEnd: { type: MarkerType.ArrowClosed, color: 'var(--accent, #6ea8fe)' },
       });
     }
   }

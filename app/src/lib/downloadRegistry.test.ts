@@ -3,6 +3,7 @@ import {
   __resetAssetsForTest,
   clearFinishedAssets,
   getAssets,
+  linkKnownAssetsToNearestMessages,
   linkKnownManagedAssetsFromMessageText,
   linkLocalAssetToMessage,
   linkManagedAssetsFromMessageText,
@@ -137,6 +138,78 @@ describe('asset registry', () => {
     expect(list).toHaveLength(1);
     expect(list[0].title).toBe('b.glb');
     expect(list[0].status).toBe('pending');
+  });
+
+  it('does not resurrect cleared disk assets on the next disk scan', () => {
+    const diskPath = 'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\gen.png';
+    const id = registerAsset({
+      kind: 'image',
+      source: 'generated',
+      title: 'gen.png',
+      status: 'success',
+      localPath: diskPath,
+    });
+    markAssetDone(id, { localPath: diskPath });
+
+    clearFinishedAssets();
+    expect(getAssets()).toHaveLength(0);
+
+    // The 15s Sidebar poll re-scans the workspace cache; the file is still on
+    // disk but the user cleared it, so it must stay cleared.
+    mergeCachedAssetsFromDisk([
+      {
+        kind: 'image',
+        source: 'generated',
+        title: 'gen.png',
+        localPath: diskPath,
+        sizeBytes: 10,
+        createdAtMs: 100,
+        modifiedAtMs: 300,
+      },
+    ]);
+
+    expect(getAssets()).toHaveLength(0);
+  });
+
+  it('lets a freshly generated asset reappear at a previously cleared path', () => {
+    const diskPath = 'E:\\OpenWorkflows\\.freeultracode\\clipboard-images\\gen.png';
+    const first = registerAsset({
+      kind: 'image',
+      source: 'generated',
+      title: 'gen.png',
+      status: 'success',
+      localPath: diskPath,
+    });
+    markAssetDone(first, { localPath: diskPath });
+    clearFinishedAssets();
+    expect(getAssets()).toHaveLength(0);
+
+    // A new generation lands at the same path; the dismissal lifts.
+    const second = registerAsset({
+      kind: 'image',
+      source: 'generated',
+      title: 'gen.png',
+      localPath: diskPath,
+    });
+    markAssetDone(second, { localPath: diskPath });
+
+    const list = getAssets();
+    expect(list).toHaveLength(1);
+    expect(list[0].localPath).toBe(diskPath);
+
+    // And the disk poll can now keep it around.
+    mergeCachedAssetsFromDisk([
+      {
+        kind: 'image',
+        source: 'generated',
+        title: 'gen.png',
+        localPath: diskPath,
+        sizeBytes: 10,
+        createdAtMs: 100,
+        modifiedAtMs: 300,
+      },
+    ]);
+    expect(getAssets()).toHaveLength(1);
   });
 
   it('persists terminal entries to localStorage', () => {
@@ -426,6 +499,45 @@ describe('asset registry', () => {
     expect(list[0].title).toBe('known.png');
     expect(list[0].sessionId).toBe('s_3');
     expect(list[0].messageId).toBe('m_3');
+  });
+
+  it('links known assets to the nearest message by timestamp', () => {
+    mergeCachedAssetsFromDisk([
+      {
+        kind: 'image',
+        source: 'generated',
+        title: 'generated.png',
+        localPath: 'E:\\OpenWorkflows\\.freeultracode\\assets\\image\\generated.png',
+        sizeBytes: 2,
+        createdAtMs: 1_000,
+        modifiedAtMs: 1_020,
+      },
+    ]);
+
+    linkKnownAssetsToNearestMessages({
+      messages: [
+        {
+          sessionId: 's_1',
+          workspaceId: 'w_1',
+          messageId: 'm_old',
+          role: 'assistant',
+          createdAt: 100,
+        },
+        {
+          sessionId: 's_1',
+          workspaceId: 'w_1',
+          messageId: 'm_near',
+          role: 'assistant',
+          createdAt: 1_015,
+        },
+      ],
+      maxDistanceMs: 2_000,
+    });
+
+    const entry = getAssets()[0];
+    expect(entry.sessionId).toBe('s_1');
+    expect(entry.workspaceId).toBe('w_1');
+    expect(entry.messageId).toBe('m_near');
   });
 
   describe('trackAsset', () => {

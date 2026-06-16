@@ -32,6 +32,7 @@ import type { Locale } from '@/lib/i18n';
 import {
   clearFinishedAssets,
   getAssets,
+  linkKnownAssetsToNearestMessages,
   linkKnownManagedAssetsFromMessageText,
   linkManagedAssetsFromMessageText,
   mergeCachedAssetsFromDisk,
@@ -63,6 +64,8 @@ import VideoPlayer from '@/components/ai/VideoPlayer';
 const ASSET_SESSION_JUMP_EVENT = 'fuc:asset-session-jump';
 const INITIAL_RENDERED_ASSETS = 40;
 const RENDER_ASSET_PAGE_SIZE = 40;
+const ACTIVE_ASSET_MESSAGE_LINK_WINDOW_MS = 2 * 60 * 60 * 1000;
+const HISTORY_ASSET_MESSAGE_LINK_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 const KIND_ICON: Record<AssetKind, LucideIcon> = {
   image: ImageIcon,
@@ -111,6 +114,20 @@ async function linkKnownManagedAssetsFromHistory(
   workspaceIds: string[],
   isCancelled: () => boolean = () => false,
 ): Promise<void> {
+  const userFallbacks: Array<{
+    text: string;
+    sessionId: string;
+    workspaceId: string;
+    messageId: string;
+  }> = [];
+  const nearestCandidates: Array<{
+    sessionId: string;
+    workspaceId: string;
+    messageId: string;
+    role: 'user' | 'assistant' | 'system';
+    createdAt: number;
+  }> = [];
+
   for (const workspaceId of workspaceIds) {
     let sessions: Awaited<ReturnType<typeof historyStore.listSessions>>;
     try {
@@ -131,19 +148,86 @@ async function linkKnownManagedAssetsFromHistory(
 
       for (const message of record.messages) {
         if (isCancelled()) return;
-        // Only AI-produced messages count: the Asset Hub tracks what the
-        // assistant generated/downloaded/modified, not paths the user typed.
-        if (message.role !== 'assistant') continue;
-        if (!message.text.includes('.freeultracode')) continue;
-        linkKnownManagedAssetsFromMessageText({
-          text: message.text,
+        nearestCandidates.push({
           sessionId: record.id,
           workspaceId,
           messageId: message.id,
+          role: message.role,
+          createdAt: message.createdAt,
         });
+        if (message.role === 'assistant') {
+          if (message.text.includes('.freeultracode')) {
+            linkKnownManagedAssetsFromMessageText({
+              text: message.text,
+              sessionId: record.id,
+              workspaceId,
+              messageId: message.id,
+            });
+          }
+          continue;
+        }
+        if (message.role === 'user') {
+          if (!message.text.includes('.freeultracode')) continue;
+          userFallbacks.push({
+            text: message.text,
+            sessionId: record.id,
+            workspaceId,
+            messageId: message.id,
+          });
+        }
       }
     }
   }
+
+  // Only link hub rows that remain unlinked after assistant output was tried.
+  // This lets pasted clipboard images jump back without turning arbitrary user
+  // paths into asset rows.
+  for (const message of userFallbacks) {
+    if (isCancelled()) return;
+    linkKnownManagedAssetsFromMessageText(message);
+  }
+
+  if (isCancelled()) return;
+  linkKnownAssetsToNearestMessages({
+    messages: nearestCandidates,
+    maxDistanceMs: HISTORY_ASSET_MESSAGE_LINK_WINDOW_MS,
+  });
+}
+
+function linkManagedAssetsFromActiveMessage(input: {
+  text: string;
+  role: 'user' | 'assistant' | 'system';
+  sessionId: string;
+  workspaceId: string | null;
+  messageId: string;
+}): void {
+  if (input.text.includes('.freeultracode')) {
+    if (input.role === 'assistant') {
+      linkManagedAssetsFromMessageText({
+        text: input.text,
+        sessionId: input.sessionId,
+        workspaceId: input.workspaceId,
+        messageId: input.messageId,
+      });
+    } else if (input.role === 'user') {
+      linkKnownManagedAssetsFromMessageText({
+        text: input.text,
+        sessionId: input.sessionId,
+        workspaceId: input.workspaceId,
+        messageId: input.messageId,
+      });
+    }
+  }
+}
+
+function refreshAssetEntry(entry: AssetEntry): AssetEntry {
+  return (
+    getAssets().find(
+      (item) =>
+        item.id === entry.id ||
+        Boolean(entry.localPath && item.localPath === entry.localPath),
+    ) ?? entry
+  );
 }
 
 function StatusBadge({
@@ -537,9 +621,11 @@ export default function DownloadsModal({
       assets
         .filter(
           (entry) =>
-            entry.localPath &&
-            !entry.sessionId &&
-            entry.localPath.toLowerCase().includes('.freeultracode'),
+            (!entry.sessionId || !entry.messageId) &&
+            entry.source !== 'installed' &&
+            (Boolean(entry.localPath?.toLowerCase().includes('.freeultracode')) ||
+              entry.source === 'generated' ||
+              entry.source === 'downloaded'),
         )
         .map((entry) => entry.id)
         .join('|'),
@@ -570,16 +656,24 @@ export default function DownloadsModal({
   useEffect(() => {
     if (!activeSessionId) return;
     for (const message of messages) {
-      // Skip user messages: a path the user mentions is not an AI-handled asset.
-      if (message.role !== 'assistant') continue;
-      if (!message.text.includes('.freeultracode')) continue;
-      linkManagedAssetsFromMessageText({
+      linkManagedAssetsFromActiveMessage({
         text: message.text,
+        role: message.role,
         sessionId: activeSessionId,
         workspaceId: activeWorkspaceId,
         messageId: message.id,
       });
     }
+    linkKnownAssetsToNearestMessages({
+      messages: messages.map((message) => ({
+        sessionId: activeSessionId,
+        workspaceId: activeWorkspaceId,
+        messageId: message.id,
+        role: message.role,
+        createdAt: message.createdAt,
+      })),
+      maxDistanceMs: ACTIVE_ASSET_MESSAGE_LINK_WINDOW_MS,
+    });
   }, [activeSessionId, activeWorkspaceId, messages]);
 
   useEffect(() => {
@@ -600,15 +694,27 @@ export default function DownloadsModal({
   const handleJumpToSession = useCallback(
     async (entry: AssetEntry) => {
       if (typeof window === 'undefined') return;
-      let target = entry;
-      if (!target.sessionId && isManagedLocalAsset(target)) {
+      if (activeSessionId) {
+        linkKnownAssetsToNearestMessages({
+          messages: messages.map((message) => ({
+            sessionId: activeSessionId,
+            workspaceId: activeWorkspaceId,
+            messageId: message.id,
+            role: message.role,
+            createdAt: message.createdAt,
+          })),
+          maxDistanceMs: ACTIVE_ASSET_MESSAGE_LINK_WINDOW_MS,
+        });
+      }
+      let target = refreshAssetEntry(entry);
+      if (
+        (!target.sessionId || !target.messageId) &&
+        (isManagedLocalAsset(target) ||
+          target.source === 'generated' ||
+          target.source === 'downloaded')
+      ) {
         await linkKnownManagedAssetsFromHistory(historyWorkspaceIds);
-        target =
-          getAssets().find(
-            (item) =>
-              item.id === entry.id ||
-              (entry.localPath && item.localPath === entry.localPath),
-          ) ?? entry;
+        target = refreshAssetEntry(entry);
       }
       if (!target.sessionId) return;
 
@@ -625,7 +731,7 @@ export default function DownloadsModal({
       );
       onClose();
     },
-    [historyWorkspaceIds, onClose, selectSession],
+    [activeSessionId, activeWorkspaceId, historyWorkspaceIds, messages, onClose, selectSession],
   );
 
   const filtered = useMemo(() => {

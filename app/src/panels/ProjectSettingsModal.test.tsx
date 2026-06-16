@@ -140,8 +140,10 @@ async function renderProjectSettingsModal(
   targetWorkspace: WorkspaceSummary = workspace,
 ): Promise<{
   container: HTMLDivElement;
+  onClose: ReturnType<typeof vi.fn>;
   cleanup: () => Promise<void>;
 }> {
+  const onClose = vi.fn();
   vi.mocked(tauriAvailable).mockReturnValue(false);
   vi.mocked(scanProjectEnvironment).mockResolvedValue(scan);
   useStore.setState({
@@ -154,12 +156,13 @@ async function renderProjectSettingsModal(
   const root: Root = createRoot(container);
 
   await act(async () => {
-    root.render(<ProjectSettingsModal workspace={targetWorkspace} onClose={vi.fn()} />);
+    root.render(<ProjectSettingsModal workspace={targetWorkspace} onClose={onClose} />);
   });
   await settle();
 
   return {
     container,
+    onClose,
     cleanup: async () => {
       await act(async () => {
         root.unmount();
@@ -176,7 +179,36 @@ afterEach(() => {
 });
 
 describe('ProjectSettingsModal game project tabs', () => {
-  it('splits game project capabilities into Mesh, rigging, capture/perf, expert, and command tabs', async () => {
+  it('keeps the modal open when the backdrop is clicked', async () => {
+    const view = await renderProjectSettingsModal();
+
+    try {
+      const backdrop = view.container.firstElementChild as HTMLDivElement;
+      await act(async () => {
+        backdrop.click();
+      });
+
+      expect(view.onClose).not.toHaveBeenCalled();
+
+      const dialog = view.container.querySelector<HTMLElement>(
+        '[aria-labelledby="project-settings-title"]',
+      );
+      const closeButton = dialog?.querySelector<HTMLButtonElement>(
+        'button[aria-label="关闭"]',
+      );
+      expect(closeButton).toBeInstanceOf(HTMLButtonElement);
+
+      await act(async () => {
+        closeButton?.click();
+      });
+
+      expect(view.onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('splits game project capabilities and shows the UE-only blueprint tab for Unreal projects', async () => {
     const view = await renderProjectSettingsModal();
 
     try {
@@ -193,6 +225,7 @@ describe('ProjectSettingsModal game project tabs', () => {
         '绑定渠道',
         '抓帧/性能',
         '游戏专家',
+        '蓝图',
         '命令',
         'MCP',
         'LSP',
@@ -226,6 +259,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).not.toContain('绑定渠道');
       expect(tabText).not.toContain('抓帧/性能');
       expect(tabText).not.toContain('游戏专家');
+      expect(tabText).not.toContain('蓝图');
       expect(tabText).not.toContain('命令');
     } finally {
       await view.cleanup();
@@ -418,6 +452,11 @@ describe('ProjectSettingsModal game project tabs', () => {
         '/mesh-mode-start',
         '/mesh-mode-end',
         '/mesh-search',
+        '/sprite',
+        '/sprite-mode-start',
+        '/sprite-mode-end',
+        '/blueprint-mode-start',
+        '/blueprint-mode-end',
         '/ui-mode-start',
         '/ui-mode-end',
       ]);
@@ -675,6 +714,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).toContain('抓帧/性能');
       expect(tabText).toContain('游戏专家');
       expect(tabText).toContain('命令');
+      expect(tabText).not.toContain('蓝图');
       expect(view.container.textContent).toContain('游戏项目：开启');
     } finally {
       await view.cleanup();
@@ -712,6 +752,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).toContain('抓帧/性能');
       expect(tabText).toContain('游戏专家');
       expect(tabText).toContain('命令');
+      expect(tabText).not.toContain('蓝图');
     } finally {
       await view.cleanup();
     }
@@ -721,6 +762,11 @@ describe('ProjectSettingsModal game project tabs', () => {
     const view = await renderProjectSettingsModal(unityScan());
 
     try {
+      const tabText = Array.from(
+        view.container.querySelectorAll('nav [role="tab"]'),
+      ).map((tab) => tab.textContent?.trim());
+      expect(tabText).not.toContain('蓝图');
+
       const mcpTab = Array.from(
         view.container.querySelectorAll('nav [role="tab"]'),
       ).find((tab) => tab.textContent?.trim() === 'MCP');

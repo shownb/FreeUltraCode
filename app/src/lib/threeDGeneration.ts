@@ -1,4 +1,4 @@
-export type ThreeDProviderId =
+export type BuiltInThreeDProviderId =
   | 'meshy'
   | 'tripo'
   | 'hyper3d-rodin'
@@ -25,6 +25,9 @@ export type ThreeDProviderId =
   | 'local-3d-server'
   | 'roblox-cube';
 
+export type CustomThreeDProviderId = `custom:${string}`;
+export type ThreeDProviderId = BuiltInThreeDProviderId | CustomThreeDProviderId;
+
 export type ThreeDProviderCategory = 'commercial' | 'free';
 export type ThreeDRiggingTarget = 'riggable' | 'static';
 export type ThreeDRiggingProviderId =
@@ -48,6 +51,8 @@ type ThreeDProviderApiKind =
   | 'huggingface-inference'
   | 'generic-3d-api'
   | 'generic-local-3d';
+
+export type CustomThreeDProviderApiKind = 'generic-3d-api' | 'generic-local-3d';
 
 type ThreeDRiggingProviderApiKind =
   | 'fal-meshy-rigging'
@@ -74,11 +79,31 @@ export interface ThreeDProviderDefinition {
   keyLabel?: string;
   keyPlaceholder?: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomThreeDProviderDefinition {
+  id: CustomThreeDProviderId;
+  label: string;
+  category: ThreeDProviderCategory;
+  apiKind: CustomThreeDProviderApiKind;
+  defaultModel: string;
+  models: string[];
+  needsKey: boolean;
+  local: boolean;
+  defaultBaseUrl: string;
+  supportsBaseUrl: true;
+  endpointPlaceholder: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  note: string;
 }
 
 export interface ThreeDGenerationSettings {
   enabled: boolean;
   preferredProviderId: ThreeDProviderId;
+  customProviders: CustomThreeDProviderDefinition[];
   providerKeys: Partial<Record<ThreeDProviderId, string>>;
   providerBaseUrls: Partial<Record<ThreeDProviderId, string>>;
   providerModels: Partial<Record<ThreeDProviderId, string>>;
@@ -1071,13 +1096,14 @@ export const THREE_D_PROVIDERS: ThreeDProviderDefinition[] = [
   },
 ];
 
-const THREE_D_PROVIDER_BY_ID = new Map<ThreeDProviderId, ThreeDProviderDefinition>(
-  THREE_D_PROVIDERS.map((provider) => [provider.id, provider]),
+const THREE_D_PROVIDER_BY_ID = new Map<BuiltInThreeDProviderId, ThreeDProviderDefinition>(
+  THREE_D_PROVIDERS.map((provider) => [provider.id as BuiltInThreeDProviderId, provider]),
 );
 
 export const DEFAULT_THREE_D_GENERATION_SETTINGS: ThreeDGenerationSettings = {
   enabled: false,
   preferredProviderId: 'meshy',
+  customProviders: [],
   providerKeys: {},
   providerBaseUrls: {},
   providerModels: {},
@@ -1088,8 +1114,133 @@ function hasStorage(): boolean {
   return typeof window !== 'undefined' && !!window.localStorage;
 }
 
-function isThreeDProviderId(value: unknown): value is ThreeDProviderId {
-  return typeof value === 'string' && THREE_D_PROVIDER_BY_ID.has(value as ThreeDProviderId);
+function isKnownThreeDProviderId(
+  value: unknown,
+  providers: readonly ThreeDProviderDefinition[],
+): value is ThreeDProviderId {
+  return typeof value === 'string' && providers.some((provider) => provider.id === value);
+}
+
+function slugifyCustomThreeDProviderId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  if (normalized) return normalized;
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomThreeDProviderId(label: string): CustomThreeDProviderId {
+  return `custom:${slugifyCustomThreeDProviderId(label)}`;
+}
+
+function normalizeThreeDModels(value: unknown, fallback: string): string[] {
+  const models = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [fallback, ...models]) {
+    const model = raw.trim();
+    const key = model.toLowerCase();
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    out.push(model);
+  }
+  return out.length > 0 ? out : ['custom-3d-model'];
+}
+
+function normalizeCustomThreeDProvider(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomThreeDProviderDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomThreeDProviderDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomThreeDProviderId(rawId || label || `provider-${index + 1}`)}`;
+  let id = baseId as CustomThreeDProviderId;
+  let suffix = 2;
+  while (usedIds.has(id) || THREE_D_PROVIDER_BY_ID.has(id as BuiltInThreeDProviderId)) {
+    id = `${baseId}-${suffix}` as CustomThreeDProviderId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const apiKind: CustomThreeDProviderApiKind =
+    source.apiKind === 'generic-local-3d' ? 'generic-local-3d' : 'generic-3d-api';
+  const defaultModel =
+    typeof source.defaultModel === 'string' && source.defaultModel.trim()
+      ? source.defaultModel.trim()
+      : 'custom-3d-model';
+  const defaultBaseUrl =
+    typeof source.defaultBaseUrl === 'string'
+      ? source.defaultBaseUrl.trim().replace(/\/+$/, '')
+      : '';
+  const endpointPlaceholder =
+    typeof source.endpointPlaceholder === 'string' && source.endpointPlaceholder.trim()
+      ? source.endpointPlaceholder.trim()
+      : apiKind === 'generic-local-3d'
+        ? 'http://127.0.0.1:8000/generate'
+        : 'https://api.example.com/v1/3d/generations';
+  return {
+    id,
+    label,
+    category: source.category === 'free' ? 'free' : 'commercial',
+    apiKind,
+    defaultModel,
+    models: normalizeThreeDModels(source.models, defaultModel),
+    needsKey: source.needsKey !== false,
+    local: source.local === true || apiKind === 'generic-local-3d',
+    defaultBaseUrl,
+    supportsBaseUrl: true,
+    endpointPlaceholder,
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : apiKind === 'generic-local-3d'
+          ? '自定义本地/自托管 Mesh 生成渠道。'
+          : '自定义 OpenAI-compatible Mesh 生成渠道。',
+  };
+}
+
+function normalizeCustomThreeDProviders(value: unknown): CustomThreeDProviderDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomThreeDProvider(item, index, usedIds))
+    .filter((item): item is CustomThreeDProviderDefinition => !!item);
+}
+
+export function threeDProviders(
+  settings = loadThreeDGenerationSettings(),
+): ThreeDProviderDefinition[] {
+  return [
+    ...THREE_D_PROVIDERS,
+    ...settings.customProviders.map(
+      (provider): ThreeDProviderDefinition => ({ ...provider, custom: true }),
+    ),
+  ];
 }
 
 function isThreeDRiggingProviderId(value: unknown): value is ThreeDRiggingProviderId {
@@ -1120,18 +1271,26 @@ export function normalizeThreeDGenerationSettings(
     return DEFAULT_THREE_D_GENERATION_SETTINGS;
   }
   const source = value as Partial<ThreeDGenerationSettings>;
-  const preferredProviderId = isThreeDProviderId(source.preferredProviderId)
+  const customProviders = normalizeCustomThreeDProviders(source.customProviders);
+  const providers = [
+    ...THREE_D_PROVIDERS,
+    ...customProviders.map((provider) => ({ ...provider, custom: true })),
+  ];
+  const preferredProviderId = isKnownThreeDProviderId(source.preferredProviderId, providers)
     ? source.preferredProviderId
     : DEFAULT_THREE_D_GENERATION_SETTINGS.preferredProviderId;
+  const validKey = (key: unknown): key is ThreeDProviderId =>
+    isKnownThreeDProviderId(key, providers);
   return {
     enabled:
       typeof source.enabled === 'boolean'
         ? source.enabled
         : DEFAULT_THREE_D_GENERATION_SETTINGS.enabled,
     preferredProviderId,
-    providerKeys: cleanRecord(source.providerKeys, isThreeDProviderId),
-    providerBaseUrls: cleanRecord(source.providerBaseUrls, isThreeDProviderId),
-    providerModels: cleanRecord(source.providerModels, isThreeDProviderId),
+    customProviders,
+    providerKeys: cleanRecord(source.providerKeys, validKey),
+    providerBaseUrls: cleanRecord(source.providerBaseUrls, validKey),
+    providerModels: cleanRecord(source.providerModels, validKey),
     rigging: normalizeThreeDAutoRiggingSettings(source.rigging),
   };
 }
@@ -1186,15 +1345,18 @@ export function saveThreeDGenerationSettings(settings: ThreeDGenerationSettings)
   }
 }
 
-export function threeDProviderById(id: ThreeDProviderId): ThreeDProviderDefinition {
-  return THREE_D_PROVIDER_BY_ID.get(id) ?? THREE_D_PROVIDERS[0];
+export function threeDProviderById(
+  id: ThreeDProviderId,
+  settings = loadThreeDGenerationSettings(),
+): ThreeDProviderDefinition {
+  return threeDProviders(settings).find((provider) => provider.id === id) ?? THREE_D_PROVIDERS[0];
 }
 
 export function threeDProviderModel(
   providerId: ThreeDProviderId,
   settings = loadThreeDGenerationSettings(),
 ): string {
-  const provider = threeDProviderById(providerId);
+  const provider = threeDProviderById(providerId, settings);
   return settings.providerModels[providerId]?.trim() || provider.defaultModel;
 }
 
@@ -1204,14 +1366,14 @@ export function threeDProviderBaseUrl(
 ): string {
   const custom = settings.providerBaseUrls[providerId]?.trim();
   if (custom) return custom.replace(/\/+$/, '');
-  return threeDProviderById(providerId).defaultBaseUrl.replace(/\/+$/, '');
+  return threeDProviderById(providerId, settings).defaultBaseUrl.replace(/\/+$/, '');
 }
 
 function threeDProviderKey(
   providerId: ThreeDProviderId,
   settings = loadThreeDGenerationSettings(),
 ): string {
-  const provider = threeDProviderById(providerId);
+  const provider = threeDProviderById(providerId, settings);
   const keyProviderId = provider.keyProviderId ?? providerId;
   return settings.providerKeys[keyProviderId]?.trim() || settings.providerKeys[providerId]?.trim() || '';
 }
@@ -1220,7 +1382,7 @@ export function threeDProviderReady(
   providerId: ThreeDProviderId,
   settings = loadThreeDGenerationSettings(),
 ): boolean {
-  const provider = threeDProviderById(providerId);
+  const provider = threeDProviderById(providerId, settings);
   if (provider.needsKey && !threeDProviderKey(providerId, settings)) return false;
   if (provider.local && !settings.providerBaseUrls[providerId]?.trim()) return false;
   return !!threeDProviderBaseUrl(providerId, settings);
@@ -1312,7 +1474,7 @@ export function configuredThreeDRiggingProviderIds(
 export function configuredThreeDProviderIds(
   settings = loadThreeDGenerationSettings(),
 ): ThreeDProviderId[] {
-  return THREE_D_PROVIDERS.filter((provider) => threeDProviderReady(provider.id, settings)).map(
+  return threeDProviders(settings).filter((provider) => threeDProviderReady(provider.id, settings)).map(
     (provider) => provider.id,
   );
 }
@@ -1443,7 +1605,7 @@ export async function generateThreeD(
   if (!threeDProviderReady(providerId, settings)) {
     throw new Error(`THREE_D_PROVIDER_NOT_READY:${providerId}`);
   }
-  const provider = threeDProviderById(providerId);
+  const provider = threeDProviderById(providerId, settings);
   const prompt = stripThreeDCommand(request.prompt);
   const model = request.model?.trim() || threeDProviderModel(providerId, settings);
   const rigging = assessThreeDRigging(prompt);
@@ -1485,7 +1647,7 @@ async function generateWithProvider(
   rigging: ThreeDRiggingAssessment,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  switch (threeDProviderById(providerId).apiKind) {
+  switch (threeDProviderById(providerId, settings).apiKind) {
     case 'meshy':
       return generateMeshy(prompt, model, settings, signal);
     case 'tripo':
@@ -2131,7 +2293,7 @@ async function generateGeneric3D(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const apiKey = threeDProviderKey(providerId, settings);
-  const provider = threeDProviderById(providerId);
+  const provider = threeDProviderById(providerId, settings);
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const baseUrl = threeDProviderBaseUrl(providerId, settings);
   const headers: Record<string, string> = {

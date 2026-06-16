@@ -275,6 +275,15 @@ describe('AIDock slash suggestions', () => {
       });
 
       expect(input.value).toBe('/image-mode-start ');
+
+      await act(async () => {
+        typeTextarea(input, '/blueprint-mode');
+      });
+
+      const blueprint = Array.from(
+        view.container.querySelectorAll('[role="option"]'),
+      ).find((option) => option.textContent?.includes('/blueprint-mode-start'));
+      expect(blueprint).toBeInstanceOf(HTMLElement);
     } finally {
       await view.cleanup();
     }
@@ -779,6 +788,114 @@ describe('AIDock slash suggestions', () => {
       expect(useStore.getState().composer.uiMode).toBe(true);
       expect(useStore.getState().composer.uiModeStartedAt).toBeGreaterThan(0);
       expect(generateUiPrompt).toHaveBeenCalledWith('设计一个赛博朋克 HUD');
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(input.value).toBe('');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('toggles sticky UE Blueprint mode via /blueprint-mode-start and /blueprint-mode-end', async () => {
+    resetStore();
+    const generateBlueprintPrompt = vi.fn();
+    const sendPrompt = vi.fn(() => true);
+    useStore.setState({ generateBlueprintPrompt, sendPrompt });
+    const view = await renderDock();
+
+    const submitEnter = (input: HTMLTextAreaElement) =>
+      input.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          ctrlKey: true,
+          bubbles: true,
+        }),
+      );
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(input, '/blueprint-mode-start --target BP_Player --context full');
+        submitEnter(input);
+      });
+      expect(useStore.getState().composer.blueprintMode).toBe(true);
+      expect(useStore.getState().composer.blueprintModeStartedAt).toBeGreaterThan(0);
+      expect(useStore.getState().composer.blueprintModeArgs).toBe(
+        '--target BP_Player --context full',
+      );
+      expect(useStore.getState().composer.uiMode).toBe(false);
+      expect(useStore.getState().composer.comfyMode).toBe(false);
+      expect(generateBlueprintPrompt).not.toHaveBeenCalled();
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(
+        useStore
+          .getState()
+          .messages.some(
+            (m) => m.role === 'system' && m.text.includes('已进入 UE 蓝图模式'),
+          ),
+      ).toBe(true);
+
+      await act(async () => {
+        typeTextarea(input, '给角色加一个开门交互事件');
+        submitEnter(input);
+      });
+      expect(generateBlueprintPrompt).toHaveBeenCalledWith('给角色加一个开门交互事件');
+      expect(sendPrompt).not.toHaveBeenCalled();
+
+      await act(async () => {
+        typeTextarea(input, '/review 看看这段代码');
+        submitEnter(input);
+      });
+      expect(sendPrompt).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        typeTextarea(input, '/blueprint-mode-end');
+        submitEnter(input);
+      });
+      expect(useStore.getState().composer.blueprintMode).toBe(false);
+      expect(useStore.getState().composer.blueprintModeStartedAt).toBeNull();
+      expect(useStore.getState().composer.blueprintModeArgs).toBeNull();
+      expect(
+        useStore
+          .getState()
+          .messages.some(
+            (m) => m.role === 'system' && m.text.includes('已退出 UE 蓝图模式'),
+          ),
+      ).toBe(true);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('enters UE Blueprint mode and runs the first prompt after parsed flags', async () => {
+    resetStore();
+    const generateBlueprintPrompt = vi.fn();
+    const sendPrompt = vi.fn(() => true);
+    useStore.setState({ generateBlueprintPrompt, sendPrompt });
+    const view = await renderDock();
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(
+          input,
+          '/blueprint-mode-start --target BP_Door --dry-run 添加按 E 开门逻辑',
+        );
+        input.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            ctrlKey: true,
+            bubbles: true,
+          }),
+        );
+      });
+
+      expect(useStore.getState().composer.blueprintMode).toBe(true);
+      expect(useStore.getState().composer.blueprintModeArgs).toBe(
+        '--target BP_Door --dry-run',
+      );
+      expect(generateBlueprintPrompt).toHaveBeenCalledWith('添加按 E 开门逻辑');
       expect(sendPrompt).not.toHaveBeenCalled();
       expect(input.value).toBe('');
     } finally {

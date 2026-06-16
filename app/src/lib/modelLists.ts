@@ -24,7 +24,10 @@ export interface ModelListResult {
   error?: string;
 }
 
-type ProviderModelSource = Pick<Provider, 'kind' | 'apiKey' | 'baseUrl' | 'model'>;
+type ProviderModelSource = Pick<
+  Provider,
+  'kind' | 'apiKey' | 'baseUrl' | 'model' | 'models'
+>;
 
 function hasWindow(): boolean {
   return typeof window !== 'undefined';
@@ -89,9 +92,42 @@ export function getCachedModels(key: string): CachedModelList | null {
   return cached && cached.models.length > 0 ? cached : null;
 }
 
+export function addCachedModel(key: string, model: string): CachedModelList | null {
+  return addCachedModels(key, [model]);
+}
+
+export function addCachedModels(
+  key: string,
+  models: Array<string | undefined | null>,
+): CachedModelList | null {
+  const additions = uniqueModels(models);
+  if (additions.length === 0) return getCachedModels(key);
+  const cached = getCachedModels(key);
+  return saveCachedModels(key, [...additions, ...(cached?.models ?? [])]);
+}
+
+export function removeCachedModel(key: string, model: string): CachedModelList | null {
+  const trimmed = model.trim();
+  if (!trimmed) return getCachedModels(key);
+  const cache = readCache();
+  const existing = cache[key];
+  if (!existing) return null;
+  const nextModels = existing.models.filter(
+    (item) => item.toLowerCase() !== trimmed.toLowerCase(),
+  );
+  if (sameModels(existing.models, nextModels)) return existing;
+  if (nextModels.length === 0) {
+    const next = { ...cache };
+    delete next[key];
+    writeCache(next);
+    return null;
+  }
+  return saveCachedModels(key, nextModels);
+}
+
 /** Cache key for image/music provider model lists (keyed by base URL). */
 export function endpointModelCacheKey(
-  scope: 'image' | 'music' | 'video' | 'sprite' | 'speech',
+  scope: 'image' | 'music' | 'video' | 'sprite' | 'speech' | 'mesh',
   providerId: string,
   baseUrl: string,
 ): string {
@@ -236,7 +272,11 @@ export function freeChannelModelOptions(channel: FreeChannel): string[] {
 
 export function providerModelOptions(provider: ProviderModelSource): string[] {
   const cached = getCachedModels(providerModelCacheKey(provider));
-  return uniqueModels([provider.model, ...(cached?.models ?? [])]);
+  return uniqueModels([
+    provider.model,
+    ...(provider.models ?? []),
+    ...(cached?.models ?? []),
+  ]);
 }
 
 export function allFreeChannelModelOptions(channelId: string): string[] {
@@ -255,22 +295,30 @@ export async function refreshFreeChannelModels(
   }
 
   const cacheKey = freeChannelModelCacheKey(channel.id);
+  const cached = getCachedModels(cacheKey);
   const catalog = uniqueModels([
     getFreeChannelModel(channel.id),
+    ...(cached?.models ?? []),
     channel.defaultModel,
     ...(channel.fallbackModels ?? []),
   ]);
 
   if (channel.local) {
     try {
-      const models = await listLocalModels(channel.id);
-      if (models.length > 0) {
-        const cached = saveCachedModels(cacheKey, models);
-        return { models: cached.models, source: 'local', updatedAt: cached.updatedAt };
+      const localModels = await listLocalModels(channel.id);
+      if (localModels.length > 0) {
+        const nextCached = saveCachedModels(cacheKey, [
+          ...localModels,
+          ...(cached?.models ?? []),
+        ]);
+        return {
+          models: nextCached.models,
+          source: 'local',
+          updatedAt: nextCached.updatedAt,
+        };
       }
       return { models: catalog, source: 'catalog' };
     } catch (err) {
-      const cached = getCachedModels(cacheKey);
       if (cached) {
         return {
           models: cached.models,
@@ -294,12 +342,18 @@ export async function refreshFreeChannelModels(
     });
     const models = uniqueModels(response.models);
     if (models.length > 0) {
-      const cached = saveCachedModels(cacheKey, models);
-      return { models: cached.models, source: 'remote', updatedAt: cached.updatedAt };
+      const nextCached = saveCachedModels(cacheKey, [
+        ...models,
+        ...(cached?.models ?? []),
+      ]);
+      return {
+        models: nextCached.models,
+        source: 'remote',
+        updatedAt: nextCached.updatedAt,
+      };
     }
     return { models: catalog, source: 'catalog' };
   } catch (err) {
-    const cached = getCachedModels(cacheKey);
     if (cached) {
       return {
         models: cached.models,
@@ -316,7 +370,12 @@ export async function refreshProviderModels(
   provider: ProviderModelSource,
 ): Promise<ModelListResult> {
   const cacheKey = providerModelCacheKey(provider);
-  const fallback = uniqueModels([provider.model]);
+  const cached = getCachedModels(cacheKey);
+  const fallback = uniqueModels([
+    provider.model,
+    ...(provider.models ?? []),
+    ...(cached?.models ?? []),
+  ]);
   const baseUrl = providerDefaultBaseUrl(provider);
   const urls = modelListUrls(baseUrl, providerTransport(provider));
   if (urls.length === 0) {
@@ -329,14 +388,21 @@ export async function refreshProviderModels(
       apiKey: provider.apiKey,
       transport: providerTransport(provider),
     });
-    const models = uniqueModels(response.models);
+    const models = uniqueModels([
+      ...response.models,
+      ...(provider.models ?? []),
+      ...(cached?.models ?? []),
+    ]);
     if (models.length > 0) {
-      const cached = saveCachedModels(cacheKey, models);
-      return { models: cached.models, source: 'remote', updatedAt: cached.updatedAt };
+      const nextCached = saveCachedModels(cacheKey, models);
+      return {
+        models: nextCached.models,
+        source: 'remote',
+        updatedAt: nextCached.updatedAt,
+      };
     }
     return { models: fallback, source: 'catalog' };
   } catch (err) {
-    const cached = getCachedModels(cacheKey);
     if (cached) {
       return {
         models: cached.models,

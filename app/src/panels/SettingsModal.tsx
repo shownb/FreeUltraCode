@@ -197,50 +197,58 @@ import {
   refreshProviderModels,
 } from '@/lib/modelLists';
 import {
-  IMAGE_PROVIDERS,
+  createCustomImageProviderId,
   imageProviderBaseUrl,
   imageProviderModel,
+  imageProviders,
   imageProviderReady,
   imageProviderSupportsComfyUiGraph,
   loadImageGenerationSettings,
   saveImageGenerationSettings,
+  type CustomImageProviderDefinition,
   type ImageGenerationSettings,
   type ImageProviderDefinition,
   type ImageProviderCategory,
   type ImageProviderId,
 } from '@/lib/imageGeneration';
 import {
-  MUSIC_PROVIDERS,
+  createCustomMusicProviderId,
   loadMusicGenerationSettings,
+  musicProviders,
   musicProviderBaseUrl,
   musicProviderModel,
   musicProviderReady,
   saveMusicGenerationSettings,
+  type CustomMusicProviderDefinition,
   type MusicGenerationSettings,
   type MusicProviderDefinition,
   type MusicProviderCategory,
   type MusicProviderId,
 } from '@/lib/musicGeneration';
 import {
-  VIDEO_PROVIDERS,
+  createCustomVideoProviderId,
   loadVideoGenerationSettings,
   saveVideoGenerationSettings,
+  videoProviders,
   videoProviderBaseUrl,
   videoProviderModel,
   videoProviderReady,
+  type CustomVideoProviderDefinition,
   type VideoGenerationSettings,
   type VideoProviderDefinition,
   type VideoProviderCategory,
   type VideoProviderId,
 } from '@/lib/videoGeneration';
 import {
-  SPEECH_PROVIDERS,
+  createCustomSpeechProviderId,
   loadSpeechGenerationSettings,
   saveSpeechGenerationSettings,
+  speechProviders,
   speechProviderBaseUrl,
   speechProviderModel,
   speechProviderVoice,
   speechProviderReady,
+  type CustomSpeechProviderDefinition,
   type SpeechGenerationSettings,
   type SpeechProviderDefinition,
   type SpeechProviderCategory,
@@ -256,7 +264,7 @@ import {
 } from '@/lib/spriteGeneration';
 import {
   THREE_D_RIGGING_PROVIDERS,
-  THREE_D_PROVIDERS,
+  createCustomThreeDProviderId,
   loadThreeDGenerationSettings,
   saveThreeDGenerationSettings,
   threeDRiggingProviderBaseUrl,
@@ -267,7 +275,9 @@ import {
   threeDProviderBaseUrl,
   threeDProviderById,
   threeDProviderModel,
+  threeDProviders,
   threeDProviderReady,
+  type CustomThreeDProviderDefinition,
   type ThreeDGenerationSettings,
   type ThreeDProviderCategory,
   type ThreeDProviderDefinition,
@@ -1634,7 +1644,13 @@ function GlobalRunControls({
   locale: Locale;
   cliRuntime: CliRuntimeSnapshot;
 }) {
-  const setGlobalRunSelection = useStore((s) => s.setGlobalRunSelection);
+  // Settings configures the *default* channel only. It must persist globally and
+  // affect newly opened sessions without touching any session already in flight
+  // (those switch channel from the input-box selector instead). So we use
+  // setDefaultRunSelection — setGlobalRunSelection mutates the active session's
+  // workflow and is blocked while a run is read-only, which would wrongly lock
+  // the default-channel picker whenever any session is running.
+  const setDefaultRunSelection = useStore((s) => s.setDefaultRunSelection);
   const composerModelOptions = useStore((s) => s.modelOptions);
   const [revision, setRevision] = useState(0);
   const [modelListRevision, setModelListRevision] = useState(0);
@@ -1867,20 +1883,20 @@ function GlobalRunControls({
         (item) => item.provider.id === providerId,
       )?.provider;
       if (!provider) return;
-      setGlobalRunSelection(providerSelection(provider));
+      setDefaultRunSelection(providerSelection(provider));
       return;
     }
 
     const defaultAdapter = adapterFromSystemDefaultOption(id);
     if (defaultAdapter) {
-      setGlobalRunSelection(systemDefaultGatewaySelection(defaultAdapter));
+      setDefaultRunSelection(systemDefaultGatewaySelection(defaultAdapter));
       return;
     }
 
     const freeChannelId = freeChannelFromOption(id);
     if (!freeChannelId) return;
     void ensureFreeProxy();
-    setGlobalRunSelection(
+    setDefaultRunSelection(
       freeChannelSelection(freeChannelId, getFreeChannelModel(freeChannelId)),
     );
   };
@@ -1890,7 +1906,7 @@ function GlobalRunControls({
     if (selectedFreeChannel) {
       setFreeChannelModel(selectedFreeChannel.id, selectedModel);
       void ensureFreeProxy();
-      setGlobalRunSelection(
+      setDefaultRunSelection(
         freeChannelSelection(
           selectedFreeChannel.id,
           selectedModel || getFreeChannelModel(selectedFreeChannel.id),
@@ -1902,12 +1918,12 @@ function GlobalRunControls({
       const nextModel = selectedModel || undefined;
       const provider = selectedDefaultProvider.provider;
       updateProvider(provider.id, { model: nextModel });
-      setGlobalRunSelection(
+      setDefaultRunSelection(
         providerSelection({ ...provider, model: nextModel }, selectedModel),
       );
       return;
     }
-    setGlobalRunSelection(
+    setDefaultRunSelection(
       {
         ...systemDefaultGatewaySelection(selectedAdapter),
         modelClass: selectedModel || 'default',
@@ -2814,7 +2830,6 @@ function ProviderEditor({
   return (
     <div
       className="fixed inset-0 z-[70] bg-black/60 sm:flex sm:items-center sm:justify-center sm:p-6"
-      onClick={onClose}
     >
       <div
         role="dialog"
@@ -3231,6 +3246,252 @@ function uniqueStringOptions(values: string[]): string[] {
   return out;
 }
 
+type CustomGenerationProviderDraft = {
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  models: string[];
+};
+
+function customGenerationProviderName(baseUrl: string, fallback: string): string {
+  try {
+    const url = new URL(baseUrl.trim());
+    return url.hostname.replace(/^api\./iu, '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function uniqueCustomId<T extends `custom:${string}`>(
+  baseId: T,
+  existingIds: Iterable<string>,
+): T {
+  const used = new Set(existingIds);
+  if (!used.has(baseId)) return baseId;
+  let suffix = 2;
+  while (used.has(`${baseId}-${suffix}`)) suffix += 1;
+  return `${baseId}-${suffix}` as T;
+}
+
+function CustomGenerationProviderDialog({
+  locale,
+  title,
+  modelScope,
+  defaultName,
+  defaultModel,
+  endpointPlaceholder,
+  onClose,
+  onSave,
+}: {
+  locale: Locale;
+  title: string;
+  modelScope: 'image' | 'mesh' | 'music' | 'video' | 'speech';
+  defaultName: string;
+  defaultModel: string;
+  endpointPlaceholder: string;
+  onClose: () => void;
+  onSave: (draft: CustomGenerationProviderDraft) => void;
+}) {
+  const [showKey, setShowKey] = useState(false);
+  const [name, setName] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [model, setModel] = useState(defaultModel);
+  const [models, setModels] = useState<string[]>([defaultModel]);
+  const [error, setError] = useState<string | null>(null);
+  const [modelRefresh, setModelRefresh] = useState<{
+    loading: boolean;
+    error: string | null;
+  }>({ loading: false, error: null });
+  const KeyIcon = showKey ? EyeOff : Eye;
+  const modelOptions = uniqueStringOptions([model, ...models]);
+
+  const refreshModels = async () => {
+    const trimmedBaseUrl = baseUrl.trim();
+    if (!trimmedBaseUrl || modelRefresh.loading) return;
+    setModelRefresh({ loading: true, error: null });
+    try {
+      const result = await refreshEndpointModels({
+        cacheKey: endpointModelCacheKey(modelScope, `custom:${trimmedBaseUrl}`, trimmedBaseUrl),
+        baseUrl: trimmedBaseUrl,
+        apiKey,
+        fallback: modelOptions,
+      });
+      setModels(result.models);
+      if (!model.trim() && result.models[0]) setModel(result.models[0]);
+      setModelRefresh({ loading: false, error: result.error ?? null });
+    } catch (err) {
+      setModelRefresh({
+        loading: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const save = () => {
+    const trimmedBaseUrl = baseUrl.trim().replace(/\/+$/, '');
+    const trimmedModel = model.trim() || models[0]?.trim() || defaultModel;
+    if (!trimmedBaseUrl) {
+      setError(locale === 'zh-CN' ? '请填写 URL。' : 'Enter a URL.');
+      return;
+    }
+    setError(null);
+    onSave({
+      name: name.trim() || customGenerationProviderName(trimmedBaseUrl, defaultName),
+      baseUrl: trimmedBaseUrl,
+      apiKey: apiKey.trim(),
+      model: trimmedModel,
+      models: uniqueStringOptions([trimmedModel, ...models]),
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-[75] bg-black/60 sm:flex sm:items-center sm:justify-center sm:p-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        data-custom-generation-provider-editor="true"
+        className="fixed inset-x-0 bottom-0 flex max-h-[calc(100vh-1rem)] flex-col overflow-hidden rounded-t-lg border border-border bg-panel shadow-2xl sm:relative sm:inset-auto sm:max-h-[calc(100vh-3rem)] sm:w-[min(560px,calc(100vw-2rem))] sm:rounded-lg"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="shrink-0 border-b border-border-soft bg-bg-alt px-5 py-4">
+          <div className="flex items-center gap-3">
+            <h3 className="min-w-0 flex-1 text-base font-semibold text-fg">{title}</h3>
+            <button
+              type="button"
+              onClick={onClose}
+              title={t(locale, 'common.close')}
+              aria-label={t(locale, 'common.close')}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-faint transition-colors hover:border-accent hover:text-fg"
+            >
+              <X size={15} strokeWidth={2.2} />
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          <TextField
+            label={locale === 'zh-CN' ? '渠道名称' : 'Channel name'}
+            value={name}
+            onChange={setName}
+            placeholder={defaultName}
+          />
+          <TextField
+            label={locale === 'zh-CN' ? 'URL（必填）' : 'URL (required)'}
+            value={baseUrl}
+            onChange={(value) => {
+              setBaseUrl(value);
+              setError(null);
+            }}
+            placeholder={endpointPlaceholder}
+            error={error ?? undefined}
+            mono
+          />
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-fg-dim">Token</span>
+            <div className="relative">
+              <input
+                type={showKey ? 'text' : 'password'}
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                onKeyDown={stopSettingsInputKeyPropagation}
+                onPaste={(event) => {
+                  const nextValue = inputValueAfterPaste(event);
+                  if (nextValue != null) setApiKey(nextValue);
+                }}
+                placeholder="sk-..."
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full rounded border border-border bg-bg px-2 py-1.5 pr-10 font-mono text-xs text-fg outline-none transition-colors focus:border-accent"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey((v) => !v)}
+                title={t(locale, showKey ? 'settings.models.hideKey' : 'settings.models.showKey')}
+                className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+              >
+                <KeyIcon size={13} strokeWidth={2} />
+              </button>
+            </div>
+          </label>
+
+          <label className="block space-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-medium text-fg-dim">
+                {locale === 'zh-CN' ? '渠道列表 / 模型' : 'Channel list / model'}
+              </span>
+              <button
+                type="button"
+                onClick={() => void refreshModels()}
+                disabled={!baseUrl.trim() || modelRefresh.loading}
+                className="inline-flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 text-[11px] text-fg-dim transition-colors hover:border-accent hover:text-fg disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RefreshCw
+                  size={12}
+                  strokeWidth={2}
+                  className={modelRefresh.loading ? 'animate-spin' : undefined}
+                />
+                {locale === 'zh-CN' ? '获取渠道' : 'Fetch channels'}
+              </button>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(10rem,14rem)]">
+              <input
+                type="text"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                placeholder={defaultModel}
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full rounded border border-border bg-bg px-2 py-1.5 font-mono text-xs text-fg outline-none transition-colors focus:border-accent"
+              />
+              <select
+                value={modelOptions.includes(model.trim()) ? model.trim() : ''}
+                onChange={(event) => {
+                  if (event.target.value) setModel(event.target.value);
+                }}
+                className="h-[31px] w-full rounded border border-border bg-bg px-2 font-mono text-xs text-fg outline-none transition-colors focus:border-accent"
+              >
+                <option value="">{locale === 'zh-CN' ? '选择渠道' : 'Select channel'}</option>
+                {modelOptions.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {modelRefresh.error && (
+              <p className="text-[11px] leading-relaxed text-amber-300">
+                {modelRefresh.error}
+              </p>
+            )}
+          </label>
+        </div>
+
+        <div className="shrink-0 border-t border-border-soft bg-bg-alt px-5 py-3">
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-border bg-panel px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              {t(locale, 'common.cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              disabled={!baseUrl.trim()}
+              className="rounded border border-accent bg-accent px-3 py-1.5 text-xs font-medium text-bg transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:border-border disabled:bg-panel disabled:text-fg-faint"
+            >
+              {t(locale, 'settings.models.save')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
   const [settings, setSettings] = useState<ImageGenerationSettings>(() =>
     loadImageGenerationSettings(),
@@ -3238,6 +3499,7 @@ function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
   // Commercial and free-credit providers live in separate tabs so each
   // category stays self-contained instead of stacking in one long list.
   const [category, setCategory] = useState<ImageProviderCategory>('commercial');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const update = (patch: Partial<ImageGenerationSettings>) => {
     const next = { ...settings, ...patch };
@@ -3245,7 +3507,8 @@ function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
     setSettings(next);
   };
 
-  const providerOptions = IMAGE_PROVIDERS.map((provider) => ({
+  const providers = imageProviders(settings);
+  const providerOptions = providers.map((provider) => ({
     id: provider.id,
     label: provider.label,
     hint: `${imageProviderCategoryLabel(provider.category, locale)} · ${imageProviderStatusLabel(
@@ -3254,9 +3517,69 @@ function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
       locale,
     )}`,
   }));
-  const activeProviders = IMAGE_PROVIDERS.filter(
+  const activeProviders = providers.filter(
     (provider) => provider.category === category,
   );
+
+  const addCustomProvider = (draft: CustomGenerationProviderDraft) => {
+    const id = uniqueCustomId(
+      createCustomImageProviderId(draft.name),
+      settings.customProviders.map((provider) => provider.id),
+    );
+    const provider: CustomImageProviderDefinition = {
+      id,
+      label: draft.name,
+      category,
+      apiKind: 'openai-images',
+      defaultModel: draft.model,
+      models: draft.models,
+      needsKey: true,
+      local: false,
+      defaultBaseUrl: draft.baseUrl,
+      supportsBaseUrl: true,
+      endpointPlaceholder: draft.baseUrl,
+      keyPlaceholder: 'sk-...',
+      note: '自定义 OpenAI-compatible 生图渠道。',
+    };
+    const next: ImageGenerationSettings = {
+      ...settings,
+      preferredProviderId: id,
+      customProviders: [...settings.customProviders, provider],
+      providerKeys: { ...settings.providerKeys },
+      providerAccountIds: { ...settings.providerAccountIds },
+      providerBaseUrls: { ...settings.providerBaseUrls, [id]: draft.baseUrl },
+      providerModels: { ...settings.providerModels, [id]: draft.model },
+    };
+    if (draft.apiKey) next.providerKeys[id] = draft.apiKey;
+    saveImageGenerationSettings(next);
+    setSettings(loadImageGenerationSettings());
+    setCustomDialogOpen(false);
+  };
+
+  const deleteCustomProvider = (id: ImageProviderId) => {
+    const providerKeys = { ...settings.providerKeys };
+    const providerAccountIds = { ...settings.providerAccountIds };
+    const providerBaseUrls = { ...settings.providerBaseUrls };
+    const providerModels = { ...settings.providerModels };
+    delete providerKeys[id];
+    delete providerAccountIds[id];
+    delete providerBaseUrls[id];
+    delete providerModels[id];
+    const next: ImageGenerationSettings = {
+      ...settings,
+      preferredProviderId:
+        settings.preferredProviderId === id
+          ? 'siliconflow'
+          : settings.preferredProviderId,
+      customProviders: settings.customProviders.filter((provider) => provider.id !== id),
+      providerKeys,
+      providerAccountIds,
+      providerBaseUrls,
+      providerModels,
+    };
+    saveImageGenerationSettings(next);
+    setSettings(loadImageGenerationSettings());
+  };
 
   return (
     <div className="space-y-5">
@@ -3334,7 +3657,17 @@ function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
               {t(locale, imageProviderCategoryDescKey(category))}
             </p>
           </div>
-          <StatusBadge state="default" label={String(activeProviders.length)} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge state="default" label={String(activeProviders.length)} />
+            <button
+              type="button"
+              onClick={() => setCustomDialogOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              <Plus size={13} strokeWidth={2.2} />
+              {t(locale, 'settings.models.add')}
+            </button>
+          </div>
         </div>
         <div className={SETTINGS_PROVIDER_GRID_CLASS}>
           {activeProviders.map((provider) => (
@@ -3347,10 +3680,25 @@ function ImageGenerationSettingsPanel({ locale }: { locale: Locale }) {
                 saveImageGenerationSettings(next);
                 setSettings(next);
               }}
+              onDelete={
+                provider.custom ? () => deleteCustomProvider(provider.id) : undefined
+              }
             />
           ))}
         </div>
       </section>
+      {customDialogOpen && (
+        <CustomGenerationProviderDialog
+          locale={locale}
+          title={t(locale, 'settings.models.addTitle')}
+          modelScope="image"
+          defaultName={t(locale, 'settings.models.newProviderName')}
+          defaultModel="custom-image-model"
+          endpointPlaceholder="https://api.example.com/v1"
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomProvider}
+        />
+      )}
     </div>
   );
 }
@@ -3412,11 +3760,13 @@ function ImageProviderSettingsRow({
   settings,
   locale,
   onChange,
+  onDelete,
 }: {
   provider: ImageProviderDefinition;
   settings: ImageGenerationSettings;
   locale: Locale;
   onChange: (settings: ImageGenerationSettings) => void;
+  onDelete?: () => void;
 }) {
   const [showKey, setShowKey] = useState(false);
   const [modelRefresh, setModelRefresh] = useState<{
@@ -3598,7 +3948,18 @@ function ImageProviderSettingsRow({
                   ready
                     ? 'settings.freeChannels.manageKey'
                     : 'settings.freeChannels.getKey',
-                )}
+            )}
+          </button>
+        )}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            title={t(locale, 'settings.models.delete')}
+            aria-label={t(locale, 'settings.models.delete')}
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} strokeWidth={2.2} />
           </button>
         )}
       </div>
@@ -3779,6 +4140,7 @@ function MusicGenerationSettingsPanel({ locale }: { locale: Locale }) {
     loadMusicGenerationSettings(),
   );
   const [category, setCategory] = useState<MusicProviderCategory>('commercial');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const update = (patch: Partial<MusicGenerationSettings>) => {
     const next = { ...settings, ...patch };
@@ -3786,7 +4148,8 @@ function MusicGenerationSettingsPanel({ locale }: { locale: Locale }) {
     setSettings(next);
   };
 
-  const providerOptions = MUSIC_PROVIDERS.map((provider) => ({
+  const providers = musicProviders(settings);
+  const providerOptions = providers.map((provider) => ({
     id: provider.id,
     label: provider.label,
     hint: `${musicProviderCategoryLabel(provider.category, locale)} · ${musicProviderStatusLabel(
@@ -3796,9 +4159,65 @@ function MusicGenerationSettingsPanel({ locale }: { locale: Locale }) {
     )}`,
     group: musicProviderCategoryLabel(provider.category, locale),
   }));
-  const activeProviders = MUSIC_PROVIDERS.filter(
+  const activeProviders = providers.filter(
     (provider) => provider.category === category,
   );
+
+  const addCustomProvider = (draft: CustomGenerationProviderDraft) => {
+    const id = uniqueCustomId(
+      createCustomMusicProviderId(draft.name),
+      settings.customProviders.map((provider) => provider.id),
+    );
+    const provider: CustomMusicProviderDefinition = {
+      id,
+      label: draft.name,
+      category,
+      apiKind: 'generic-online-music',
+      defaultModel: draft.model,
+      models: draft.models,
+      needsKey: true,
+      local: false,
+      defaultBaseUrl: draft.baseUrl,
+      supportsBaseUrl: true,
+      endpointPlaceholder: draft.baseUrl,
+      keyPlaceholder: 'sk-...',
+      note: '自定义 OpenAI-compatible 音乐生成渠道。',
+    };
+    const next: MusicGenerationSettings = {
+      ...settings,
+      preferredProviderId: id,
+      customProviders: [...settings.customProviders, provider],
+      providerKeys: { ...settings.providerKeys },
+      providerBaseUrls: { ...settings.providerBaseUrls, [id]: draft.baseUrl },
+      providerModels: { ...settings.providerModels, [id]: draft.model },
+    };
+    if (draft.apiKey) next.providerKeys[id] = draft.apiKey;
+    saveMusicGenerationSettings(next);
+    setSettings(loadMusicGenerationSettings());
+    setCustomDialogOpen(false);
+  };
+
+  const deleteCustomProvider = (id: MusicProviderId) => {
+    const providerKeys = { ...settings.providerKeys };
+    const providerBaseUrls = { ...settings.providerBaseUrls };
+    const providerModels = { ...settings.providerModels };
+    delete providerKeys[id];
+    delete providerBaseUrls[id];
+    delete providerModels[id];
+    const next: MusicGenerationSettings = {
+      ...settings,
+      preferredProviderId:
+        settings.preferredProviderId === id
+          ? 'elevenlabs-music'
+          : settings.preferredProviderId,
+      customProviders: settings.customProviders.filter((provider) => provider.id !== id),
+      providerKeys,
+      providerBaseUrls,
+      providerModels,
+    };
+    saveMusicGenerationSettings(next);
+    setSettings(loadMusicGenerationSettings());
+  };
 
   return (
     <div className="space-y-5">
@@ -3876,7 +4295,17 @@ function MusicGenerationSettingsPanel({ locale }: { locale: Locale }) {
               {t(locale, musicProviderCategoryDescKey(category))}
             </p>
           </div>
-          <StatusBadge state="default" label={String(activeProviders.length)} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge state="default" label={String(activeProviders.length)} />
+            <button
+              type="button"
+              onClick={() => setCustomDialogOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              <Plus size={13} strokeWidth={2.2} />
+              {t(locale, 'settings.models.add')}
+            </button>
+          </div>
         </div>
         <div className={SETTINGS_PROVIDER_GRID_CLASS}>
           {activeProviders.map((provider) => (
@@ -3889,10 +4318,25 @@ function MusicGenerationSettingsPanel({ locale }: { locale: Locale }) {
                 saveMusicGenerationSettings(next);
                 setSettings(next);
               }}
+              onDelete={
+                provider.custom ? () => deleteCustomProvider(provider.id) : undefined
+              }
             />
           ))}
         </div>
       </section>
+      {customDialogOpen && (
+        <CustomGenerationProviderDialog
+          locale={locale}
+          title={t(locale, 'settings.models.addTitle')}
+          modelScope="music"
+          defaultName={t(locale, 'settings.models.newProviderName')}
+          defaultModel="custom-music-model"
+          endpointPlaceholder="https://api.example.com/v1/audio/generations"
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomProvider}
+        />
+      )}
     </div>
   );
 }
@@ -3951,11 +4395,13 @@ function MusicProviderSettingsRow({
   settings,
   locale,
   onChange,
+  onDelete,
 }: {
   provider: MusicProviderDefinition;
   settings: MusicGenerationSettings;
   locale: Locale;
   onChange: (settings: MusicGenerationSettings) => void;
+  onDelete?: () => void;
 }) {
   const [showKey, setShowKey] = useState(false);
   const [modelRefresh, setModelRefresh] = useState<{
@@ -4082,6 +4528,17 @@ function MusicProviderSettingsRow({
                 )}
           </button>
         )}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            title={t(locale, 'settings.models.delete')}
+            aria-label={t(locale, 'settings.models.delete')}
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} strokeWidth={2.2} />
+          </button>
+        )}
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
@@ -4199,6 +4656,7 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
     loadVideoGenerationSettings(),
   );
   const [category, setCategory] = useState<VideoProviderCategory>('commercial');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const update = (patch: Partial<VideoGenerationSettings>) => {
     const next = { ...settings, ...patch };
@@ -4206,7 +4664,8 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
     setSettings(next);
   };
 
-  const providerOptions = VIDEO_PROVIDERS.map((provider) => ({
+  const providers = videoProviders(settings);
+  const providerOptions = providers.map((provider) => ({
     id: provider.id,
     label: provider.label,
     hint: `${videoProviderCategoryLabel(provider.category, locale)} · ${videoProviderStatusLabel(
@@ -4216,9 +4675,63 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
     )}`,
     group: videoProviderCategoryLabel(provider.category, locale),
   }));
-  const activeProviders = VIDEO_PROVIDERS.filter(
+  const activeProviders = providers.filter(
     (provider) => provider.category === category,
   );
+
+  const addCustomProvider = (draft: CustomGenerationProviderDraft) => {
+    const id = uniqueCustomId(
+      createCustomVideoProviderId(draft.name),
+      settings.customProviders.map((provider) => provider.id),
+    );
+    const provider: CustomVideoProviderDefinition = {
+      id,
+      label: draft.name,
+      category,
+      apiKind: 'generic-online-video',
+      defaultModel: draft.model,
+      models: draft.models,
+      needsKey: true,
+      local: false,
+      defaultBaseUrl: draft.baseUrl,
+      supportsBaseUrl: true,
+      endpointPlaceholder: draft.baseUrl,
+      keyPlaceholder: 'sk-...',
+      note: '自定义 OpenAI-compatible 视频生成渠道。',
+    };
+    const next: VideoGenerationSettings = {
+      ...settings,
+      preferredProviderId: id,
+      customProviders: [...settings.customProviders, provider],
+      providerKeys: { ...settings.providerKeys },
+      providerBaseUrls: { ...settings.providerBaseUrls, [id]: draft.baseUrl },
+      providerModels: { ...settings.providerModels, [id]: draft.model },
+    };
+    if (draft.apiKey) next.providerKeys[id] = draft.apiKey;
+    saveVideoGenerationSettings(next);
+    setSettings(loadVideoGenerationSettings());
+    setCustomDialogOpen(false);
+  };
+
+  const deleteCustomProvider = (id: VideoProviderId) => {
+    const providerKeys = { ...settings.providerKeys };
+    const providerBaseUrls = { ...settings.providerBaseUrls };
+    const providerModels = { ...settings.providerModels };
+    delete providerKeys[id];
+    delete providerBaseUrls[id];
+    delete providerModels[id];
+    const next: VideoGenerationSettings = {
+      ...settings,
+      preferredProviderId:
+        settings.preferredProviderId === id ? 'fal-video' : settings.preferredProviderId,
+      customProviders: settings.customProviders.filter((provider) => provider.id !== id),
+      providerKeys,
+      providerBaseUrls,
+      providerModels,
+    };
+    saveVideoGenerationSettings(next);
+    setSettings(loadVideoGenerationSettings());
+  };
 
   return (
     <div className="space-y-5">
@@ -4296,7 +4809,17 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
               {t(locale, videoProviderCategoryDescKey(category))}
             </p>
           </div>
-          <StatusBadge state="default" label={String(activeProviders.length)} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge state="default" label={String(activeProviders.length)} />
+            <button
+              type="button"
+              onClick={() => setCustomDialogOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              <Plus size={13} strokeWidth={2.2} />
+              {t(locale, 'settings.models.add')}
+            </button>
+          </div>
         </div>
         <div className={SETTINGS_PROVIDER_GRID_CLASS}>
           {activeProviders.map((provider) => (
@@ -4309,10 +4832,25 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
                 saveVideoGenerationSettings(next);
                 setSettings(next);
               }}
+              onDelete={
+                provider.custom ? () => deleteCustomProvider(provider.id) : undefined
+              }
             />
           ))}
         </div>
       </section>
+      {customDialogOpen && (
+        <CustomGenerationProviderDialog
+          locale={locale}
+          title={t(locale, 'settings.models.addTitle')}
+          modelScope="video"
+          defaultName={t(locale, 'settings.models.newProviderName')}
+          defaultModel="custom-video-model"
+          endpointPlaceholder="https://api.example.com/v1/video/generations"
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomProvider}
+        />
+      )}
     </div>
   );
 }
@@ -4371,11 +4909,13 @@ function VideoProviderSettingsRow({
   settings,
   locale,
   onChange,
+  onDelete,
 }: {
   provider: VideoProviderDefinition;
   settings: VideoGenerationSettings;
   locale: Locale;
   onChange: (settings: VideoGenerationSettings) => void;
+  onDelete?: () => void;
 }) {
   const [showKey, setShowKey] = useState(false);
   const [modelRefresh, setModelRefresh] = useState<{
@@ -4502,6 +5042,17 @@ function VideoProviderSettingsRow({
                 )}
           </button>
         )}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            title={t(locale, 'settings.models.delete')}
+            aria-label={t(locale, 'settings.models.delete')}
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} strokeWidth={2.2} />
+          </button>
+        )}
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
@@ -4621,6 +5172,7 @@ function SpeechGenerationSettingsPanel({ locale }: { locale: Locale }) {
     loadSpeechGenerationSettings(),
   );
   const [category, setCategory] = useState<SpeechProviderCategory>('commercial');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const update = (patch: Partial<SpeechGenerationSettings>) => {
     const next = { ...settings, ...patch };
@@ -4628,7 +5180,8 @@ function SpeechGenerationSettingsPanel({ locale }: { locale: Locale }) {
     setSettings(next);
   };
 
-  const providerOptions = SPEECH_PROVIDERS.map((provider) => ({
+  const providers = speechProviders(settings);
+  const providerOptions = providers.map((provider) => ({
     id: provider.id,
     label: provider.label,
     hint: `${speechProviderCategoryLabel(provider.category, locale)} · ${speechProviderStatusLabel(
@@ -4638,9 +5191,73 @@ function SpeechGenerationSettingsPanel({ locale }: { locale: Locale }) {
     )}`,
     group: speechProviderCategoryLabel(provider.category, locale),
   }));
-  const activeProviders = SPEECH_PROVIDERS.filter(
+  const activeProviders = providers.filter(
     (provider) => provider.category === category,
   );
+
+  const addCustomProvider = (draft: CustomGenerationProviderDraft) => {
+    const id = uniqueCustomId(
+      createCustomSpeechProviderId(draft.name),
+      settings.customProviders.map((provider) => provider.id),
+    );
+    const provider: CustomSpeechProviderDefinition = {
+      id,
+      label: draft.name,
+      category,
+      apiKind: 'generic-online-speech',
+      defaultModel: draft.model,
+      models: draft.models,
+      defaultVoice: 'alloy',
+      voices: ['alloy'],
+      needsKey: true,
+      local: false,
+      defaultBaseUrl: draft.baseUrl,
+      supportsBaseUrl: true,
+      endpointPlaceholder: draft.baseUrl,
+      keyPlaceholder: 'sk-...',
+      note: '自定义 OpenAI-compatible 语音生成渠道。',
+    };
+    const next: SpeechGenerationSettings = {
+      ...settings,
+      preferredProviderId: id,
+      customProviders: [...settings.customProviders, provider],
+      providerKeys: { ...settings.providerKeys },
+      providerAccountIds: { ...settings.providerAccountIds },
+      providerBaseUrls: { ...settings.providerBaseUrls, [id]: draft.baseUrl },
+      providerModels: { ...settings.providerModels, [id]: draft.model },
+      providerVoices: { ...settings.providerVoices },
+    };
+    if (draft.apiKey) next.providerKeys[id] = draft.apiKey;
+    saveSpeechGenerationSettings(next);
+    setSettings(loadSpeechGenerationSettings());
+    setCustomDialogOpen(false);
+  };
+
+  const deleteCustomProvider = (id: SpeechProviderId) => {
+    const providerKeys = { ...settings.providerKeys };
+    const providerAccountIds = { ...settings.providerAccountIds };
+    const providerBaseUrls = { ...settings.providerBaseUrls };
+    const providerModels = { ...settings.providerModels };
+    const providerVoices = { ...settings.providerVoices };
+    delete providerKeys[id];
+    delete providerAccountIds[id];
+    delete providerBaseUrls[id];
+    delete providerModels[id];
+    delete providerVoices[id];
+    const next: SpeechGenerationSettings = {
+      ...settings,
+      preferredProviderId:
+        settings.preferredProviderId === id ? 'openai-tts' : settings.preferredProviderId,
+      customProviders: settings.customProviders.filter((provider) => provider.id !== id),
+      providerKeys,
+      providerAccountIds,
+      providerBaseUrls,
+      providerModels,
+      providerVoices,
+    };
+    saveSpeechGenerationSettings(next);
+    setSettings(loadSpeechGenerationSettings());
+  };
 
   return (
     <div className="space-y-5">
@@ -4718,7 +5335,17 @@ function SpeechGenerationSettingsPanel({ locale }: { locale: Locale }) {
               {t(locale, speechProviderCategoryDescKey(category))}
             </p>
           </div>
-          <StatusBadge state="default" label={String(activeProviders.length)} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge state="default" label={String(activeProviders.length)} />
+            <button
+              type="button"
+              onClick={() => setCustomDialogOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              <Plus size={13} strokeWidth={2.2} />
+              {t(locale, 'settings.models.add')}
+            </button>
+          </div>
         </div>
         <div className={SETTINGS_PROVIDER_GRID_CLASS}>
           {activeProviders.map((provider) => (
@@ -4731,10 +5358,25 @@ function SpeechGenerationSettingsPanel({ locale }: { locale: Locale }) {
                 saveSpeechGenerationSettings(next);
                 setSettings(next);
               }}
+              onDelete={
+                provider.custom ? () => deleteCustomProvider(provider.id) : undefined
+              }
             />
           ))}
         </div>
       </section>
+      {customDialogOpen && (
+        <CustomGenerationProviderDialog
+          locale={locale}
+          title={t(locale, 'settings.models.addTitle')}
+          modelScope="speech"
+          defaultName={t(locale, 'settings.models.newProviderName')}
+          defaultModel="custom-speech-model"
+          endpointPlaceholder="https://api.example.com/v1/audio/speech"
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomProvider}
+        />
+      )}
     </div>
   );
 }
@@ -4793,11 +5435,13 @@ function SpeechProviderSettingsRow({
   settings,
   locale,
   onChange,
+  onDelete,
 }: {
   provider: SpeechProviderDefinition;
   settings: SpeechGenerationSettings;
   locale: Locale;
   onChange: (settings: SpeechGenerationSettings) => void;
+  onDelete?: () => void;
 }) {
   const [showKey, setShowKey] = useState(false);
   const [modelRefresh, setModelRefresh] = useState<{
@@ -4949,6 +5593,17 @@ function SpeechProviderSettingsRow({
                     ? 'settings.freeChannels.manageKey'
                     : 'settings.freeChannels.getKey',
                 )}
+          </button>
+        )}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            title={t(locale, 'settings.models.delete')}
+            aria-label={t(locale, 'settings.models.delete')}
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} strokeWidth={2.2} />
           </button>
         )}
       </div>
@@ -5410,6 +6065,7 @@ export function ThreeDGenerationSettingsPanel({
     loadThreeDGenerationSettings(),
   );
   const [category, setCategory] = useState<ThreeDProviderCategory>('commercial');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const update = (patch: Partial<ThreeDGenerationSettings>) => {
     const next = { ...settings, ...patch };
@@ -5417,7 +6073,8 @@ export function ThreeDGenerationSettingsPanel({
     setSettings(loadThreeDGenerationSettings());
   };
 
-  const providerOptions = THREE_D_PROVIDERS.map((provider) => ({
+  const providers = threeDProviders(settings);
+  const providerOptions = providers.map((provider) => ({
     id: provider.id,
     label: provider.label,
     hint: `${threeDProviderCategoryLabel(provider.category, locale)} · ${threeDProviderStatusLabel(
@@ -5427,9 +6084,63 @@ export function ThreeDGenerationSettingsPanel({
     )}`,
     group: threeDProviderCategoryLabel(provider.category, locale),
   }));
-  const activeProviders = THREE_D_PROVIDERS.filter(
+  const activeProviders = providers.filter(
     (provider) => provider.category === category,
   );
+
+  const addCustomProvider = (draft: CustomGenerationProviderDraft) => {
+    const id = uniqueCustomId(
+      createCustomThreeDProviderId(draft.name),
+      settings.customProviders.map((provider) => provider.id),
+    );
+    const provider: CustomThreeDProviderDefinition = {
+      id,
+      label: draft.name,
+      category,
+      apiKind: 'generic-3d-api',
+      defaultModel: draft.model,
+      models: draft.models,
+      needsKey: true,
+      local: false,
+      defaultBaseUrl: draft.baseUrl,
+      supportsBaseUrl: true,
+      endpointPlaceholder: draft.baseUrl,
+      keyPlaceholder: 'sk-...',
+      note: '自定义 OpenAI-compatible Mesh 生成渠道。',
+    };
+    const next: ThreeDGenerationSettings = {
+      ...settings,
+      preferredProviderId: id,
+      customProviders: [...settings.customProviders, provider],
+      providerKeys: { ...settings.providerKeys },
+      providerBaseUrls: { ...settings.providerBaseUrls, [id]: draft.baseUrl },
+      providerModels: { ...settings.providerModels, [id]: draft.model },
+    };
+    if (draft.apiKey) next.providerKeys[id] = draft.apiKey;
+    saveThreeDGenerationSettings(next);
+    setSettings(loadThreeDGenerationSettings());
+    setCustomDialogOpen(false);
+  };
+
+  const deleteCustomProvider = (id: ThreeDProviderId) => {
+    const providerKeys = { ...settings.providerKeys };
+    const providerBaseUrls = { ...settings.providerBaseUrls };
+    const providerModels = { ...settings.providerModels };
+    delete providerKeys[id];
+    delete providerBaseUrls[id];
+    delete providerModels[id];
+    const next: ThreeDGenerationSettings = {
+      ...settings,
+      preferredProviderId:
+        settings.preferredProviderId === id ? 'meshy' : settings.preferredProviderId,
+      customProviders: settings.customProviders.filter((provider) => provider.id !== id),
+      providerKeys,
+      providerBaseUrls,
+      providerModels,
+    };
+    saveThreeDGenerationSettings(next);
+    setSettings(loadThreeDGenerationSettings());
+  };
 
   return (
     <div className="space-y-5">
@@ -5511,7 +6222,17 @@ export function ThreeDGenerationSettingsPanel({
               {t(locale, threeDProviderCategoryDescKey(category))}
             </p>
           </div>
-          <StatusBadge state="default" label={String(activeProviders.length)} />
+          <div className="flex shrink-0 items-center gap-2">
+            <StatusBadge state="default" label={String(activeProviders.length)} />
+            <button
+              type="button"
+              onClick={() => setCustomDialogOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              <Plus size={13} strokeWidth={2.2} />
+              {t(locale, 'settings.models.add')}
+            </button>
+          </div>
         </div>
         <div className={SETTINGS_PROVIDER_GRID_CLASS}>
           {activeProviders.map((provider) => (
@@ -5524,10 +6245,25 @@ export function ThreeDGenerationSettingsPanel({
                 saveThreeDGenerationSettings(next);
                 setSettings(loadThreeDGenerationSettings());
               }}
+              onDelete={
+                provider.custom ? () => deleteCustomProvider(provider.id) : undefined
+              }
             />
           ))}
         </div>
       </section>
+      {customDialogOpen && (
+        <CustomGenerationProviderDialog
+          locale={locale}
+          title={t(locale, 'settings.models.addTitle')}
+          modelScope="mesh"
+          defaultName={t(locale, 'settings.models.newProviderName')}
+          defaultModel="custom-3d-model"
+          endpointPlaceholder="https://api.example.com/v1/3d/generations"
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomProvider}
+        />
+      )}
     </div>
   );
 }
@@ -5586,11 +6322,13 @@ function ThreeDProviderSettingsRow({
   settings,
   locale,
   onChange,
+  onDelete,
 }: {
   provider: ThreeDProviderDefinition;
   settings: ThreeDGenerationSettings;
   locale: Locale;
   onChange: (settings: ThreeDGenerationSettings) => void;
+  onDelete?: () => void;
 }) {
   const [showKey, setShowKey] = useState(false);
   const keyProviderId = provider.keyProviderId ?? provider.id;
@@ -5674,7 +6412,18 @@ function ThreeDProviderSettingsRow({
                   ready
                     ? 'settings.freeChannels.manageKey'
                     : 'settings.freeChannels.getKey',
-                )}
+            )}
+          </button>
+        )}
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            title={t(locale, 'settings.models.delete')}
+            aria-label={t(locale, 'settings.models.delete')}
+            className="inline-flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} strokeWidth={2.2} />
           </button>
         )}
       </div>

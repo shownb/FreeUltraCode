@@ -1,4 +1,4 @@
-export type VideoProviderId =
+export type BuiltInVideoProviderId =
   | 'google-veo'
   | 'runway'
   | 'luma-ray'
@@ -22,6 +22,9 @@ export type VideoProviderId =
   | 'local-hunyuan-video'
   | 'local-video-server';
 
+export type CustomVideoProviderId = `custom:${string}`;
+export type VideoProviderId = BuiltInVideoProviderId | CustomVideoProviderId;
+
 export type VideoProviderCategory = 'commercial' | 'free';
 
 type VideoProviderApiKind =
@@ -43,6 +46,8 @@ type VideoProviderApiKind =
   | 'huggingface-inference'
   | 'generic-local-video';
 
+export type CustomVideoProviderApiKind = 'generic-online-video' | 'generic-local-video';
+
 export interface VideoProviderDefinition {
   id: VideoProviderId;
   label: string;
@@ -60,11 +65,31 @@ export interface VideoProviderDefinition {
   keyLabel?: string;
   keyPlaceholder?: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomVideoProviderDefinition {
+  id: CustomVideoProviderId;
+  label: string;
+  category: VideoProviderCategory;
+  apiKind: CustomVideoProviderApiKind;
+  defaultModel: string;
+  models: string[];
+  needsKey: boolean;
+  local: boolean;
+  defaultBaseUrl: string;
+  supportsBaseUrl: true;
+  endpointPlaceholder: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  note: string;
 }
 
 export interface VideoGenerationSettings {
   enabled: boolean;
   preferredProviderId: VideoProviderId;
+  customProviders: CustomVideoProviderDefinition[];
   providerKeys: Partial<Record<VideoProviderId, string>>;
   providerBaseUrls: Partial<Record<VideoProviderId, string>>;
   providerModels: Partial<Record<VideoProviderId, string>>;
@@ -564,6 +589,7 @@ const VIDEO_PROVIDER_BY_ID = new Map<VideoProviderId, VideoProviderDefinition>(
 export const DEFAULT_VIDEO_GENERATION_SETTINGS: VideoGenerationSettings = {
   enabled: true,
   preferredProviderId: 'fal-video',
+  customProviders: [],
   providerKeys: {},
   providerBaseUrls: {},
   providerModels: {},
@@ -573,8 +599,11 @@ function hasStorage(): boolean {
   return typeof window !== 'undefined' && !!window.localStorage;
 }
 
-function isVideoProviderId(value: unknown): value is VideoProviderId {
-  return typeof value === 'string' && VIDEO_PROVIDER_BY_ID.has(value as VideoProviderId);
+function isKnownVideoProviderId(
+  value: unknown,
+  providers: readonly VideoProviderDefinition[],
+): value is VideoProviderId {
+  return typeof value === 'string' && providers.some((provider) => provider.id === value);
 }
 
 function cleanRecord<T extends string>(
@@ -591,23 +620,154 @@ function cleanRecord<T extends string>(
   return out;
 }
 
+function slugifyCustomVideoProviderId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || cryptoRandomVideoId();
+}
+
+function cryptoRandomVideoId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomVideoProviderId(label: string): CustomVideoProviderId {
+  return `custom:${slugifyCustomVideoProviderId(label)}`;
+}
+
+function normalizeVideoModels(value: unknown, fallback: string): string[] {
+  const models = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [fallback, ...models]) {
+    const model = raw.trim();
+    const key = model.toLowerCase();
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    out.push(model);
+  }
+  return out.length > 0 ? out : ['custom-video-model'];
+}
+
+function normalizeCustomVideoProvider(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomVideoProviderDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomVideoProviderDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomVideoProviderId(rawId || label || `provider-${index + 1}`)}`;
+  let id = baseId as CustomVideoProviderId;
+  let suffix = 2;
+  while (usedIds.has(id) || VIDEO_PROVIDER_BY_ID.has(id as VideoProviderId)) {
+    id = `${baseId}-${suffix}` as CustomVideoProviderId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const apiKind: CustomVideoProviderApiKind =
+    source.apiKind === 'generic-local-video' ? 'generic-local-video' : 'generic-online-video';
+  const defaultModel =
+    typeof source.defaultModel === 'string' && source.defaultModel.trim()
+      ? source.defaultModel.trim()
+      : 'custom-video-model';
+  const defaultBaseUrl =
+    typeof source.defaultBaseUrl === 'string' ? source.defaultBaseUrl.trim().replace(/\/+$/, '') : '';
+  const endpointPlaceholder =
+    typeof source.endpointPlaceholder === 'string' && source.endpointPlaceholder.trim()
+      ? source.endpointPlaceholder.trim()
+      : apiKind === 'generic-local-video'
+        ? 'http://127.0.0.1:8000/generate'
+        : 'https://api.example.com/v1/video/generations';
+  return {
+    id,
+    label,
+    category: source.category === 'free' ? 'free' : 'commercial',
+    apiKind,
+    defaultModel,
+    models: normalizeVideoModels(source.models, defaultModel),
+    needsKey: source.needsKey === true,
+    local: source.local === true || apiKind === 'generic-local-video',
+    defaultBaseUrl,
+    supportsBaseUrl: true,
+    endpointPlaceholder,
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : apiKind === 'generic-local-video'
+          ? '自定义本地/自托管视频生成渠道。'
+          : '自定义 OpenAI-compatible 在线视频生成渠道。',
+  };
+}
+
+function normalizeCustomVideoProviders(value: unknown): CustomVideoProviderDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomVideoProvider(item, index, usedIds))
+    .filter((item): item is CustomVideoProviderDefinition => !!item);
+}
+
+export function videoProviders(
+  settings = loadVideoGenerationSettings(),
+): VideoProviderDefinition[] {
+  return [
+    ...VIDEO_PROVIDERS,
+    ...settings.customProviders.map(
+      (provider): VideoProviderDefinition => ({ ...provider, custom: true }),
+    ),
+  ];
+}
+
 export function normalizeVideoGenerationSettings(value: unknown): VideoGenerationSettings {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return DEFAULT_VIDEO_GENERATION_SETTINGS;
   }
   const source = value as Partial<VideoGenerationSettings>;
-  const preferredProviderId = isVideoProviderId(source.preferredProviderId)
+  const customProviders = normalizeCustomVideoProviders(source.customProviders);
+  const providers = [
+    ...VIDEO_PROVIDERS,
+    ...customProviders.map((provider) => ({ ...provider, custom: true })),
+  ];
+  const preferredProviderId = isKnownVideoProviderId(source.preferredProviderId, providers)
     ? source.preferredProviderId
     : DEFAULT_VIDEO_GENERATION_SETTINGS.preferredProviderId;
+  const validKey = (key: unknown): key is VideoProviderId =>
+    isKnownVideoProviderId(key, providers);
   return {
     enabled:
       typeof source.enabled === 'boolean'
         ? source.enabled
         : DEFAULT_VIDEO_GENERATION_SETTINGS.enabled,
     preferredProviderId,
-    providerKeys: cleanRecord(source.providerKeys, isVideoProviderId),
-    providerBaseUrls: cleanRecord(source.providerBaseUrls, isVideoProviderId),
-    providerModels: cleanRecord(source.providerModels, isVideoProviderId),
+    customProviders,
+    providerKeys: cleanRecord(source.providerKeys, validKey),
+    providerBaseUrls: cleanRecord(source.providerBaseUrls, validKey),
+    providerModels: cleanRecord(source.providerModels, validKey),
   };
 }
 
@@ -634,15 +794,18 @@ export function saveVideoGenerationSettings(settings: VideoGenerationSettings): 
   }
 }
 
-export function videoProviderById(id: VideoProviderId): VideoProviderDefinition {
-  return VIDEO_PROVIDER_BY_ID.get(id) ?? VIDEO_PROVIDERS[0];
+export function videoProviderById(
+  id: VideoProviderId,
+  settings = loadVideoGenerationSettings(),
+): VideoProviderDefinition {
+  return videoProviders(settings).find((provider) => provider.id === id) ?? VIDEO_PROVIDERS[0];
 }
 
 export function videoProviderModel(
   providerId: VideoProviderId,
   settings = loadVideoGenerationSettings(),
 ): string {
-  const provider = videoProviderById(providerId);
+  const provider = videoProviderById(providerId, settings);
   return settings.providerModels[providerId]?.trim() || provider.defaultModel;
 }
 
@@ -652,14 +815,14 @@ export function videoProviderBaseUrl(
 ): string {
   const custom = settings.providerBaseUrls[providerId]?.trim();
   if (custom) return custom.replace(/\/+$/, '');
-  return videoProviderById(providerId).defaultBaseUrl.replace(/\/+$/, '');
+  return videoProviderById(providerId, settings).defaultBaseUrl.replace(/\/+$/, '');
 }
 
 function videoProviderKey(
   providerId: VideoProviderId,
   settings = loadVideoGenerationSettings(),
 ): string {
-  const provider = videoProviderById(providerId);
+  const provider = videoProviderById(providerId, settings);
   const keyProviderId = provider.keyProviderId ?? providerId;
   return settings.providerKeys[keyProviderId]?.trim() || settings.providerKeys[providerId]?.trim() || '';
 }
@@ -668,7 +831,7 @@ export function videoProviderReady(
   providerId: VideoProviderId,
   settings = loadVideoGenerationSettings(),
 ): boolean {
-  const provider = videoProviderById(providerId);
+  const provider = videoProviderById(providerId, settings);
   if (provider.needsKey && !videoProviderKey(providerId, settings)) return false;
   if (provider.local && !settings.providerBaseUrls[providerId]?.trim()) return false;
   return !!videoProviderBaseUrl(providerId, settings);
@@ -677,9 +840,9 @@ export function videoProviderReady(
 export function configuredVideoProviderIds(
   settings = loadVideoGenerationSettings(),
 ): VideoProviderId[] {
-  return VIDEO_PROVIDERS.filter((provider) => videoProviderReady(provider.id, settings)).map(
-    (provider) => provider.id,
-  );
+  return videoProviders(settings)
+    .filter((provider) => videoProviderReady(provider.id, settings))
+    .map((provider) => provider.id);
 }
 
 export function preferredReadyVideoProviderId(
@@ -745,7 +908,7 @@ export async function generateVideo(
   if (!videoProviderReady(providerId, settings)) {
     throw new Error(`VIDEO_PROVIDER_NOT_READY:${providerId}`);
   }
-  const provider = videoProviderById(providerId);
+  const provider = videoProviderById(providerId, settings);
   const prompt = stripVideoCommand(request.prompt);
   const model = request.model?.trim() || videoProviderModel(providerId, settings);
   const targetDurationSeconds =
@@ -779,7 +942,7 @@ async function generateWithProvider(
   targetDurationSeconds: number,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  switch (videoProviderById(providerId).apiKind) {
+  switch (videoProviderById(providerId, settings).apiKind) {
     case 'google-veo':
       return generateGoogleVeo(prompt, model, settings, targetDurationSeconds, signal);
     case 'runway':
@@ -1117,7 +1280,7 @@ async function generateGenericOnlineVideo(
   targetDurationSeconds: number,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = videoProviderById(providerId);
+  const provider = videoProviderById(providerId, settings);
   const apiKey = videoProviderKey(providerId, settings);
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const headers: Record<string, string> = {
@@ -1300,14 +1463,14 @@ async function generateGenericLocalVideo(
     body: JSON.stringify(videoRequestBody(prompt, model, targetDurationSeconds)),
     signal,
   });
-  const started = await readResponseJsonOrVideos(response, videoProviderById(providerId).label);
+  const started = await readResponseJsonOrVideos(response, videoProviderById(providerId, settings).label);
   const immediate = videosFromJson(started);
   if (immediate.length > 0 && isTerminalSuccess(started)) return immediate;
   const statusUrl = statusUrlFromUnknown(started);
   const taskId = taskIdFromJson(started);
   if (!statusUrl && !taskId) {
     if (immediate.length > 0) return immediate;
-    throw new Error(`${videoProviderById(providerId).label} returned no video.`);
+    throw new Error(`${videoProviderById(providerId, settings).label} returned no video.`);
   }
   const done = await pollJson(
     () =>
@@ -1318,12 +1481,12 @@ async function generateGenericLocalVideo(
           )}`,
         { signal },
       ),
-    videoProviderById(providerId).label,
+    videoProviderById(providerId, settings).label,
     signal,
   );
   const videos = videosFromJson(done);
   if (videos.length > 0) return videos;
-  throw new Error(`${videoProviderById(providerId).label} returned no video.`);
+  throw new Error(`${videoProviderById(providerId, settings).label} returned no video.`);
 }
 
 function videoRequestBody(

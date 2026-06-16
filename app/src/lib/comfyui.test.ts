@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import {
   parseComfyGraph,
   stringifyComfyGraph,
@@ -8,7 +8,11 @@ import {
   comfyBaseUrl,
   comfyApiKey,
   comfyAuthHeaders,
+  validateComfyGraph,
+  randomizeSeeds,
+  runComfyGraph,
   type ComfyPromptGraph,
+  type ComfyObjectInfoSummary,
 } from './comfyui';
 import {
   saveImageGenerationSettings,
@@ -95,6 +99,7 @@ describe('loadComfyUiSettings', () => {
 
 describe('comfyBaseUrl (shared image channel)', () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     window.localStorage.clear();
   });
 
@@ -135,5 +140,131 @@ describe('comfyBaseUrl (shared image channel)', () => {
 
   it('emits no auth header when no key is set', () => {
     expect(comfyAuthHeaders('')).toEqual({});
+  });
+
+  it('sends an explicit API key when running a custom ComfyUI endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/prompt')) {
+        return new Response(JSON.stringify({ prompt_id: 'p1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          p1: {
+            status: { completed: true },
+            outputs: {
+              '3': {
+                images: [{ filename: 'out.png', subfolder: '', type: 'output' }],
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      );
+    });
+
+    await runComfyGraph(SAMPLE, {
+      baseUrl: 'https://custom-comfy.example.com',
+      apiKey: 'custom-key',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://custom-comfy.example.com/prompt',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer custom-key',
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://custom-comfy.example.com/history/p1',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer custom-key',
+        }),
+      }),
+    );
+  });
+});
+
+describe('validateComfyGraph', () => {
+  const info: ComfyObjectInfoSummary = {
+    classTypes: ['CheckpointLoaderSimple', 'CLIPTextEncode', 'SaveImage'],
+    schemas: {
+      CheckpointLoaderSimple: {
+        classType: 'CheckpointLoaderSimple',
+        displayName: 'Load Checkpoint',
+        required: { ckpt_name: { type: 'COMBO', options: ['sd_xl.safetensors'] } },
+        optional: {},
+        outputs: ['MODEL', 'CLIP', 'VAE'],
+      },
+      CLIPTextEncode: {
+        classType: 'CLIPTextEncode',
+        displayName: 'CLIP Text Encode',
+        required: { text: { type: 'STRING' }, clip: { type: 'LINK' } },
+        optional: {},
+        outputs: ['CONDITIONING'],
+      },
+      SaveImage: {
+        classType: 'SaveImage',
+        displayName: 'Save Image',
+        required: { images: { type: 'LINK' } },
+        optional: {},
+        outputs: [],
+      },
+    },
+  };
+
+  it('passes a well-formed graph', () => {
+    expect(validateComfyGraph(SAMPLE, info)).toEqual([]);
+  });
+
+  it('flags an unknown node type', () => {
+    const bad: ComfyPromptGraph = {
+      '1': { class_type: 'NotARealNode', inputs: {} },
+    };
+    const problems = validateComfyGraph(bad, info);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('NotARealNode');
+  });
+
+  it('flags a missing required input', () => {
+    const bad: ComfyPromptGraph = {
+      '1': { class_type: 'CheckpointLoaderSimple', inputs: {} },
+    };
+    const problems = validateComfyGraph(bad, info);
+    expect(problems.some((p) => p.includes('ckpt_name'))).toBe(true);
+  });
+
+  it('flags a dangling link to a missing source node', () => {
+    const bad: ComfyPromptGraph = {
+      '3': { class_type: 'SaveImage', inputs: { images: ['99', 0] } },
+    };
+    const problems = validateComfyGraph(bad, info);
+    expect(problems.some((p) => p.includes('99'))).toBe(true);
+  });
+});
+
+describe('randomizeSeeds', () => {
+  it('rerolls numeric seed inputs without mutating the source', () => {
+    const graph: ComfyPromptGraph = {
+      '3': {
+        class_type: 'KSampler',
+        inputs: { seed: 42, noise_seed: 7, steps: 20, model: ['1', 0] },
+      },
+    };
+    const next = randomizeSeeds(graph);
+    expect(graph['3'].inputs.seed).toBe(42);
+    expect(next['3'].inputs.seed).not.toBe(42);
+    expect(next['3'].inputs.noise_seed).not.toBe(7);
+    expect(next['3'].inputs.steps).toBe(20);
+    // Links are preserved untouched.
+    expect(next['3'].inputs.model).toEqual(['1', 0]);
   });
 });

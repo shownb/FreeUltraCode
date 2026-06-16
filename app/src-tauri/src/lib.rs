@@ -4580,6 +4580,204 @@ async fn unity_mcp_setup_project(
         .map_err(|e| format!("Unity MCP 配置任务失败: {e}"))?
 }
 
+// ===== Blueprint Mode plugin one-click install =====
+
+const BLUEPRINT_MODE_DEFAULT_SOURCE: &str = "E:/ue-blueprint-mode";
+const BLUEPRINT_MODE_PLUGIN_DIRNAME: &str = "BlueprintMode";
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueprintModeInstallRequest {
+    /// UE project root (the folder that contains the .uproject file).
+    root_path: String,
+    /// Optional source plugin directory; defaults to the local checkout.
+    source_dir: Option<String>,
+    /// Optional explicit target directory; defaults to <project>/Plugins/<name>.
+    target_dir: Option<String>,
+    /// Overwrite an existing install when true.
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueprintModeInstallResult {
+    ok: bool,
+    /// Source directory that was copied from.
+    source_dir: String,
+    /// Resolved install destination.
+    target_dir: String,
+    /// Number of files copied.
+    files_copied: usize,
+    /// True when an existing install was replaced.
+    replaced_existing: bool,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+    error: Option<String>,
+}
+
+fn blueprint_mode_validate_source(source: &Path) -> Result<(), String> {
+    if !source.is_dir() {
+        return Err(format!(
+            "插件源目录不存在：{}",
+            source.to_string_lossy()
+        ));
+    }
+    let has_uplugin = std::fs::read_dir(source)
+        .map_err(|e| format!("读取源目录失败：{e}"))?
+        .flatten()
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| ext.eq_ignore_ascii_case("uplugin"))
+                .unwrap_or(false)
+        });
+    if !has_uplugin {
+        return Err(format!(
+            "源目录不是合法的 UE 插件（缺少 .uplugin）：{}",
+            source.to_string_lossy()
+        ));
+    }
+    Ok(())
+}
+
+fn blueprint_mode_copy_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+    let mut copied = 0usize;
+    std::fs::create_dir_all(dst).map_err(|e| {
+        format!("创建目录失败 {}：{e}", dst.to_string_lossy())
+    })?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| format!("读取目录失败 {}：{e}", src.to_string_lossy()))?
+    {
+        let entry = entry.map_err(|e| format!("枚举目录项失败：{e}"))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let target = dst.join(&file_name);
+        if path.is_dir() {
+            copied += blueprint_mode_copy_dir(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target).map_err(|e| {
+                format!(
+                    "复制文件失败 {} -> {}：{e}",
+                    path.to_string_lossy(),
+                    target.to_string_lossy()
+                )
+            })?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn blueprint_mode_install_blocking(
+    req: BlueprintModeInstallRequest,
+) -> Result<BlueprintModeInstallResult, String> {
+    let mut notes = Vec::new();
+    let mut warnings = Vec::new();
+
+    let root = project_scan_root(&req.root_path)?;
+    let engine = detect_project_engine(&root);
+    if engine.engine != "unreal" {
+        return Ok(BlueprintModeInstallResult {
+            ok: false,
+            source_dir: String::new(),
+            target_dir: String::new(),
+            files_copied: 0,
+            replaced_existing: false,
+            notes,
+            warnings,
+            error: Some("当前工作区不是 Unreal Engine 工程（未找到 .uproject）。".to_string()),
+        });
+    }
+
+    let source = req
+        .source_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BLUEPRINT_MODE_DEFAULT_SOURCE));
+    let source = std::fs::canonicalize(&source).unwrap_or(source);
+    blueprint_mode_validate_source(&source)?;
+
+    // Default target: <project>/Plugins/<source leaf name>.
+    let leaf = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| BLUEPRINT_MODE_PLUGIN_DIRNAME.to_string());
+    let target = req
+        .target_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("Plugins").join(&leaf));
+
+    // Guard against source == target.
+    if let (Ok(s), Ok(t)) = (
+        std::fs::canonicalize(&source),
+        std::fs::canonicalize(target.parent().unwrap_or(&target)),
+    ) {
+        if t.join(&leaf) == s {
+            return Err("安装目标与源目录相同，已取消。".to_string());
+        }
+    }
+
+    let overwrite = req.overwrite.unwrap_or(false);
+    let mut replaced_existing = false;
+    if target.exists() {
+        if !overwrite {
+            return Ok(BlueprintModeInstallResult {
+                ok: false,
+                source_dir: source.to_string_lossy().to_string(),
+                target_dir: target.to_string_lossy().to_string(),
+                files_copied: 0,
+                replaced_existing: false,
+                notes,
+                warnings,
+                error: Some(format!(
+                    "目标已存在：{}。勾选覆盖后再安装。",
+                    target.to_string_lossy()
+                )),
+            });
+        }
+        std::fs::remove_dir_all(&target).map_err(|e| {
+            format!("删除旧版本失败 {}：{e}", target.to_string_lossy())
+        })?;
+        replaced_existing = true;
+        notes.push("已删除旧版本插件目录。".to_string());
+    }
+
+    let files_copied = blueprint_mode_copy_dir(&source, &target)?;
+    notes.push(format!(
+        "已复制 {files_copied} 个文件到 {}。",
+        target.to_string_lossy()
+    ));
+    notes.push("请重启 Unreal Editor 以加载插件。".to_string());
+    warnings.push("插件首次启用需在 UE 中编译（Editor 模块）。".to_string());
+
+    Ok(BlueprintModeInstallResult {
+        ok: true,
+        source_dir: source.to_string_lossy().to_string(),
+        target_dir: target.to_string_lossy().to_string(),
+        files_copied,
+        replaced_existing,
+        notes,
+        warnings,
+        error: None,
+    })
+}
+
+#[tauri::command]
+async fn blueprint_mode_install(
+    request: BlueprintModeInstallRequest,
+) -> Result<BlueprintModeInstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || blueprint_mode_install_blocking(request))
+        .await
+        .map_err(|e| format!("蓝图插件安装任务失败：{e}"))?
+}
+
 // ===== Godot / Cocos MCP one-click project setup =====
 
 const GODOT_MCP_SERVER_ID: &str = "godot-mcp";
@@ -11582,6 +11780,17 @@ fn encode_tool_patch(patch: &serde_json::Value) -> String {
     format!("\n<<FUC_TOOL>>{}<<FUC_TOOL_END>>\n", payload)
 }
 
+fn encode_running_status_patch(run_id: &str, elapsed_secs: u64) -> String {
+    let patch = serde_json::json!({
+        "id": format!("runtime-status-{run_id}"),
+        "name": "运行状态",
+        "subject": format!("仍在运行…（已 {elapsed_secs}s）"),
+        "status": "running",
+        "ephemeral": true,
+    });
+    encode_tool_patch(&patch)
+}
+
 /// Cap a tool result body so a huge file read doesn't bloat the message text.
 const TOOL_RESULT_CLAMP: usize = 4000;
 
@@ -12853,7 +13062,7 @@ async fn ai_cli(
                             && now.duration_since(last_heartbeat) >= beat
                         {
                             let total = run_started_at.elapsed().as_secs();
-                            emit_progress(&app, &run_id, &format!("\n⏳ 仍在运行…（已 {total}s）\n"));
+                            emit_progress(&app, &run_id, &encode_running_status_patch(&run_id, total));
                             last_heartbeat = now;
                         }
                     }
@@ -14416,6 +14625,7 @@ pub fn run() {
             project_lsp_probe,
             project_lsp_install,
             unity_mcp_setup_project,
+            blueprint_mode_install,
             godot_mcp_setup_project,
             cocos_mcp_setup_project,
             ue_mcp_ensure_binary,

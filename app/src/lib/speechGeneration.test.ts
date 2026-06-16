@@ -2,12 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_SPEECH_GENERATION_SETTINGS,
   SPEECH_PROVIDERS,
+  createCustomSpeechProviderId,
   generateSpeech,
   looksLikeSpeechGenerationRequest,
   normalizeSpeechGenerationSettings,
   preferredReadySpeechProviderId,
   speechProviderBaseUrl,
   speechProviderById,
+  speechProviders,
   speechProviderReady,
   speechProviderVoice,
   stripSpeechCommand,
@@ -212,6 +214,42 @@ describe('speech generation settings and routing', () => {
     expect(speechProviderById('elevenlabs').label).toContain('ElevenLabs');
     expect(speechProviderBaseUrl('openai-tts', DEFAULT_SPEECH_GENERATION_SETTINGS)).toBe(
       'https://api.openai.com/v1',
+    );
+  });
+});
+describe('custom speech providers', () => {
+  it('normalizes a custom channel with default voice and model', () => {
+    const id = createCustomSpeechProviderId('My TTS');
+    const settings = normalizeSpeechGenerationSettings({
+      ...DEFAULT_SPEECH_GENERATION_SETTINGS,
+      customProviders: [
+        {
+          id,
+          label: 'My TTS',
+          category: 'free',
+          apiKind: 'generic-online-speech',
+          defaultModel: 'tts-model',
+          models: ['tts-model'],
+          defaultVoice: 'alloy',
+          voices: ['alloy', 'echo'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://api.example.com/v1/audio/speech',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'x',
+          note: 'custom',
+        },
+      ],
+    });
+    expect(settings.customProviders).toHaveLength(1);
+    expect(speechProviders(settings).some((p) => p.id === id)).toBe(true);
+    expect(speechProviderById(id, settings).label).toBe('My TTS');
+    expect(speechProviderVoice(id, settings)).toBe('alloy');
+    expect(speechProviderReady(id, settings)).toBe(false);
+    const withKey = { ...settings, providerKeys: { [id]: 'sk-test' } };
+    expect(speechProviderReady(id, withKey)).toBe(true);
+    expect(speechProviderBaseUrl(id, withKey)).toBe(
+      'https://api.example.com/v1/audio/speech',
     );
   });
 });

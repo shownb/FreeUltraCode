@@ -14,6 +14,7 @@ import {
   previewLocalFile,
   type LocalFilePreview,
 } from '@/lib/tauri';
+import { createObjectUrlFromBase64, revokeObjectUrl } from '@/lib/objectUrl';
 import { useResizableWidth } from '@/lib/useResizableWidth';
 import {
   displayFileRefPath,
@@ -235,6 +236,48 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function useBase64ObjectUrl(
+  base64: string | null | undefined,
+  mime: string | null | undefined,
+): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setUrl(null);
+    if (!base64 || !mime) return;
+
+    let disposed = false;
+    let createdUrl: string | null = null;
+    let timer: number | null = null;
+
+    const createUrl = async () => {
+      try {
+        const nextUrl = await createObjectUrlFromBase64(base64, mime);
+        if (disposed) {
+          revokeObjectUrl(nextUrl);
+          return;
+        }
+        createdUrl = nextUrl;
+        setUrl(createdUrl);
+      } catch {
+        if (!disposed) setUrl(`data:${mime};base64,${base64}`);
+      }
+    };
+
+    timer = window.setTimeout(() => {
+      void createUrl();
+    }, 0);
+
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+      revokeObjectUrl(createdUrl);
+    };
+  }, [base64, mime]);
+
+  return url;
+}
+
 export default function FilePreviewDrawer({
   refData,
   cwd,
@@ -283,6 +326,10 @@ export default function FilePreviewDrawer({
   }, [onClose, refData]);
 
   const file = state.status === 'ready' ? state.file : null;
+  const imageUrl = useBase64ObjectUrl(
+    file?.kind === 'image' ? file.base64 : null,
+    file?.kind === 'image' ? file.mime : null,
+  );
   const label = file?.fileName ?? refData?.basename ?? '文件预览';
   const path = file?.path ?? (refData ? displayFileRefPath(refData, cwd) : '');
   const lineSuffix = refData?.startLine
@@ -301,12 +348,6 @@ export default function FilePreviewDrawer({
 
   return (
     <div className="fixed inset-0 z-50 pointer-events-none">
-      <button
-        type="button"
-        aria-label="关闭文件预览"
-        onClick={onClose}
-        className="pointer-events-auto absolute inset-0 bg-bg/45 backdrop-blur-[1px]"
-      />
       <aside
         className="pointer-events-auto absolute bottom-0 right-0 top-0 flex flex-col border-l border-border bg-panel shadow-2xl"
         style={{ width }}
@@ -385,11 +426,18 @@ export default function FilePreviewDrawer({
               {file.mime} · {formatBytes(file.sizeBytes)}
             </div>
             <div className="min-h-0 flex-1 overflow-auto bg-bg p-4">
-              <img
-                src={`data:${file.mime};base64,${file.base64}`}
-                alt={file.fileName}
-                className="mx-auto max-h-full max-w-full object-contain"
-              />
+              {imageUrl ? (
+                <img
+                  src={imageUrl}
+                  alt={file.fileName}
+                  className="mx-auto max-h-full max-w-full object-contain"
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-fg-dim">
+                  <Loader2 size={16} className="animate-spin text-accent" />
+                  解码中
+                </div>
+              )}
             </div>
           </div>
         )}

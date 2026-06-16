@@ -7,6 +7,7 @@ import {
   imageProviderById,
   imageProviderReady,
   imageProviderSupportsComfyUiGraph,
+  imageProviders,
   looksLikeImageGenerationRequest,
   normalizeImageGenerationSettings,
   preferredReadyImageProviderId,
@@ -67,6 +68,38 @@ describe('image generation settings and routing', () => {
     expect(settings.preferredProviderId).toBe('pollinations');
     expect(settings.providerKeys.pollinations).toBe('token');
     expect(settings.providerModels.pollinations).toBe('flux');
+  });
+
+  it('normalizes custom image providers and keeps them selectable', () => {
+    const settings = normalizeImageGenerationSettings({
+      preferredProviderId: 'custom:my-router',
+      customProviders: [
+        {
+          id: 'custom:my-router',
+          label: 'My Router',
+          category: 'commercial',
+          apiKind: 'openai-images',
+          defaultModel: 'router-image',
+          models: ['router-image', 'router-image-fast'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://images.example.com/v1/',
+          supportsBaseUrl: true,
+          endpointPlaceholder: '',
+          note: 'Custom OpenAI-compatible route.',
+        },
+      ],
+      providerKeys: { 'custom:my-router': ' key ', unknown: 'x' },
+      providerModels: { 'custom:my-router': ' router-image-fast ' },
+    });
+
+    expect(settings.preferredProviderId).toBe('custom:my-router');
+    expect(settings.customProviders).toHaveLength(1);
+    expect(settings.providerKeys['custom:my-router']).toBe('key');
+    expect(imageProviders(settings).some((provider) => provider.id === 'custom:my-router')).toBe(true);
+    expect(imageProviderById('custom:my-router', settings).label).toBe('My Router');
+    expect(imageProviderBaseUrl('custom:my-router', settings)).toBe('https://images.example.com/v1');
+    expect(imageProviderReady('custom:my-router', settings)).toBe(true);
   });
 
   it('does not route anonymous fallback traffic to Pollinations', () => {
@@ -216,6 +249,64 @@ describe('image generation settings and routing', () => {
     expect(result.images).toEqual(['https://example.com/recraft.png']);
     expect(fetchMock).toHaveBeenCalledWith(
       'https://external.api.recraft.ai/v1/images/generations',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer test-key',
+          'Content-Type': 'application/json',
+        }),
+      }),
+    );
+  });
+
+  it('calls custom OpenAI-compatible image providers', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [{ url: 'https://example.com/custom.png' }],
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+    const settings = normalizeImageGenerationSettings({
+      enabled: true,
+      preferredProviderId: 'custom:my-router',
+      customProviders: [
+        {
+          id: 'custom:my-router',
+          label: 'My Router',
+          category: 'commercial',
+          apiKind: 'openai-images',
+          defaultModel: 'router-image',
+          models: ['router-image'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://images.example.com/v1',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'https://images.example.com/v1',
+          note: 'Custom OpenAI-compatible route.',
+        },
+      ],
+      providerKeys: { 'custom:my-router': 'test-key' },
+      providerAccountIds: {},
+      providerBaseUrls: {},
+      providerModels: {},
+    });
+
+    const result = await generateImage(
+      {
+        prompt: '/image brand icon',
+      },
+      settings,
+    );
+
+    expect(result.providerId).toBe('custom:my-router');
+    expect(result.images).toEqual(['https://example.com/custom.png']);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://images.example.com/v1/images/generations',
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({

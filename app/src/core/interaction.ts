@@ -200,8 +200,32 @@ export function liveProse(text: string): string {
   if (ask !== -1) cuts.push(ask);
   const fence = text.indexOf('```');
   if (fence !== -1) cuts.push(fence);
-  if (cuts.length === 0) return text;
-  return text.slice(0, Math.min(...cuts)).trimEnd();
+  const visible = cuts.length === 0 ? text : text.slice(0, Math.min(...cuts)).trimEnd();
+  return compactRuntimeHeartbeatLines(visible);
+}
+
+const RUNTIME_HEARTBEAT_LINE_RE =
+  /^\s*(?:⏳\s*)?仍在运行[.…。]*(?:[（(]已\s*\d+\s*s[）)])?\s*$/u;
+
+/** Keep only a tail-position runtime heartbeat; drop stale "still running" lines. */
+export function compactRuntimeHeartbeatLines(text: string): string {
+  if (!text.includes('仍在运行')) return text;
+  const lines = text.split(/\r?\n/u);
+  const heartbeatIndexes: number[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (RUNTIME_HEARTBEAT_LINE_RE.test(lines[i])) heartbeatIndexes.push(i);
+  }
+  if (heartbeatIndexes.length === 0) return text;
+
+  const lastHeartbeat = heartbeatIndexes[heartbeatIndexes.length - 1];
+  const keepLast =
+    lines.slice(lastHeartbeat + 1).every((line) => line.trim().length === 0);
+  const drop = new Set(
+    keepLast
+      ? heartbeatIndexes.slice(0, -1)
+      : heartbeatIndexes,
+  );
+  return lines.filter((_, index) => !drop.has(index)).join('\n');
 }
 
 /** Human-readable one-line summary of an answer (for the answered widget). */

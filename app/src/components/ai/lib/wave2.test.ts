@@ -151,6 +151,94 @@ describe('segmentMessage tool segments', () => {
     expect(segs.filter((s) => s.type === 'tools')).toHaveLength(1);
   });
 
+  it('collapses repeated runtime heartbeat patches into one running status card', () => {
+    const text =
+      encodeToolPatch({
+        id: 'runtime-status-run1',
+        name: '运行状态',
+        subject: '仍在运行…（已 12s）',
+        status: 'running',
+        ephemeral: true,
+      }) +
+      encodeToolPatch({
+        id: 'runtime-status-run1',
+        name: '运行状态',
+        subject: '仍在运行…（已 24s）',
+        status: 'running',
+        ephemeral: true,
+      });
+    const segs = segmentMessage(text, true);
+    const tools = segs.filter((s) => s.type === 'tools');
+    expect(tools).toHaveLength(1);
+    if (tools[0].type === 'tools') {
+      expect(tools[0].events).toHaveLength(1);
+      expect(tools[0].events[0]).toMatchObject({
+        id: 'runtime-status-run1',
+        subject: '仍在运行…（已 24s）',
+        status: 'running',
+        ephemeral: true,
+      });
+    }
+  });
+
+  it('drops a stale runtime heartbeat once newer prose arrives', () => {
+    const text =
+      encodeToolPatch({
+        id: 'runtime-status-run1',
+        name: '运行状态',
+        subject: '仍在运行…（已 12s）',
+        status: 'running',
+        ephemeral: true,
+      }) +
+      '结论：已经完成。';
+    const segs = segmentMessage(text, true);
+    expect(segs).toEqual([{ type: 'answer', text: '结论：已经完成。' }]);
+  });
+
+  it('moves runtime heartbeat display to the latest tail heartbeat', () => {
+    const text =
+      encodeToolPatch({
+        id: 'runtime-status-run1',
+        name: '运行状态',
+        subject: '仍在运行…（已 12s）',
+        status: 'running',
+        ephemeral: true,
+      }) +
+      '已读取配置。' +
+      encodeToolPatch({
+        id: 'runtime-status-run1',
+        name: '运行状态',
+        subject: '仍在运行…（已 24s）',
+        status: 'running',
+        ephemeral: true,
+      });
+    const segs = segmentMessage(text, true);
+    expect(segs.map((s) => s.type)).toEqual(['answer', 'tools']);
+    expect(segs[0]).toEqual({ type: 'answer', text: '已读取配置。' });
+    if (segs[1].type === 'tools') {
+      expect(segs[1].events).toHaveLength(1);
+      expect(segs[1].events[0]).toMatchObject({
+        id: 'runtime-status-run1',
+        subject: '仍在运行…（已 24s）',
+        ephemeral: true,
+      });
+    }
+  });
+
+  it('keeps only the final tail heartbeat for legacy text heartbeats', () => {
+    expect(
+      segmentMessage(
+        '⏳ 仍在运行…（已 12s）\n已读取配置。\n⏳ 仍在运行…（已 24s）',
+        true,
+      ),
+    ).toEqual([
+      { type: 'answer', text: '已读取配置。\n⏳ 仍在运行…（已 24s）' },
+    ]);
+    expect(
+      segmentMessage('⏳ 仍在运行…（已 12s）\n结论：已经完成。', true),
+    ).toEqual([{ type: 'answer', text: '结论：已经完成。' }]);
+  });
+
   it('keeps a done status when a late running patch arrives (monotonic)', () => {
     const merged = mergeToolPatches([
       { id: 'a', name: 'X', status: 'done', durationMs: 5 },

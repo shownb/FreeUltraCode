@@ -1,4 +1,4 @@
-export type SpeechProviderId =
+export type BuiltInSpeechProviderId =
   | 'elevenlabs'
   | 'openai-tts'
   | 'google-gemini-tts'
@@ -29,6 +29,9 @@ export type SpeechProviderId =
   | 'local-openai-speech'
   | 'local-speech-server';
 
+export type CustomSpeechProviderId = `custom:${string}`;
+export type SpeechProviderId = BuiltInSpeechProviderId | CustomSpeechProviderId;
+
 export type SpeechProviderCategory = 'commercial' | 'free';
 
 type SpeechProviderApiKind =
@@ -45,6 +48,8 @@ type SpeechProviderApiKind =
   | 'fal-ai'
   | 'huggingface-inference'
   | 'generic-local-speech';
+
+export type CustomSpeechProviderApiKind = 'generic-online-speech' | 'generic-local-speech';
 export interface SpeechProviderDefinition {
   id: SpeechProviderId;
   label: string;
@@ -67,11 +72,33 @@ export interface SpeechProviderDefinition {
   accountIdLabel?: string;
   accountIdPlaceholder?: string;
   note: string;
+  custom?: boolean;
+}
+
+export interface CustomSpeechProviderDefinition {
+  id: CustomSpeechProviderId;
+  label: string;
+  category: SpeechProviderCategory;
+  apiKind: CustomSpeechProviderApiKind;
+  defaultModel: string;
+  models: string[];
+  defaultVoice: string;
+  voices: string[];
+  needsKey: boolean;
+  local: boolean;
+  defaultBaseUrl: string;
+  supportsBaseUrl: true;
+  endpointPlaceholder: string;
+  credentialUrl?: string;
+  keyLabel?: string;
+  keyPlaceholder?: string;
+  note: string;
 }
 
 export interface SpeechGenerationSettings {
   enabled: boolean;
   preferredProviderId: SpeechProviderId;
+  customProviders: CustomSpeechProviderDefinition[];
   providerKeys: Partial<Record<SpeechProviderId, string>>;
   providerAccountIds: Partial<Record<SpeechProviderId, string>>;
   providerBaseUrls: Partial<Record<SpeechProviderId, string>>;
@@ -681,6 +708,7 @@ const SPEECH_PROVIDER_BY_ID = new Map<SpeechProviderId, SpeechProviderDefinition
 export const DEFAULT_SPEECH_GENERATION_SETTINGS: SpeechGenerationSettings = {
   enabled: true,
   preferredProviderId: 'openai-tts',
+  customProviders: [],
   providerKeys: {},
   providerAccountIds: {},
   providerBaseUrls: {},
@@ -692,8 +720,140 @@ function hasStorage(): boolean {
   return typeof window !== 'undefined' && !!window.localStorage;
 }
 
-function isSpeechProviderId(value: unknown): value is SpeechProviderId {
-  return typeof value === 'string' && SPEECH_PROVIDER_BY_ID.has(value as SpeechProviderId);
+function isKnownSpeechProviderId(
+  value: unknown,
+  providers: readonly SpeechProviderDefinition[],
+): value is SpeechProviderId {
+  return typeof value === 'string' && providers.some((provider) => provider.id === value);
+}
+
+function slugifyCustomSpeechProviderId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || cryptoRandomSpeechId();
+}
+
+function cryptoRandomSpeechId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function createCustomSpeechProviderId(label: string): CustomSpeechProviderId {
+  return `custom:${slugifyCustomSpeechProviderId(label)}`;
+}
+
+function normalizeSpeechStringList(value: unknown, fallback: string): string[] {
+  const items = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [fallback, ...items]) {
+    const item = raw.trim();
+    const key = item.toLowerCase();
+    if (!item || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function normalizeCustomSpeechProvider(
+  value: unknown,
+  index: number,
+  usedIds: Set<string>,
+): CustomSpeechProviderDefinition | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CustomSpeechProviderDefinition>;
+  const label = typeof source.label === 'string' ? source.label.trim() : '';
+  if (!label) return null;
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const baseId = rawId.startsWith('custom:')
+    ? rawId
+    : `custom:${slugifyCustomSpeechProviderId(rawId || label || `provider-${index + 1}`)}`;
+  let id = baseId as CustomSpeechProviderId;
+  let suffix = 2;
+  while (usedIds.has(id) || SPEECH_PROVIDER_BY_ID.has(id as SpeechProviderId)) {
+    id = `${baseId}-${suffix}` as CustomSpeechProviderId;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  const apiKind: CustomSpeechProviderApiKind =
+    source.apiKind === 'generic-local-speech' ? 'generic-local-speech' : 'generic-online-speech';
+  const defaultModel =
+    typeof source.defaultModel === 'string' && source.defaultModel.trim()
+      ? source.defaultModel.trim()
+      : 'custom-tts-model';
+  const defaultVoice =
+    typeof source.defaultVoice === 'string' && source.defaultVoice.trim()
+      ? source.defaultVoice.trim()
+      : 'default';
+  const defaultBaseUrl =
+    typeof source.defaultBaseUrl === 'string' ? source.defaultBaseUrl.trim().replace(/\/+$/, '') : '';
+  const endpointPlaceholder =
+    typeof source.endpointPlaceholder === 'string' && source.endpointPlaceholder.trim()
+      ? source.endpointPlaceholder.trim()
+      : apiKind === 'generic-local-speech'
+        ? 'http://127.0.0.1:8000/tts'
+        : 'https://api.example.com/v1/audio/speech';
+  return {
+    id,
+    label,
+    category: source.category === 'free' ? 'free' : 'commercial',
+    apiKind,
+    defaultModel,
+    models: normalizeSpeechStringList(source.models, defaultModel),
+    defaultVoice,
+    voices: normalizeSpeechStringList(source.voices, defaultVoice),
+    needsKey: source.needsKey === true,
+    local: source.local === true || apiKind === 'generic-local-speech',
+    defaultBaseUrl,
+    supportsBaseUrl: true,
+    endpointPlaceholder,
+    credentialUrl:
+      typeof source.credentialUrl === 'string' && source.credentialUrl.trim()
+        ? source.credentialUrl.trim()
+        : undefined,
+    keyLabel:
+      typeof source.keyLabel === 'string' && source.keyLabel.trim()
+        ? source.keyLabel.trim()
+        : undefined,
+    keyPlaceholder:
+      typeof source.keyPlaceholder === 'string' && source.keyPlaceholder.trim()
+        ? source.keyPlaceholder.trim()
+        : undefined,
+    note:
+      typeof source.note === 'string' && source.note.trim()
+        ? source.note.trim()
+        : apiKind === 'generic-local-speech'
+          ? '自定义本地/自托管语音合成渠道。'
+          : '自定义 OpenAI-compatible 在线语音合成渠道。',
+  };
+}
+
+function normalizeCustomSpeechProviders(value: unknown): CustomSpeechProviderDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => normalizeCustomSpeechProvider(item, index, usedIds))
+    .filter((item): item is CustomSpeechProviderDefinition => !!item);
+}
+
+export function speechProviders(
+  settings = loadSpeechGenerationSettings(),
+): SpeechProviderDefinition[] {
+  return [
+    ...SPEECH_PROVIDERS,
+    ...settings.customProviders.map(
+      (provider): SpeechProviderDefinition => ({ ...provider, custom: true }),
+    ),
+  ];
 }
 
 function cleanRecord<T extends string>(
@@ -715,20 +875,28 @@ export function normalizeSpeechGenerationSettings(value: unknown): SpeechGenerat
     return DEFAULT_SPEECH_GENERATION_SETTINGS;
   }
   const source = value as Partial<SpeechGenerationSettings>;
-  const preferredProviderId = isSpeechProviderId(source.preferredProviderId)
+  const customProviders = normalizeCustomSpeechProviders(source.customProviders);
+  const providers = [
+    ...SPEECH_PROVIDERS,
+    ...customProviders.map((provider) => ({ ...provider, custom: true })),
+  ];
+  const preferredProviderId = isKnownSpeechProviderId(source.preferredProviderId, providers)
     ? source.preferredProviderId
     : DEFAULT_SPEECH_GENERATION_SETTINGS.preferredProviderId;
+  const validKey = (key: unknown): key is SpeechProviderId =>
+    isKnownSpeechProviderId(key, providers);
   return {
     enabled:
       typeof source.enabled === 'boolean'
         ? source.enabled
         : DEFAULT_SPEECH_GENERATION_SETTINGS.enabled,
     preferredProviderId,
-    providerKeys: cleanRecord(source.providerKeys, isSpeechProviderId),
-    providerAccountIds: cleanRecord(source.providerAccountIds, isSpeechProviderId),
-    providerBaseUrls: cleanRecord(source.providerBaseUrls, isSpeechProviderId),
-    providerModels: cleanRecord(source.providerModels, isSpeechProviderId),
-    providerVoices: cleanRecord(source.providerVoices, isSpeechProviderId),
+    customProviders,
+    providerKeys: cleanRecord(source.providerKeys, validKey),
+    providerAccountIds: cleanRecord(source.providerAccountIds, validKey),
+    providerBaseUrls: cleanRecord(source.providerBaseUrls, validKey),
+    providerModels: cleanRecord(source.providerModels, validKey),
+    providerVoices: cleanRecord(source.providerVoices, validKey),
   };
 }
 
@@ -755,15 +923,18 @@ export function saveSpeechGenerationSettings(settings: SpeechGenerationSettings)
   }
 }
 
-export function speechProviderById(id: SpeechProviderId): SpeechProviderDefinition {
-  return SPEECH_PROVIDER_BY_ID.get(id) ?? SPEECH_PROVIDERS[0];
+export function speechProviderById(
+  id: SpeechProviderId,
+  settings = loadSpeechGenerationSettings(),
+): SpeechProviderDefinition {
+  return speechProviders(settings).find((provider) => provider.id === id) ?? SPEECH_PROVIDERS[0];
 }
 
 export function speechProviderModel(
   providerId: SpeechProviderId,
   settings = loadSpeechGenerationSettings(),
 ): string {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   return settings.providerModels[providerId]?.trim() || provider.defaultModel;
 }
 
@@ -771,7 +942,7 @@ export function speechProviderVoice(
   providerId: SpeechProviderId,
   settings = loadSpeechGenerationSettings(),
 ): string {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   return settings.providerVoices[providerId]?.trim() || provider.defaultVoice;
 }
 
@@ -781,14 +952,14 @@ export function speechProviderBaseUrl(
 ): string {
   const custom = settings.providerBaseUrls[providerId]?.trim();
   if (custom) return custom.replace(/\/+$/, '');
-  return speechProviderById(providerId).defaultBaseUrl.replace(/\/+$/, '');
+  return speechProviderById(providerId, settings).defaultBaseUrl.replace(/\/+$/, '');
 }
 
 function speechProviderKey(
   providerId: SpeechProviderId,
   settings = loadSpeechGenerationSettings(),
 ): string {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   const keyProviderId = provider.keyProviderId ?? providerId;
   return (
     settings.providerKeys[keyProviderId]?.trim() ||
@@ -801,7 +972,7 @@ export function speechProviderReady(
   providerId: SpeechProviderId,
   settings = loadSpeechGenerationSettings(),
 ): boolean {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   if (provider.needsKey && !speechProviderKey(providerId, settings)) return false;
   if (provider.needsAccountId && !settings.providerAccountIds[providerId]?.trim()) {
     return false;
@@ -813,9 +984,9 @@ export function speechProviderReady(
 export function configuredSpeechProviderIds(
   settings = loadSpeechGenerationSettings(),
 ): SpeechProviderId[] {
-  return SPEECH_PROVIDERS.filter((provider) => speechProviderReady(provider.id, settings)).map(
-    (provider) => provider.id,
-  );
+  return speechProviders(settings)
+    .filter((provider) => speechProviderReady(provider.id, settings))
+    .map((provider) => provider.id);
 }
 
 export function preferredReadySpeechProviderId(
@@ -861,7 +1032,7 @@ export async function generateSpeech(
   if (!speechProviderReady(providerId, settings)) {
     throw new Error(`SPEECH_PROVIDER_NOT_READY:${providerId}`);
   }
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   const prompt = stripSpeechCommand(request.prompt);
   if (!prompt) throw new Error('EMPTY_SPEECH_PROMPT');
   const model = request.model?.trim() || speechProviderModel(providerId, settings);
@@ -892,7 +1063,7 @@ async function generateWithProvider(
   settings: SpeechGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  switch (speechProviderById(providerId).apiKind) {
+  switch (speechProviderById(providerId, settings).apiKind) {
     case 'elevenlabs':
       return generateElevenLabs(providerId, prompt, model, voice, settings, signal);
     case 'openai-speech':
@@ -957,7 +1128,7 @@ async function generateOpenAiSpeech(
   settings: SpeechGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   const apiKey = speechProviderKey(providerId, settings);
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const headers: Record<string, string> = {
@@ -1303,7 +1474,7 @@ async function generateGenericOnlineSpeech(
   settings: SpeechGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   const apiKey = speechProviderKey(providerId, settings);
   if (provider.needsKey && !apiKey) throw new Error(`${provider.label} API key is missing.`);
   const headers: Record<string, string> = {
@@ -1358,7 +1529,7 @@ async function generateGenericLocalSpeech(
   settings: SpeechGenerationSettings,
   signal?: AbortSignal,
 ): Promise<string[]> {
-  const provider = speechProviderById(providerId);
+  const provider = speechProviderById(providerId, settings);
   const started = await readResponseJsonOrAudios(
     await fetch(speechProviderBaseUrl(providerId, settings), {
       method: 'POST',

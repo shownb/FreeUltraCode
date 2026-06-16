@@ -109,14 +109,16 @@ import {
   saveSpriteGenerationSettings,
 } from '@/lib/spriteGeneration';
 import {
-  MESH_LIBRARIES,
   MESH_LIBRARY_CATEGORY_LABELS,
+  createCustomMeshLibraryId,
   meshLibraryCategoryLabel,
+  meshLibraries,
   loadMeshLibrarySettings,
   meshLibraryReady,
   meshLibraryUsability,
   meshLibraryUsable,
   saveMeshLibrarySettings,
+  type CustomMeshLibraryDefinition,
   type MeshLibraryAccountSettings,
   type MeshLibraryDefinition,
   type MeshLibraryId,
@@ -1423,11 +1425,13 @@ function MeshLibraryCard({
   settings,
   onToggle,
   onKeyChange,
+  onDelete,
 }: {
   library: MeshLibraryDefinition;
   settings: MeshLibraryAccountSettings;
   onToggle: (enabled: boolean) => void;
   onKeyChange: (value: string) => void;
+  onDelete?: () => void;
 }) {
   const locale = useStore((s) => s.locale);
   const enabled = settings.enabledIds.includes(library.id);
@@ -1454,15 +1458,28 @@ function MeshLibraryCard({
             {library.note}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={() => void openExternal(library.homepageUrl)}
-          title={tr('打开来源', locale)}
-          aria-label={tr('打开来源', locale)}
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-border-soft bg-bg-alt text-fg-faint hover:border-accent hover:text-fg"
-        >
-          <ExternalLink size={13} />
-        </button>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={() => void openExternal(library.homepageUrl)}
+            title={tr('打开来源', locale)}
+            aria-label={tr('打开来源', locale)}
+            className="flex h-7 w-7 items-center justify-center rounded border border-border-soft bg-bg-alt text-fg-faint hover:border-accent hover:text-fg"
+          >
+            <ExternalLink size={13} />
+          </button>
+          {onDelete ? (
+            <button
+              type="button"
+              onClick={onDelete}
+              title={tr('删除', locale)}
+              aria-label={tr('删除', locale)}
+              className="flex h-7 w-7 items-center justify-center rounded border border-rose-500/40 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20"
+            >
+              <Trash2 size={13} />
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-1">
@@ -1544,6 +1561,171 @@ function MeshLibraryCard({
   );
 }
 
+function customMeshLibraryName(baseUrl: string, fallback: string): string {
+  try {
+    const url = new URL(baseUrl.trim());
+    return url.hostname.replace(/^www\./iu, '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function customMeshHomepageUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed.includes('{query}')) return trimmed.replace(/\/+$/, '');
+  try {
+    const url = new URL(trimmed.replace('{query}', ''));
+    return url.origin;
+  } catch {
+    return trimmed.split('{query}', 1)[0]?.replace(/[?&=/_-]+$/u, '') || trimmed;
+  }
+}
+
+function customMeshSearchUrlTemplate(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (trimmed.includes('{query}')) return trimmed;
+  if (trimmed.includes('?')) return `${trimmed}&q={query}`;
+  if (/\/search$/iu.test(trimmed)) return `${trimmed}?q={query}`;
+  return `${trimmed}/search?q={query}`;
+}
+
+function CustomMeshLibraryDialog({
+  locale,
+  onClose,
+  onSave,
+}: {
+  locale: Locale;
+  onClose: () => void;
+  onSave: (draft: {
+    name: string;
+    homepageUrl: string;
+    token: string;
+  }) => void;
+}) {
+  const [name, setName] = useState('');
+  const [homepageUrl, setHomepageUrl] = useState('');
+  const [token, setToken] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const KeyIcon = showKey ? EyeOff : Eye;
+
+  const save = () => {
+    const trimmedUrl = homepageUrl.trim();
+    if (!trimmedUrl) {
+      setError(locale === 'zh-CN' ? '请填写 URL。' : 'Enter a URL.');
+      return;
+    }
+    setError(null);
+    onSave({
+      name: name.trim() || customMeshLibraryName(trimmedUrl, '自定义模型库'),
+      homepageUrl: trimmedUrl,
+      token: token.trim(),
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-[75] bg-black/60 sm:flex sm:items-center sm:justify-center sm:p-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        data-custom-mesh-library-editor="true"
+        className="fixed inset-x-0 bottom-0 flex max-h-[calc(100vh-1rem)] flex-col overflow-hidden rounded-t-lg border border-border bg-panel shadow-2xl sm:relative sm:inset-auto sm:max-h-[calc(100vh-3rem)] sm:w-[min(520px,calc(100vw-2rem))] sm:rounded-lg"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="shrink-0 border-b border-border-soft bg-bg-alt px-5 py-4">
+          <div className="flex items-center gap-3">
+            <h3 className="min-w-0 flex-1 text-base font-semibold text-fg">
+              {locale === 'zh-CN' ? '添加模型库渠道' : 'Add model library channel'}
+            </h3>
+            <button
+              type="button"
+              onClick={onClose}
+              title={tr('关闭', locale)}
+              aria-label={tr('关闭', locale)}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-panel-2 text-fg-faint transition-colors hover:border-accent hover:text-fg"
+            >
+              <X size={15} strokeWidth={2.2} />
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-fg-dim">
+              {locale === 'zh-CN' ? '渠道名称' : 'Channel name'}
+            </span>
+            <input
+              type="text"
+              value={name}
+              onChange={(event) => setName(event.currentTarget.value)}
+              placeholder={locale === 'zh-CN' ? '新模型库' : 'New model library'}
+              className="w-full rounded border border-border bg-bg px-2 py-1.5 text-xs text-fg outline-none transition-colors focus:border-accent"
+            />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-fg-dim">URL</span>
+            <input
+              type="text"
+              value={homepageUrl}
+              onChange={(event) => {
+                setHomepageUrl(event.currentTarget.value);
+                setError(null);
+              }}
+              placeholder="https://example.com/search?q={query}"
+              className={cn(
+                'w-full rounded border border-border bg-bg px-2 py-1.5 font-mono text-xs text-fg outline-none transition-colors focus:border-accent',
+                error && 'border-rose-500/60',
+              )}
+            />
+            {error ? (
+              <p className="text-[11px] leading-relaxed text-rose-300">{error}</p>
+            ) : null}
+          </label>
+          <label className="block space-y-1">
+            <span className="text-[11px] font-medium text-fg-dim">Token</span>
+            <div className="relative">
+              <input
+                type={showKey ? 'text' : 'password'}
+                value={token}
+                onChange={(event) => setToken(event.currentTarget.value)}
+                placeholder={locale === 'zh-CN' ? '可选' : 'Optional'}
+                className="w-full rounded border border-border bg-bg px-2 py-1.5 pr-10 font-mono text-xs text-fg outline-none transition-colors focus:border-accent"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey((v) => !v)}
+                title={showKey ? tr('隐藏', locale) : tr('显示', locale)}
+                className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-fg-faint transition-colors hover:text-fg"
+              >
+                <KeyIcon size={13} strokeWidth={2} />
+              </button>
+            </div>
+          </label>
+        </div>
+
+        <div className="shrink-0 border-t border-border-soft bg-bg-alt px-5 py-3">
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-border bg-panel px-3 py-1.5 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+            >
+              {tr('取消', locale)}
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              className="rounded border border-accent bg-accent px-3 py-1.5 text-xs font-semibold text-bg transition-colors hover:bg-accent/90"
+            >
+              {tr('保存', locale)}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MeshLibrarySettings() {
   const locale = useStore((s) => s.locale);
   const [settings, setSettings] = useState<MeshLibraryAccountSettings>(() =>
@@ -1551,11 +1733,14 @@ function MeshLibrarySettings() {
   );
   const [query, setQuery] = useState('');
   const [innerTab, setInnerTab] = useState<'enabled' | 'repository'>('enabled');
+  const [customDialogOpen, setCustomDialogOpen] = useState(false);
 
   const persist = useCallback((next: MeshLibraryAccountSettings) => {
-    setSettings(next);
     saveMeshLibrarySettings(next);
+    setSettings(loadMeshLibrarySettings());
   }, []);
+
+  const libraries = useMemo(() => meshLibraries(settings), [settings]);
 
   const toggleLibrary = useCallback(
     (id: MeshLibraryId, enabled: boolean) => {
@@ -1580,40 +1765,91 @@ function MeshLibrarySettings() {
     [persist, settings],
   );
 
+  const addCustomLibrary = useCallback(
+    (draft: { name: string; homepageUrl: string; token: string }) => {
+      const existingIds = new Set(libraries.map((library) => library.id));
+      let id = createCustomMeshLibraryId(draft.name);
+      let suffix = 2;
+      while (existingIds.has(id)) {
+        id = `${createCustomMeshLibraryId(draft.name)}-${suffix}` as typeof id;
+        suffix += 1;
+      }
+      const searchUrlTemplate = customMeshSearchUrlTemplate(draft.homepageUrl);
+      const library: CustomMeshLibraryDefinition = {
+        id,
+        label: draft.name,
+        category: 'marketplace',
+        searchKind: 'link-out',
+        needsKey: !!draft.token,
+        supportsDownload: false,
+        homepageUrl: customMeshHomepageUrl(draft.homepageUrl),
+        searchUrlTemplate,
+        keyLabel: 'Token',
+        keyPlaceholder: 'optional',
+        note: '自定义在线模型库渠道（深链搜索）。',
+      };
+      persist({
+        ...settings,
+        enabledIds: Array.from(new Set([...settings.enabledIds, id])),
+        customLibraries: [...settings.customLibraries, library],
+        apiKeys: draft.token
+          ? { ...settings.apiKeys, [id]: draft.token }
+          : { ...settings.apiKeys },
+      });
+      setCustomDialogOpen(false);
+      setInnerTab('enabled');
+    },
+    [libraries, persist, settings],
+  );
+
+  const deleteCustomLibrary = useCallback(
+    (id: MeshLibraryId) => {
+      const apiKeys = { ...settings.apiKeys };
+      delete apiKeys[id];
+      persist({
+        ...settings,
+        enabledIds: settings.enabledIds.filter((value) => value !== id),
+        customLibraries: settings.customLibraries.filter((library) => library.id !== id),
+        apiKeys,
+      });
+    },
+    [persist, settings],
+  );
+
   // "已启用" only lists libraries that genuinely work end to end: toggled on AND
   // actually able to run an in-app search/download (key configured where the API
   // requires one). Toggling a library on without its key keeps it out of here.
   const usableLibraries = useMemo(
     () =>
-      MESH_LIBRARIES.filter(
+      libraries.filter(
         (library) =>
           settings.enabledIds.includes(library.id) &&
           meshLibraryUsable(library.id, settings),
       ),
-    [settings],
+    [libraries, settings],
   );
 
   // Enabled-but-not-yet-usable libraries (e.g. toggled on but missing API key)
   // so the user understands why they are not in the working set.
   const pendingLibraries = useMemo(
     () =>
-      MESH_LIBRARIES.filter(
+      libraries.filter(
         (library) =>
           settings.enabledIds.includes(library.id) &&
           !meshLibraryUsable(library.id, settings),
       ),
-    [settings],
+    [libraries, settings],
   );
 
   const filteredRepository = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return MESH_LIBRARIES;
-    return MESH_LIBRARIES.filter((library) =>
+    if (!q) return libraries;
+    return libraries.filter((library) =>
       `${library.label} ${library.note} ${MESH_LIBRARY_CATEGORY_LABELS[library.category]}`
         .toLowerCase()
         .includes(q),
     );
-  }, [query]);
+  }, [libraries, query]);
 
   const usableCount = usableLibraries.length;
   const enabledCount = settings.enabledIds.length;
@@ -1645,8 +1881,8 @@ function MeshLibrarySettings() {
         </div>
         <div className="mt-2 text-[11px] text-fg-faint">
           {locale === 'zh-CN'
-            ? `可用 ${usableCount} 个 · 已开启 ${enabledCount} 个 · 仓库共 ${MESH_LIBRARIES.length} 个`
-            : `${usableCount} usable · ${enabledCount} enabled · ${MESH_LIBRARIES.length} in registry`}
+            ? `可用 ${usableCount} 个 · 已开启 ${enabledCount} 个 · 仓库共 ${libraries.length} 个`
+            : `${usableCount} usable · ${enabledCount} enabled · ${libraries.length} in registry`}
         </div>
       </section>
 
@@ -1658,7 +1894,7 @@ function MeshLibrarySettings() {
         {(
           [
             { id: 'enabled' as const, label: tr('已启用', locale), count: usableCount },
-            { id: 'repository' as const, label: tr('仓库', locale), count: MESH_LIBRARIES.length },
+            { id: 'repository' as const, label: tr('仓库', locale), count: libraries.length },
           ]
         ).map((tab) => {
           const active = innerTab === tab.id;
@@ -1697,6 +1933,8 @@ function MeshLibrarySettings() {
           settings={settings}
           onToggle={toggleLibrary}
           onKeyChange={setKey}
+          onAddLibrary={() => setCustomDialogOpen(true)}
+          onDeleteCustomLibrary={deleteCustomLibrary}
           onBrowseRepository={() => setInnerTab('repository')}
         />
       ) : (
@@ -1707,6 +1945,8 @@ function MeshLibrarySettings() {
           onQueryChange={setQuery}
           onToggle={toggleLibrary}
           onKeyChange={setKey}
+          onAddLibrary={() => setCustomDialogOpen(true)}
+          onDeleteCustomLibrary={deleteCustomLibrary}
         />
       )}
 
@@ -1743,6 +1983,13 @@ function MeshLibrarySettings() {
           />
         </label>
       </div>
+      {customDialogOpen ? (
+        <CustomMeshLibraryDialog
+          locale={locale}
+          onClose={() => setCustomDialogOpen(false)}
+          onSave={addCustomLibrary}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1753,6 +2000,8 @@ function MeshLibraryEnabledTab({
   settings,
   onToggle,
   onKeyChange,
+  onAddLibrary,
+  onDeleteCustomLibrary,
   onBrowseRepository,
 }: {
   usableLibraries: MeshLibraryDefinition[];
@@ -1760,6 +2009,8 @@ function MeshLibraryEnabledTab({
   settings: MeshLibraryAccountSettings;
   onToggle: (id: MeshLibraryId, enabled: boolean) => void;
   onKeyChange: (id: MeshLibraryId, value: string) => void;
+  onAddLibrary: () => void;
+  onDeleteCustomLibrary: (id: MeshLibraryId) => void;
   onBrowseRepository: () => void;
 }) {
   const locale = useStore((s) => s.locale);
@@ -1773,16 +2024,33 @@ function MeshLibraryEnabledTab({
         </p>
         <button
           type="button"
-          onClick={onBrowseRepository}
+          onClick={onAddLibrary}
           className="justify-self-center rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20"
         >
-          {locale === 'zh-CN' ? '去仓库添加' : 'Add from registry'}
+          {locale === 'zh-CN' ? '添加新渠道' : 'Add new channel'}
+        </button>
+        <button
+          type="button"
+          onClick={onBrowseRepository}
+          className="justify-self-center rounded-md border border-border bg-panel px-3 py-1.5 text-xs font-semibold text-fg-dim hover:border-accent hover:text-fg"
+        >
+          {locale === 'zh-CN' ? '浏览仓库' : 'Browse registry'}
         </button>
       </div>
     );
   }
   return (
     <div className="grid gap-3">
+      <div>
+        <button
+          type="button"
+          onClick={onAddLibrary}
+          className="inline-flex items-center gap-1.5 rounded border border-border bg-panel px-2.5 py-1 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+        >
+          <Plus size={13} strokeWidth={2.2} />
+          {locale === 'zh-CN' ? '添加新渠道' : 'Add new channel'}
+        </button>
+      </div>
       {usableLibraries.length > 0 ? (
         <div className="grid gap-2.5 lg:grid-cols-2 2xl:grid-cols-3">
           {usableLibraries.map((library) => (
@@ -1792,6 +2060,9 @@ function MeshLibraryEnabledTab({
               settings={settings}
               onToggle={(enabled) => onToggle(library.id, enabled)}
               onKeyChange={(value) => onKeyChange(library.id, value)}
+              onDelete={
+                library.custom ? () => onDeleteCustomLibrary(library.id) : undefined
+              }
             />
           ))}
         </div>
@@ -1812,6 +2083,9 @@ function MeshLibraryEnabledTab({
                 settings={settings}
                 onToggle={(enabled) => onToggle(library.id, enabled)}
                 onKeyChange={(value) => onKeyChange(library.id, value)}
+                onDelete={
+                  library.custom ? () => onDeleteCustomLibrary(library.id) : undefined
+                }
               />
             ))}
           </div>
@@ -1828,6 +2102,8 @@ function MeshLibraryRepositoryTab({
   onQueryChange,
   onToggle,
   onKeyChange,
+  onAddLibrary,
+  onDeleteCustomLibrary,
 }: {
   libraries: MeshLibraryDefinition[];
   settings: MeshLibraryAccountSettings;
@@ -1835,22 +2111,34 @@ function MeshLibraryRepositoryTab({
   onQueryChange: (value: string) => void;
   onToggle: (id: MeshLibraryId, enabled: boolean) => void;
   onKeyChange: (id: MeshLibraryId, value: string) => void;
+  onAddLibrary: () => void;
+  onDeleteCustomLibrary: (id: MeshLibraryId) => void;
 }) {
   const locale = useStore((s) => s.locale);
   return (
     <div className="grid gap-3">
-      <div className="relative">
-        <Search
-          size={14}
-          className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-faint"
-        />
-        <input
-          type="text"
-          value={query}
-          onChange={(event) => onQueryChange(event.currentTarget.value)}
-          placeholder={tr('搜索在线模型库名称、用途...', locale)}
-          className="w-full rounded-lg border border-border bg-bg-alt py-2 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none"
-        />
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="relative">
+          <Search
+            size={14}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-faint"
+          />
+          <input
+            type="text"
+            value={query}
+            onChange={(event) => onQueryChange(event.currentTarget.value)}
+            placeholder={tr('搜索在线模型库名称、用途...', locale)}
+            className="w-full rounded-lg border border-border bg-bg-alt py-2 pl-9 pr-3 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none"
+          />
+        </div>
+        <button
+          type="button"
+          onClick={onAddLibrary}
+          className="inline-flex items-center justify-center gap-1.5 rounded border border-border bg-panel px-3 py-2 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg"
+        >
+          <Plus size={13} strokeWidth={2.2} />
+          {locale === 'zh-CN' ? '添加新渠道' : 'Add new channel'}
+        </button>
       </div>
 
       {libraries.length === 0 ? (
@@ -1866,6 +2154,9 @@ function MeshLibraryRepositoryTab({
               settings={settings}
               onToggle={(enabled) => onToggle(library.id, enabled)}
               onKeyChange={(value) => onKeyChange(library.id, value)}
+              onDelete={
+                library.custom ? () => onDeleteCustomLibrary(library.id) : undefined
+              }
             />
           ))}
         </div>

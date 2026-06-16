@@ -33,6 +33,7 @@ import {
   type ToolEventPatch,
 } from './toolEvent';
 import { parseToolLine } from './toolLine';
+import { compactRuntimeHeartbeatLines } from '@/core/interaction';
 
 const OPEN = /<think(?:ing)?>/i;
 const CLOSE = /<\/think(?:ing)?>/i;
@@ -70,12 +71,13 @@ export function hasReasoning(text: string): boolean {
  * in-progress reasoning (true) or simply closed off (false, final render).
  */
 export function segmentMessage(text: string, streaming = false): Segment[] {
-  if (!hasReasoning(text)) {
-    return expandTools(text ? [{ type: 'answer', text }] : []);
+  const displayText = compactRuntimeHeartbeatLines(text);
+  if (!hasReasoning(displayText)) {
+    return expandTools(displayText ? [{ type: 'answer', text: displayText }] : [], streaming);
   }
 
   const segments: Segment[] = [];
-  let rest = text;
+  let rest = displayText;
   let mode: 'answer' | 'reasoning' = 'answer';
 
   const pushAnswer = (chunk: string) => {
@@ -136,7 +138,7 @@ export function segmentMessage(text: string, streaming = false): Segment[] {
     if (s.type === 'answer') return s.text.length > 0;
     return true;
   });
-  return expandTools(cleaned);
+  return expandTools(cleaned, streaming);
 }
 
 /**
@@ -147,7 +149,7 @@ export function segmentMessage(text: string, streaming = false): Segment[] {
  * per answer-segment) so a tool that starts before a reasoning block and
  * finishes after it still resolves to a single event.
  */
-function expandTools(segments: Segment[]): Segment[] {
+function expandTools(segments: Segment[], streaming: boolean): Segment[] {
   const anySentinels = segments.some(
     (s) => s.type === 'answer' && hasToolSentinel(s.text),
   );
@@ -165,9 +167,17 @@ function expandTools(segments: Segment[]): Segment[] {
   }
   const merged = mergeToolPatches(allPatches);
   const byId = new Map(merged.map((e) => [e.id, e]));
+  const trailingEphemeralId = streaming
+    ? findTrailingEphemeralToolId(segments, byId)
+    : null;
+  const patchCounts = new Map<string, number>();
+  for (const patch of allPatches) {
+    patchCounts.set(patch.id, (patchCounts.get(patch.id) ?? 0) + 1);
+  }
 
   const out: Segment[] = [];
   const emitted = new Set<string>();
+  const seenPatchCounts = new Map<string, number>();
   let legacyId = 0;
   const pushAnswerText = (text: string) => {
     const trimmed = text.replace(/^\n+|\n+$/g, '');
@@ -179,13 +189,23 @@ function expandTools(segments: Segment[]): Segment[] {
     if (last && last.type === 'tools') last.events.push(event);
     else out.push({ type: 'tools', events: [event] });
   };
-  const pushTool = (id: string) => {
+  const pushTool = (patch: ToolEventPatch) => {
     // Global dedup: a tool's `running` and later `done` patch resolve to one
     // card, placed at the FIRST (running) position — even when prose or a
     // reasoning block streams between the two patches.
+    const id = patch.id;
+    const seenCount = (seenPatchCounts.get(id) ?? 0) + 1;
+    seenPatchCounts.set(id, seenCount);
     if (emitted.has(id)) return;
     const event = byId.get(id);
     if (!event) return;
+    if (event.ephemeral) {
+      // Runtime heartbeats are transient. Show only the latest heartbeat when
+      // it is the current tail of the live stream; once real output appears
+      // after it, the old "still running" card disappears.
+      if (id !== trailingEphemeralId) return;
+      if (seenCount !== (patchCounts.get(id) ?? 0)) return;
+    }
     emitted.add(id);
     pushToolEvent(event);
   };
@@ -215,11 +235,38 @@ function expandTools(segments: Segment[]): Segment[] {
     // Walk the ordered parts so tool cards land exactly between prose runs.
     for (const part of extractToolSentinels(s.text).parts) {
       if ('text' in part) pushTextWithLegacyTools(part.text);
-      else pushTool(part.patch.id);
+      else pushTool(part.patch);
     }
   }
 
   return out;
+}
+
+function findTrailingEphemeralToolId(
+  segments: Segment[],
+  byId: Map<string, ToolEvent>,
+): string | null {
+  for (let segmentIndex = segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    const segment = segments[segmentIndex];
+    if (segment.type === 'reasoning') {
+      if (segment.text.trim().length > 0) return null;
+      continue;
+    }
+    if (segment.type === 'tools') return null;
+    const parts = hasToolSentinel(segment.text)
+      ? extractToolSentinels(segment.text).parts
+      : [{ text: segment.text }];
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = parts[partIndex];
+      if ('text' in part) {
+        if (part.text.trim().length > 0) return null;
+        continue;
+      }
+      const event = byId.get(part.patch.id);
+      return event?.ephemeral ? part.patch.id : null;
+    }
+  }
+  return null;
 }
 
 const LEGACY_TOOL_MARKER = /🔧\s*([A-Za-z][A-Za-z0-9_.-]{0,80})\s*:\s*/gu;

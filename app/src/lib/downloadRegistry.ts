@@ -119,7 +119,16 @@ export interface DownloadEntry {
 
 const STORAGE_KEY = 'freeultracode.assets.v1';
 const LEGACY_STORAGE_KEY = 'freeultracode.downloads.v1';
+/**
+ * Path keys the user explicitly cleared from the Asset Hub. The disk-cache poll
+ * (`mergeCachedAssetsFromDisk`) would otherwise re-discover the still-on-disk
+ * files and resurrect the rows the user just cleared. Persisting the dismissals
+ * keeps "清空已完成" sticky across the 15s poll and reloads, while a genuinely
+ * new generation at the same path lifts the dismissal so the asset reappears.
+ */
+const DISMISSED_STORAGE_KEY = 'freeultracode.assets.dismissed.v1';
 const MAX_PERSISTED = 1000;
+const MAX_DISMISSED = 5000;
 /**
  * Largest inline `data:` preview we are willing to write to localStorage.
  * Generated media (a 1024px PNG is ~1–2MB as base64) would otherwise blow the
@@ -131,6 +140,12 @@ const MAX_INLINE_PREVIEW_CHARS = 64 * 1024;
 
 let entries: AssetEntry[] = [];
 let hydrated = false;
+/**
+ * Path keys (see {@link pathKey}) the user has cleared. The disk poll skips any
+ * file whose path is in this set so cleared assets stay cleared. Hydrated lazily
+ * alongside `entries`.
+ */
+let dismissedPaths = new Set<string>();
 const listeners = new Set<() => void>();
 
 function entrySortTime(entry: Pick<AssetEntry, 'finishedAt' | 'startedAt'>): number {
@@ -153,6 +168,7 @@ function hydrate(): void {
   if (hydrated) return;
   hydrated = true;
   if (!hasStorage()) return;
+  hydrateDismissed();
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw) {
@@ -167,6 +183,40 @@ function hydrate(): void {
   } catch {
     entries = [];
   }
+}
+
+function hydrateDismissed(): void {
+  if (!hasStorage()) return;
+  try {
+    const raw = window.localStorage.getItem(DISMISSED_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      dismissedPaths = new Set(parsed.filter((v): v is string => typeof v === 'string'));
+    }
+  } catch {
+    dismissedPaths = new Set();
+  }
+}
+
+function persistDismissed(): void {
+  if (!hasStorage()) return;
+  try {
+    const list = [...dismissedPaths].slice(-MAX_DISMISSED);
+    window.localStorage.setItem(DISMISSED_STORAGE_KEY, JSON.stringify(list));
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Lift a path's dismissal so a freshly produced asset at that path can show up
+ * in the hub again. Called whenever a real (non-disk-poll) registration lands a
+ * local path. No-op when the path was never dismissed.
+ */
+function undismissPath(localPath: string | undefined): void {
+  if (!localPath) return;
+  if (dismissedPaths.delete(pathKey(localPath))) persistDismissed();
 }
 
 /** One-time migration of the old `downloads.v1` history into the asset store. */
@@ -342,6 +392,9 @@ export function mergeCachedAssetsFromDisk(files: CachedAssetFileInput[]): void {
     if (!localPath) continue;
     const key = pathKey(localPath);
     const existing = byPath.get(key);
+    // The user cleared this asset; don't resurrect it from disk unless it is
+    // still a live row (e.g. re-registered by a fresh generation).
+    if (!existing && dismissedPaths.has(key)) continue;
     const diskEntry = diskAssetToEntry({ ...file, localPath });
     if (!existing) {
       byPath.set(key, diskEntry);
@@ -474,6 +527,7 @@ const MANAGED_ASSET_TERMINATORS = new Set([
 ]);
 const MANAGED_ASSET_PATH_RE =
   /(?:file:\/\/\/)?(?:[A-Za-z]:[/\\]|[/\\]{1,2}|~[/\\]|\$\w+[/\\]|\.[/\\])?[^\s"'`<>()[\]{}]*?\.freeultracode[/\\][^\s"'`<>()[\]{}]*?\.(?:jpeg|pjpeg|apng|jfif|webp|avif|gltf|blend|html|jpg|jpe|pjp|gif|bmp|dib|ico|cur|svg|png|mp4|webm|mov|m4v|mp3|wav|ogg|flac|aac|m4a|glb|obj|stl|fbx|ply|usdz|zip|json|htm|md|txt|pdf)(?=$|[\s"'`<>()[\]{}.,;:!?，。；、！？])/gi;
+const ASSET_MESSAGE_LINK_MAX_DISTANCE_MS = 2 * 60 * 60 * 1000;
 
 function extensionFromPath(path: string): string {
   const base = fileNameFromUrl(path);
@@ -588,6 +642,10 @@ export function linkLocalAssetToMessage(input: LinkLocalAssetToMessageInput): vo
     return;
   }
 
+  // Don't recreate an asset the user cleared just because an old chat message
+  // still references its path.
+  if (dismissedPaths.has(key)) return;
+
   commit([
     {
       id: diskAssetId(localPath),
@@ -651,6 +709,138 @@ export function linkKnownManagedAssetsFromMessageText(input: {
   }
 }
 
+export interface AssetMessageLinkCandidate {
+  sessionId?: string | null;
+  workspaceId?: string | null;
+  messageId?: string | null;
+  role?: 'user' | 'assistant' | 'system';
+  createdAt?: number | null;
+}
+
+interface NormalizedAssetMessageLinkCandidate {
+  sessionId: string;
+  workspaceId: string | null;
+  messageId: string;
+  role?: 'user' | 'assistant' | 'system';
+  createdAt: number;
+}
+
+function finiteTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function assetLinkTimes(entry: AssetEntry): number[] {
+  const times = [entry.startedAt, entry.finishedAt].filter(finiteTimestamp);
+  return [...new Set(times)];
+}
+
+function assetCanBelongToSession(entry: AssetEntry): boolean {
+  return entry.source !== 'installed';
+}
+
+function messageRolePenalty(role: AssetMessageLinkCandidate['role']): number {
+  if (role === 'assistant') return 0;
+  if (role === 'user') return 5_000;
+  return 15_000;
+}
+
+function workspaceCompatible(
+  entry: AssetEntry,
+  candidate: NormalizedAssetMessageLinkCandidate,
+): boolean {
+  if (entry.workspaceId == null) return true;
+  return candidate.workspaceId === entry.workspaceId;
+}
+
+function sessionCompatible(
+  entry: AssetEntry,
+  candidate: NormalizedAssetMessageLinkCandidate,
+): boolean {
+  if (!entry.sessionId) return true;
+  return candidate.sessionId === entry.sessionId;
+}
+
+function messageCompatible(
+  entry: AssetEntry,
+  candidate: NormalizedAssetMessageLinkCandidate,
+): boolean {
+  if (!entry.messageId) return true;
+  return candidate.messageId === entry.messageId;
+}
+
+/**
+ * Link already-known assets to the nearest chat message by timestamp.
+ *
+ * This is the recovery path for durable cache files discovered from disk after
+ * their localStorage row was lost, and for older generated images whose chat
+ * markdown only contained an inline/remote preview rather than the final local
+ * `.freeultracode` path.
+ */
+export function linkKnownAssetsToNearestMessages(input: {
+  messages: AssetMessageLinkCandidate[];
+  maxDistanceMs?: number;
+}): void {
+  const candidates: NormalizedAssetMessageLinkCandidate[] = [];
+  for (const message of input.messages) {
+    const sessionId = message.sessionId?.trim();
+    const messageId = message.messageId?.trim();
+    if (!sessionId || !messageId || !finiteTimestamp(message.createdAt)) continue;
+    candidates.push({
+      sessionId,
+      workspaceId: message.workspaceId ?? null,
+      messageId,
+      role: message.role,
+      createdAt: message.createdAt,
+    });
+  }
+  if (candidates.length === 0) return;
+
+  hydrate();
+  const maxDistanceMs =
+    input.maxDistanceMs ?? ASSET_MESSAGE_LINK_MAX_DISTANCE_MS;
+  let changed = false;
+
+  const next = entries.map((entry) => {
+    if (!assetCanBelongToSession(entry)) return entry;
+    if (entry.sessionId && entry.messageId) return entry;
+    const times = assetLinkTimes(entry);
+    if (times.length === 0) return entry;
+
+    let best:
+      | {
+          candidate: (typeof candidates)[number];
+          distance: number;
+          score: number;
+        }
+      | null = null;
+
+    for (const candidate of candidates) {
+      if (!workspaceCompatible(entry, candidate)) continue;
+      if (!sessionCompatible(entry, candidate)) continue;
+      if (!messageCompatible(entry, candidate)) continue;
+      const distance = Math.min(
+        ...times.map((time) => Math.abs(time - candidate.createdAt)),
+      );
+      if (distance > maxDistanceMs) continue;
+      const score = distance + messageRolePenalty(candidate.role);
+      if (!best || score < best.score) {
+        best = { candidate, distance, score };
+      }
+    }
+
+    if (!best) return entry;
+    changed = true;
+    return {
+      ...entry,
+      sessionId: entry.sessionId ?? best.candidate.sessionId,
+      workspaceId: entry.workspaceId ?? best.candidate.workspaceId ?? null,
+      messageId: entry.messageId ?? best.candidate.messageId,
+    };
+  });
+
+  if (changed) commit(next);
+}
+
 /**
  * Register an asset. When `status` is omitted it defaults to `pending` so the
  * caller can later mark it terminal with {@link markAssetDone} /
@@ -662,6 +852,9 @@ export function registerAsset(input: RegisterAssetInput): string {
   const id = nextId();
   const status = input.status ?? 'pending';
   const localPath = input.localPath ? normalizeLocalPath(input.localPath) : undefined;
+  // A new registration at a previously-cleared path means the user produced a
+  // fresh asset there; let it surface again.
+  undismissPath(localPath);
   const title =
     input.title?.trim() ||
     (input.remoteUrl ? fileNameFromUrl(input.remoteUrl) : '') ||
@@ -705,6 +898,7 @@ export interface MarkAssetDoneInput {
 /** Mark a pending asset as completed. */
 export function markAssetDone(id: string, result?: MarkAssetDoneInput): void {
   hydrate();
+  if (result?.localPath) undismissPath(normalizeLocalPath(result.localPath));
   commit(
     entries.map((entry) =>
       entry.id === id
@@ -736,15 +930,28 @@ export function markAssetFailed(id: string, error: string): void {
   );
 }
 
-/** Remove a single entry (terminal entries only; pending ones are ignored). */
+/** Remove a single entry. Its disk path is dismissed so the poll won't re-add it. */
 export function removeAsset(id: string): void {
   hydrate();
+  const target = entries.find((entry) => entry.id === id);
+  if (target?.localPath) {
+    dismissedPaths.add(pathKey(target.localPath));
+    persistDismissed();
+  }
   commit(entries.filter((entry) => entry.id !== id));
 }
 
 /** Clear every terminal entry, keeping anything still pending. */
 export function clearFinishedAssets(): void {
   hydrate();
+  let changed = false;
+  for (const entry of entries) {
+    if (entry.status !== 'pending' && entry.localPath) {
+      dismissedPaths.add(pathKey(entry.localPath));
+      changed = true;
+    }
+  }
+  if (changed) persistDismissed();
   commit(entries.filter((entry) => entry.status === 'pending'));
 }
 
@@ -838,6 +1045,7 @@ export async function trackAsset<T>(
 /** Test-only: reset all state. */
 export function __resetDownloadsForTest(): void {
   entries = [];
+  dismissedPaths = new Set();
   hydrated = false;
   counter = 0;
   listeners.clear();
@@ -845,6 +1053,7 @@ export function __resetDownloadsForTest(): void {
     try {
       window.localStorage.removeItem(STORAGE_KEY);
       window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+      window.localStorage.removeItem(DISMISSED_STORAGE_KEY);
     } catch {
       /* ignore */
     }

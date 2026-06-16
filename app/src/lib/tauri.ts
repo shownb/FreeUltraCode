@@ -1231,6 +1231,38 @@ export async function unityMcpSetupProject(
   return invoke<UnityMcpSetupResult>('unity_mcp_setup_project', { request });
 }
 
+export interface BlueprintModeInstallRequest {
+  rootPath: string;
+  sourceDir?: string | null;
+  targetDir?: string | null;
+  overwrite?: boolean;
+}
+
+export interface BlueprintModeInstallResult {
+  ok: boolean;
+  sourceDir: string;
+  targetDir: string;
+  filesCopied: number;
+  replacedExisting: boolean;
+  notes: string[];
+  warnings: string[];
+  error: string | null;
+}
+
+/**
+ * Install the Blueprint Mode UE editor plugin into the detected Unreal project
+ * by copying it from a local source directory into `<project>/Plugins/`.
+ */
+export async function blueprintModeInstall(
+  request: BlueprintModeInstallRequest,
+): Promise<BlueprintModeInstallResult> {
+  if (!tauriAvailable()) {
+    throw new Error('NO_BACKEND');
+  }
+  const invoke = await getInvoke();
+  return invoke<BlueprintModeInstallResult>('blueprint_mode_install', { request });
+}
+
 export async function godotMcpSetupProject(
   request: GenericProjectMcpSetupRequest,
 ): Promise<GenericProjectMcpSetupResult> {

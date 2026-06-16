@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_MESH_LIBRARY_SETTINGS,
   MESH_LIBRARIES,
+  createCustomMeshLibraryId,
   loadMeshLibrarySettings,
   looksLikeMeshSearchRequest,
   meshSearchQueryNeedsEnglish,
+  meshLibraries,
   meshLibraryReady,
   meshLibraryUsability,
   meshLibraryUsable,
@@ -214,3 +216,56 @@ describe('searchMeshLibraries', () => {
   });
 });
 
+
+describe('custom mesh libraries', () => {
+  it('normalizes a custom commercial library as a link-out channel', () => {
+    const id = createCustomMeshLibraryId('My Store');
+    const settings = normalizeMeshLibrarySettings({
+      ...DEFAULT_MESH_LIBRARY_SETTINGS,
+      customLibraries: [
+        {
+          id,
+          label: 'My Store',
+          category: 'marketplace',
+          searchKind: 'link-out',
+          needsKey: false,
+          supportsDownload: false,
+          homepageUrl: 'https://store.example.com',
+          searchUrlTemplate: 'https://store.example.com/search?q={query}',
+          note: 'custom',
+        },
+      ],
+    });
+    expect(settings.customLibraries).toHaveLength(1);
+    expect(meshLibraries(settings).some((l) => l.id === id)).toBe(true);
+    const library = meshLibraryById(id, settings);
+    expect(library?.label).toBe('My Store');
+    expect(meshLibrarySearchUrl(library!, 'sword')).toBe(
+      'https://store.example.com/search?q=sword',
+    );
+  });
+
+  it('keeps an enabled custom library id after normalization', () => {
+    const id = createCustomMeshLibraryId('Free CC0');
+    const settings = normalizeMeshLibrarySettings({
+      ...DEFAULT_MESH_LIBRARY_SETTINGS,
+      enabledIds: [...DEFAULT_MESH_LIBRARY_SETTINGS.enabledIds, id],
+      customLibraries: [
+        {
+          id,
+          label: 'Free CC0',
+          category: 'free',
+          searchKind: 'link-out',
+          needsKey: false,
+          supportsDownload: true,
+          homepageUrl: 'https://free.example.com',
+          searchUrlTemplate: 'https://free.example.com/?q={query}',
+          note: 'free',
+        },
+      ],
+    });
+    expect(settings.enabledIds).toContain(id);
+    expect(meshLibraryReady(id, settings)).toBe(true);
+    expect(meshLibraryUsability(id, settings)).toBe('link-only');
+  });
+});

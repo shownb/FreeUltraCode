@@ -1,4 +1,5 @@
 import {
+  Clock3,
   FilePen,
   FileText,
   FolderOpen,
@@ -12,6 +13,7 @@ import {
 import { toolIconName } from './lib/toolMeta';
 
 const ICONS: Record<string, LucideIcon> = {
+  Clock3,
   FilePen,
   FileText,
   SquareTerminal,
@@ -32,6 +34,9 @@ export default function ToolIcon({
   size?: number;
   className?: string;
 }) {
+  if (/^(?:运行状态|runtime[_-]?status)$/iu.test(name.trim())) {
+    return <Clock3 size={size} className={className} />;
+  }
   const Icon = ICONS[toolIconName(name)] ?? Wrench;
   return <Icon size={size} className={className} />;
 }

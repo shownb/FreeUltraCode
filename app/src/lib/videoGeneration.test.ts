@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_VIDEO_GENERATION_SETTINGS,
   VIDEO_PROVIDERS,
+  createCustomVideoProviderId,
   generateVideo,
   looksLikeVideoGenerationRequest,
   normalizeVideoGenerationSettings,
@@ -10,6 +11,7 @@ import {
   videoDurationSecondsFromPrompt,
   videoProviderBaseUrl,
   videoProviderById,
+  videoProviders,
   videoProviderReady,
 } from './videoGeneration';
 
@@ -231,6 +233,40 @@ describe('video generation settings and routing', () => {
     expect(videoProviderById('runway').label).toContain('Runway');
     expect(videoProviderBaseUrl('runway', DEFAULT_VIDEO_GENERATION_SETTINGS)).toBe(
       'https://api.dev.runwayml.com/v1',
+    );
+  });
+});
+
+describe('custom video providers', () => {
+  it('normalizes and exposes a custom commercial channel', () => {
+    const id = createCustomVideoProviderId('My Video');
+    const settings = normalizeVideoGenerationSettings({
+      ...DEFAULT_VIDEO_GENERATION_SETTINGS,
+      customProviders: [
+        {
+          id,
+          label: 'My Video',
+          category: 'commercial',
+          apiKind: 'generic-online-video',
+          defaultModel: 'v-model',
+          models: ['v-model'],
+          needsKey: true,
+          local: false,
+          defaultBaseUrl: 'https://api.example.com/v1/video/generations',
+          supportsBaseUrl: true,
+          endpointPlaceholder: 'x',
+          note: 'custom',
+        },
+      ],
+    });
+    expect(settings.customProviders).toHaveLength(1);
+    expect(videoProviders(settings).some((p) => p.id === id)).toBe(true);
+    expect(videoProviderById(id, settings).label).toBe('My Video');
+    expect(videoProviderReady(id, settings)).toBe(false);
+    const withKey = { ...settings, providerKeys: { [id]: 'sk-test' } };
+    expect(videoProviderReady(id, withKey)).toBe(true);
+    expect(videoProviderBaseUrl(id, withKey)).toBe(
+      'https://api.example.com/v1/video/generations',
     );
   });
 });

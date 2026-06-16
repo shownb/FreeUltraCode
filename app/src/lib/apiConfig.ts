@@ -29,6 +29,14 @@ import {
   secureStorageAvailable,
   writeSecureRecord,
 } from '@/lib/secureStorage';
+import {
+  loadGatewayConfig,
+  modelClassFromModelId,
+  saveGatewayConfig,
+  setActiveGatewaySelection,
+} from '@/lib/gatewayConfig';
+import type { RuntimeAdapterId } from '@/lib/adapters';
+import type { GatewayProvider, GatewayTransport } from '@/lib/modelGateway/types';
 
 export type ProviderKind = 'anthropic' | 'codex' | 'gemini';
 export type ProviderTransport = 'direct' | 'cli';
@@ -53,6 +61,8 @@ export interface Provider {
   transport?: ProviderTransport;
   /** Optional model override (informational; the app uses `composer.model`). */
   model?: string;
+  /** User-added model ids kept selectable for this provider. */
+  models?: string[];
 }
 
 export type ProviderRuntimeStatus = 'direct' | 'cli' | 'unavailable';
@@ -299,7 +309,24 @@ function normalizeStoredProvider(value: unknown): Provider | null {
       v.transport,
     ),
     model: typeof v.model === 'string' ? v.model : undefined,
+    models: normalizeProviderModels(v.models),
   };
+}
+
+function normalizeProviderModels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== 'string') continue;
+    const model = raw.trim();
+    if (!model) continue;
+    const key = model.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(model);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function normalizeProviderKind(value: unknown): ProviderKind {
@@ -339,6 +366,88 @@ function providerForStorage(provider: Provider): Omit<Provider, 'apiKey'> | Prov
   return stored;
 }
 
+function providerAdapter(provider: Pick<Provider, 'kind'>): RuntimeAdapterId {
+  if (provider.kind === 'codex') return 'codex';
+  if (provider.kind === 'gemini') return 'gemini';
+  return 'claude-code';
+}
+
+function providerTransport(provider: Provider): GatewayTransport {
+  if (provider.transport === 'cli' || provider.kind !== 'anthropic') return 'cli';
+  return 'anthropic';
+}
+
+function providerToGatewayProvider(provider: Provider): GatewayProvider {
+  const model = provider.model?.trim() || undefined;
+  const models = provider.models?.length
+    ? Object.fromEntries(provider.models.map((item) => [item, item]))
+    : undefined;
+  const transport = providerTransport(provider);
+  const adapter = providerAdapter(provider);
+  return {
+    id: provider.id,
+    kind: provider.kind,
+    name: provider.name,
+    adapter,
+    channels: [
+      {
+        id: 'default',
+        name: model ?? 'Default',
+        apiKey: provider.apiKey,
+        baseUrl: provider.baseUrl,
+        model,
+        models,
+        route: {
+          transport,
+          baseUrl: provider.baseUrl,
+          model,
+          models,
+        },
+      },
+    ],
+  };
+}
+
+function syncGatewayProvidersFromProviders(list: Provider[]): void {
+  const current = loadGatewayConfig();
+  const legacyIds = new Set(list.map((provider) => provider.id));
+  const nextProviders = current.providers.filter(
+    (provider) =>
+      !legacyIds.has(provider.id) && !provider.id.startsWith('freecc:'),
+  );
+  nextProviders.push(...list.map(providerToGatewayProvider));
+  saveGatewayConfig({ version: 1, providers: nextProviders });
+}
+
+function upsertGatewayProvider(provider: Provider): void {
+  const gatewayProvider = providerToGatewayProvider(provider);
+  const current = loadGatewayConfig();
+  const nextProviders = current.providers.filter(
+    (candidate) =>
+      candidate.id !== provider.id && !candidate.id.startsWith('freecc:'),
+  );
+  nextProviders.push(gatewayProvider);
+  saveGatewayConfig({ version: 1, providers: nextProviders });
+}
+
+function removeGatewayProvider(providerId: string): void {
+  const current = loadGatewayConfig();
+  const nextProviders = current.providers.filter(
+    (candidate) =>
+      candidate.id !== providerId && !candidate.id.startsWith('freecc:'),
+  );
+  saveGatewayConfig({ version: 1, providers: nextProviders });
+}
+
+function selectGatewayProvider(provider: Provider): void {
+  setActiveGatewaySelection({
+    adapter: providerAdapter(provider),
+    modelClass: modelClassFromModelId(provider.model),
+    providerId: provider.id,
+    channelId: 'default',
+  });
+}
+
 function normalizeImportProvider(value: unknown): Provider | null {
   const stored = normalizeStoredProvider(value);
   if (stored) return stored;
@@ -356,6 +465,7 @@ function normalizeImportProvider(value: unknown): Provider | null {
       v.transport,
     ),
     model: typeof v.model === 'string' ? v.model : undefined,
+    models: normalizeProviderModels(v.models),
   };
 }
 
@@ -569,6 +679,7 @@ export function importDefaultChannelsConfig(
   }
 
   saveProviders(list);
+  syncGatewayProvidersFromProviders(list);
   saveActiveByKind(activeMap);
   notifyProviderConfigChanged();
 
@@ -584,6 +695,8 @@ export function setActiveProviderId(id: string): void {
   const map = loadActiveByKind();
   map[provider.kind] = trimmed;
   saveActiveByKind(map);
+  upsertGatewayProvider(provider);
+  selectGatewayProvider(provider);
   notifyProviderConfigChanged();
 }
 
@@ -608,9 +721,11 @@ export function addProvider(p: Omit<Provider, 'id'>): Provider {
   const existingDefault = resolveActiveForKind(list, map, created.kind);
   list.push(created);
   saveProviders(list);
+  syncGatewayProvidersFromProviders(list);
   if (!existingDefault) {
     map[created.kind] = created.id;
     saveActiveByKind(map);
+    selectGatewayProvider(created);
     notifyProviderConfigChanged();
   }
   return created;
@@ -626,6 +741,7 @@ export function updateProvider(
   if (idx === -1) return;
   list[idx] = { ...list[idx], ...patch };
   saveProviders(list);
+  upsertGatewayProvider(list[idx]);
 }
 
 /**
@@ -637,12 +753,17 @@ export function deleteProvider(id: string): void {
   const target = list.find((p) => p.id === id);
   const next = list.filter((p) => p.id !== id);
   saveProviders(next);
+  removeGatewayProvider(id);
   if (!target) return;
   const map = loadActiveByKind();
   if (map[target.kind] === id) {
     const promote = next.find((p) => p.kind === target.kind);
-    if (promote) map[target.kind] = promote.id;
-    else delete map[target.kind];
+    if (promote) {
+      map[target.kind] = promote.id;
+      selectGatewayProvider(promote);
+    } else {
+      delete map[target.kind];
+    }
     saveActiveByKind(map);
   }
   notifyProviderConfigChanged();
@@ -741,6 +862,7 @@ export function importProviders(
   }
 
   saveProviders(list);
+  syncGatewayProvidersFromProviders(list);
 
   // Ensure every category has a default (first of its kind when unset), then
   // let an explicit active match override its own category's default.
@@ -759,7 +881,10 @@ export function importProviders(
   }
   if (activeTarget) {
     const target = list.find((p) => p.id === activeTarget);
-    if (target) map[target.kind] = activeTarget;
+    if (target) {
+      map[target.kind] = activeTarget;
+      selectGatewayProvider(target);
+    }
   }
   saveActiveByKind(map);
   notifyProviderConfigChanged();

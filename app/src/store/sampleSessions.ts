@@ -1015,4 +1015,7 @@ export const defaultComposer: ComposerSettings = {
   comfyModeStartedAt: null,
   uiMode: false,
   uiModeStartedAt: null,
+  blueprintMode: false,
+  blueprintModeStartedAt: null,
+  blueprintModeArgs: null,
 };

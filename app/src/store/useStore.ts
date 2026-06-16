@@ -31,6 +31,7 @@ import {
   encodeToolPatch,
   extractToolSentinels,
   hasToolSentinel,
+  type ToolEventPatch,
 } from '@/components/ai/lib/toolEvent';
 import {
   personalInstructionsBlock,
@@ -102,10 +103,10 @@ import {
 } from '@/lib/sessionNotification';
 import {
   generateImage,
-  IMAGE_PROVIDERS,
   imageProviderById,
   imageProviderModel,
   imageProviderReady,
+  imageProviders,
   loadImageGenerationSettings,
   preferredReadyImageProviderId,
   stripImageCommand,
@@ -132,7 +133,7 @@ import {
   threeDProviderModel,
   type ThreeDProviderId,
 } from '@/lib/threeDGeneration';
-import { stripComfyCommand } from '@/lib/comfyui';
+import { stripComfyCommand, fetchComfyObjectInfo, comfyBaseUrl } from '@/lib/comfyui';
 import {
   loadUiDesignChannelSettings,
   uiDesignChannelById,
@@ -579,6 +580,8 @@ export interface StoreState {
   /** Import a workflow from a file into a specific workspace history bucket. */
   importWorkflowToWorkspace: (workspaceId: string, title?: string) => void;
   setAdapter: (adapter: string) => void;
+  /** Persist the Settings default run channel without rebinding the active session. */
+  setDefaultRunSelection: (selection: GatewaySelection) => void;
   setGlobalRunSelection: (selection: GatewaySelection) => void;
   setSessionRunSelection: (selection: GatewaySelection) => void;
   /** Clear the composer model pin so it inherits the Settings-active provider. */
@@ -657,6 +660,12 @@ export interface StoreState {
    * in AIDock.
    */
   generateUiPrompt: (text: string) => void;
+  /**
+   * UE Blueprint mode turn: route the request through the selected coding model
+   * with instructions to operate UE Blueprint assets via the editor plugin/MCP
+   * when available, never OpenWorkflows workflow IRGraph.
+   */
+  generateBlueprintPrompt: (text: string) => void;
   /**
    * Search the enabled online 3D model libraries (Project Settings > 在线模型库) for
    * the given query and render thumbnails / previews / downloads into the active
@@ -1215,6 +1224,11 @@ function normalizeComposerSettings(value: Partial<ComposerSettings> | undefined)
     uiMode: source.uiMode ?? defaultComposer.uiMode,
     uiModeStartedAt:
       source.uiModeStartedAt ?? defaultComposer.uiModeStartedAt,
+    blueprintMode: source.blueprintMode ?? defaultComposer.blueprintMode,
+    blueprintModeStartedAt:
+      source.blueprintModeStartedAt ?? defaultComposer.blueprintModeStartedAt,
+    blueprintModeArgs:
+      source.blueprintModeArgs ?? defaultComposer.blueprintModeArgs,
   };
 }
 
@@ -1499,18 +1513,22 @@ function friendlyImageGenerationError(message: string): string {
   }
   if (message.startsWith('IMAGE_PROVIDER_NOT_READY:')) {
     const providerId = message.slice('IMAGE_PROVIDER_NOT_READY:'.length);
-    const label = isImageProviderId(providerId)
-      ? imageProviderById(providerId).label
+    const settings = loadImageGenerationSettings();
+    const label = isImageProviderId(providerId, settings)
+      ? imageProviderById(providerId, settings).label
       : providerId;
     return `图片 Provider「${label}」尚未配置完整（缺少 API Key、Account ID 或 Base URL）。请在 设置 > 生图 中补全后重试。`;
   }
   return message;
 }
 
-function isImageProviderId(value: unknown): value is ImageProviderId {
+function isImageProviderId(
+  value: unknown,
+  settings = loadImageGenerationSettings(),
+): value is ImageProviderId {
   return (
     typeof value === 'string' &&
-    IMAGE_PROVIDERS.some((provider) => provider.id === value)
+    imageProviders(settings).some((provider) => provider.id === value)
   );
 }
 
@@ -1737,7 +1755,7 @@ function meshSearchResultMarkdown(
     lines.push(`英文化搜索词失败，已改用原词：${queryResolution.translationError}`);
   }
   const enabledLabels = settings.enabledIds
-    .map((id) => meshLibraryById(id)?.label)
+    .map((id) => meshLibraryById(id, settings)?.label)
     .filter((label): label is string => !!label);
   if (enabledLabels.length > 0) {
     lines.push(`已搜索：${enabledLabels.join('、')}`);
@@ -4244,9 +4262,17 @@ async function initHistoryFromDisk(): Promise<void> {
     const configuredWorkspace = config.lastActiveWorkspaceId
       ? await historyStore.getWorkspace(config.lastActiveWorkspaceId)
       : null;
-    let workspace = persistedPath
-      ? await historyStore.resolveWorkspaceByPath(persistedPath)
-      : configuredWorkspace;
+    // Prefer `config.lastActiveWorkspaceId` — it is the authoritative record of
+    // the last workspace the user navigated to (written to disk atomically by
+    // activateWorkspacePath/navigate on every switch). The composer's persisted
+    // `workspace` path is a secondary, debounced localStorage value that tracks
+    // the composer cwd and can lag or desync from the genuinely-last-active
+    // workspace, so it is only a fallback when no config record exists.
+    let workspace =
+      configuredWorkspace ??
+      (persistedPath
+        ? await historyStore.resolveWorkspaceByPath(persistedPath)
+        : null);
     if (!workspace && workspaces[0]) {
       workspace = await historyStore.getWorkspace(workspaces[0].id);
     }
@@ -4819,6 +4845,16 @@ export const useStore = create<StoreState>((set, get) => ({
     });
   },
 
+  setDefaultRunSelection: (selection) => {
+    const normalized = persistGlobalGatewaySelection(selection);
+    set((state) => ({
+      personalInstructions: personalInstructionsForSelection(
+        state.personalInstructionsByModel,
+        normalized,
+      ),
+    }));
+  },
+
   setSessionRunSelection: (selection) => {
     set((state) => {
       if (isWorkflowReadOnly(state)) return state;
@@ -5215,7 +5251,23 @@ export const useStore = create<StoreState>((set, get) => ({
     // authoring instruction so the model emits a ```comfyui block instead of
     // editing the workflow blueprint. This reuses all channel/persistence logic
     // and renders the result as an embedded node graph in the chat stream.
-    void get().sendPrompt(`${COMFY_PROMPT_SYSTEM}\n\n用户需求：\n${prompt}`);
+    //
+    // Best-effort: fetch the server's actual node catalog so the model is told
+    // which class_types really exist (otherwise it invents nodes the local
+    // ComfyUI can't run, and POST /prompt rejects the graph). Falls back to the
+    // base instruction if the server is unreachable.
+    void (async () => {
+      let systemPrompt = COMFY_PROMPT_SYSTEM;
+      try {
+        const info = await fetchComfyObjectInfo(comfyBaseUrl());
+        if (info.classTypes.length > 0) {
+          systemPrompt += `\n\n本地 ComfyUI 服务器实际可用的节点类型(只能使用其中的 class_type，不得编造其它节点)：\n${info.classTypes.join(', ')}`;
+        }
+      } catch {
+        /* server unreachable — fall back to the base instruction */
+      }
+      void get().sendPrompt(`${systemPrompt}\n\n用户需求：\n${prompt}`);
+    })();
   },
 
   generateUiPrompt: (text) => {
@@ -5226,6 +5278,15 @@ export const useStore = create<StoreState>((set, get) => ({
     // produces interface specs / deliverables instead of editing the workflow
     // blueprint. Reuses all channel/persistence logic.
     void get().sendPrompt(`${uiDesignPromptSystem()}\n\n用户需求：\n${prompt}`);
+  },
+
+  generateBlueprintPrompt: (text) => {
+    const prompt = stripBlueprintModeCommand(text);
+    if (!prompt) return;
+    const modeArgs = get().composer.blueprintModeArgs;
+    void get().sendPrompt(
+      `${blueprintModePromptSystem(modeArgs)}\n\n用户需求：\n${prompt}`,
+    );
   },
 
   searchMeshLibraryPrompt: (text) => {
@@ -6348,7 +6409,7 @@ ${previousReply.slice(0, 4000)}
               latestCliLive = live;
               if (hasToolSentinel(live)) {
                 const { patches } = extractToolSentinels(live);
-                for (const patch of patches) {
+                for (const patch of patches.filter(isPersistentToolPatch)) {
                   streamedToolSentinels += encodeToolPatch(patch);
                 }
               }
@@ -8083,6 +8144,29 @@ function uiDesignPromptSystem(): string {
 - 与用户输入语言保持一致；只产出界面设计内容，不要修改工作流蓝图。`;
 }
 
+/** Strip the /blueprint-mode-start|/blueprint-mode-end command prefix from a chat line. */
+function stripBlueprintModeCommand(text: string): string {
+  return text
+    .trim()
+    .replace(/^\/blueprint-mode-(?:start|end)\s*/iu, '')
+    .trim();
+}
+
+function blueprintModePromptSystem(modeArgs: string | null | undefined): string {
+  const args = modeArgs?.trim();
+  const argsLine = args
+    ? `\n当前 /blueprint-mode-start 参数：${args}`
+    : '';
+  return `你现在处于 UE 蓝图模式。目标是帮助用户创建、修改、验证 Unreal Engine Blueprint 资产，不是 OpenWorkflows workflow 蓝图。
+要求：
+- 优先检查当前工作区是否是 UE 项目、BlueprintMode 插件是否已安装；如未安装且本地 E:/ue-blueprint-mode 可用，按项目设置里的安装逻辑自动处理或给出最短可执行步骤。
+- 如果可通过 UE 编辑器插件、MCP、Remote Control、Python 或本地命令实际完成，就直接完成；只在确实缺少目标蓝图名、父类、创建确认等关键信息时使用交互协议询问。
+- 蓝图不存在时，先提示用户确认是否创建；确认后默认按 Actor 蓝图创建，除非用户指定 Character、Pawn、GameMode、Widget、Function Library 等父类。
+- 输出或执行内容围绕 BlueprintMode 操作：target、context、checkpoint、BlueprintOp 计划、spawn node、connect pin、set property、compile、verify、commit/discard。
+- 不要生成 OpenWorkflows IRGraph，不要输出 workflow 蓝图 JSON，不要把需求改写成普通素材生成任务。
+- 回答使用简体中文，结论先行。${argsLine}`;
+}
+
 type GenerationPromptMode = 'image' | 'music' | 'threeD' | 'video' | 'sprite' | 'speech';
 
 function generationModeStartedAt(
@@ -8708,12 +8792,12 @@ function startImageGenerationTurn(
 
   const now = Date.now();
   const providerLabel = providerId
-    ? imageProviderById(providerId).label
+    ? imageProviderById(providerId, settings).label
     : 'Image generation';
   const model = providerId
     ? options.model?.trim() ||
       settings.providerModels[providerId]?.trim() ||
-      imageProviderById(providerId).defaultModel
+      imageProviderById(providerId, settings).defaultModel
     : options.model?.trim() || '';
   const userMsg: Message = {
     id: shortId('m'),
@@ -8833,7 +8917,7 @@ function startImageGenerationTurn(
         : '';
       pendingAssetId = registerPendingGeneratedAsset({
         kind: 'image',
-        origin: imageProviderById(providerId).local ? 'local' : 'remote',
+        origin: imageProviderById(providerId, settings).local ? 'local' : 'remote',
         provider: providerLabel,
         model,
         prompt: imagePrompt,
@@ -8862,7 +8946,7 @@ function startImageGenerationTurn(
       void captureGeneratedAssets({
         kind: 'image',
         sources: result.images,
-        origin: imageProviderById(result.providerId).local ? 'local' : 'remote',
+        origin: imageProviderById(result.providerId, settings).local ? 'local' : 'remote',
         provider: result.providerLabel,
         model: result.model,
         prompt: result.prompt,
@@ -9113,9 +9197,9 @@ function startThreeDGenerationTurn(
 
   const now = Date.now();
   const providerLabel = providerId
-    ? threeDProviderById(providerId).label
+    ? threeDProviderById(providerId, settings).label
     : '3D generation';
-  const provider = providerId ? threeDProviderById(providerId) : null;
+  const provider = providerId ? threeDProviderById(providerId, settings) : null;
   const model = providerId
     ? options.model?.trim() || threeDProviderModel(providerId, settings)
     : options.model?.trim() || '';
@@ -9713,7 +9797,7 @@ function startSpriteGenerationTurn(
 
   const now = Date.now();
   const providerLabel = providerId
-    ? imageProviderById(providerId).label
+    ? imageProviderById(providerId, imageSettings).label
     : '图片 Provider';
   const model = providerId
     ? options.model?.trim() || imageProviderModel(providerId, imageSettings)
@@ -9827,7 +9911,8 @@ function startSpriteGenerationTurn(
         : '';
       pendingAssetId = registerPendingGeneratedAsset({
         kind: 'sprite',
-        origin: providerId && imageProviderById(providerId).local ? 'local' : 'remote',
+        origin:
+          providerId && imageProviderById(providerId, imageSettings).local ? 'local' : 'remote',
         provider: providerLabel,
         model,
         prompt: spritePrompt,
@@ -9855,7 +9940,7 @@ function startSpriteGenerationTurn(
         true,
       );
       {
-        const spriteOrigin = imageProviderById(result.providerId).local
+        const spriteOrigin = imageProviderById(result.providerId, imageSettings).local
           ? 'local'
           : 'remote';
         const spriteSources = [
@@ -9930,7 +10015,7 @@ function startMeshSearchTurn(text: string): void {
 
   const now = Date.now();
   const enabledLabels = settings.enabledIds
-    .map((id) => meshLibraryById(id)?.label)
+    .map((id) => meshLibraryById(id, settings)?.label)
     .filter((label): label is string => !!label);
   const userMsg: Message = {
     id: shortId('m'),
@@ -10594,7 +10679,16 @@ function finalChatBodyWithStreamedTools(
     (patch) => !orderedKeys.has(toolPatchIdentity(patch)),
   );
   if (missingPatches.length === 0) return ordered;
-  return `${ordered}${missingPatches.map(encodeToolPatch).join('')}`;
+  // These sentinels were collected this turn but aren't in `latestLive` (e.g.
+  // tool calls from an earlier interaction round whose stream isn't part of the
+  // final round). Chronologically they ran BEFORE this round's work and the
+  // conclusion the model emits last, so prepend them — appending here would
+  // wrongly render those tool cards below the final answer.
+  return `${missingPatches.map(encodeToolPatch).join('')}${ordered}`;
+}
+
+function isPersistentToolPatch(patch: ToolEventPatch): boolean {
+  return patch.ephemeral !== true;
 }
 
 function orderedFinalBodyFromLiveTools(
@@ -10603,14 +10697,17 @@ function orderedFinalBodyFromLiveTools(
 ): string | null {
   if (!hasToolSentinel(latestLive)) return null;
   const split = extractToolSentinels(latestLive);
-  if (split.patches.length === 0) return null;
+  const persistentParts = split.parts.filter(
+    (part) => 'text' in part || isPersistentToolPatch(part.patch),
+  );
+  if (!persistentParts.some((part) => 'patch' in part)) return null;
 
   const answerRange = findTextRangeIgnoringWhitespace(split.text, finalProse);
   if (!answerRange) return null;
   const insertions: Array<{ offset: number; text: string }> = [];
   let cleanOffset = 0;
 
-  for (const part of split.parts) {
+  for (const part of persistentParts) {
     if ('text' in part) {
       cleanOffset += part.text.length;
       continue;
@@ -10625,8 +10722,15 @@ function orderedFinalBodyFromLiveTools(
               finalProse,
               answerRange.start,
               cleanOffset,
-            );
+          );
     insertions.push({ offset, text: encodeToolPatch(part.patch) });
+  }
+
+  if (
+    finalProse.length > 0 &&
+    insertions.some((insertion) => insertion.offset > 0 && insertion.offset < finalProse.length)
+  ) {
+    return null;
   }
 
   let out = '';

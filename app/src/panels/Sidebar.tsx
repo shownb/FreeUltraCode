@@ -54,11 +54,13 @@ import {
 import {
   openWorkspaceDirectory,
   scanProjectEnvironment,
+  listCachedAssets,
+  tauriAvailable,
   type ProjectEnvironmentScan,
 } from '@/lib/tauri';
 import { useResizableWidth } from '@/lib/useResizableWidth';
 import { t } from '@/lib/i18n';
-import { getAssets, subscribeAssets } from '@/lib/downloadRegistry';
+import { getAssets, subscribeAssets, mergeCachedAssetsFromDisk } from '@/lib/downloadRegistry';
 import SettingsModal from './SettingsModal';
 import ProjectSettingsModal from './ProjectSettingsModal';
 import ScheduledTaskDialog from './ScheduledTaskDialog';
@@ -364,6 +366,35 @@ export default function Sidebar() {
   const assetActiveCount = assets.filter(
     (asset) => asset.status === 'pending',
   ).length;
+
+  // Keep the asset-center badge fresh even when its modal is closed. The
+  // registry is otherwise only hydrated from disk when DownloadsModal mounts,
+  // which is why the count used to read 0 until the panel was opened. We poll
+  // on a relaxed interval (not real-time, but no longer indefinitely stale).
+  const assetBadgeCwd = useMemo(() => {
+    const activeWorkspace = activeWorkspaceId
+      ? workspaces.find((workspace) => workspace.id === activeWorkspaceId)
+      : null;
+    return activeWorkspace?.path?.trim() || null;
+  }, [activeWorkspaceId, workspaces]);
+
+  useEffect(() => {
+    if (!tauriAvailable()) return;
+    let cancelled = false;
+    const refresh = () => {
+      void listCachedAssets(assetBadgeCwd)
+        .then((files) => {
+          if (!cancelled) mergeCachedAssetsFromDisk(files);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [assetBadgeCwd]);
 
   // ── Context menu for session actions ─────────────────────────────────────
   type MenuState =
