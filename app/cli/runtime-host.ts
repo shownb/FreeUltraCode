@@ -195,7 +195,7 @@ function nodeTimeoutPolicy(): RunTimeoutPolicy {
   const i = Number(process.env.FREEULTRACODE_AI_CLI_IDLE_TIMEOUT_SECS);
   return {
     timeoutSeconds: Number.isFinite(t) && t >= 60 ? Math.floor(t) : 1800,
-    idleTimeoutSeconds: Number.isFinite(i) && (i === 0 || i >= 30) ? Math.floor(i) : 300,
+    idleTimeoutSeconds: Number.isFinite(i) && (i === 0 || i >= 30) ? Math.floor(i) : 0,
   };
 }
 

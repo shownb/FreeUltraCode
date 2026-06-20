@@ -103,6 +103,22 @@ describe('SettingsModal game feature navigation', () => {
     }
   });
 
+  it('shows image-to-game in the global commands tab', async () => {
+    const view = await renderSettingsModal();
+
+    try {
+      await clickButtonByText(view.container, '命令');
+
+      expect(view.container.textContent).toContain('/image-to-game');
+      expect(view.container.textContent).toContain('图像驱动游戏开发');
+      expect(view.container.textContent).toContain(
+        '从参考图、截图、文章链接或画面描述反推游戏方案、技术拆解和素材生成链路',
+      );
+    } finally {
+      await view.cleanup();
+    }
+  });
+
   it('pastes video provider API keys into password inputs', async () => {
     const view = await renderSettingsModal();
 

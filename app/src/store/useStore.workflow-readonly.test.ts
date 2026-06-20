@@ -814,7 +814,9 @@ describe('workflow read-only guard', () => {
         spriteMode: false,
         comfyMode: false,
         uiMode: false,
+        metahumanMode: false,
         blueprintMode: false,
+        worldMode: false,
       },
     });
 

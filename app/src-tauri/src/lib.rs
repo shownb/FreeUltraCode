@@ -38,6 +38,9 @@ const MAX_SLASH_ENTRIES: usize = 800;
 const MAX_COMMAND_SCAN_DEPTH: usize = 4;
 const MAX_SKILL_SCAN_DEPTH: usize = 8;
 const MAX_SKILL_INSTALL_BYTES: u64 = 512 * 1024;
+const MAX_SKILL_ZIP_INSTALL_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_SKILL_ZIP_EXTRACTED_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_SKILL_ZIP_FILES: usize = 200;
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -2114,6 +2117,15 @@ fn validate_skill_install_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_skill_zip_install_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("https://") {
+        return Err("只支持 HTTPS 下载地址。".to_string());
+    }
+    Ok(())
+}
+
 fn download_skill_text(url: &str) -> Result<String, String> {
     validate_skill_install_url(url)?;
     let response = ureq::get(url)
@@ -2144,6 +2156,134 @@ fn download_skill_text(url: &str) -> Result<String, String> {
     Ok(text)
 }
 
+fn download_skill_zip(url: &str) -> Result<Vec<u8>, String> {
+    validate_skill_zip_install_url(url)?;
+    let response = ureq::get(url)
+        .set("User-Agent", "FreeUltraCode")
+        .set("Accept", "application/zip,application/octet-stream,*/*;q=0.8")
+        .call()
+        .map_err(|e| format!("下载失败: {e}"))?;
+    if let Some(length) = response
+        .header("content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if length > MAX_SKILL_ZIP_INSTALL_BYTES {
+            return Err("Skill 压缩包过大，已拒绝安装。".to_string());
+        }
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_SKILL_ZIP_INSTALL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取下载内容失败: {e}"))?;
+    if bytes.len() as u64 > MAX_SKILL_ZIP_INSTALL_BYTES {
+        return Err("Skill 压缩包过大，已拒绝安装。".to_string());
+    }
+    if bytes.is_empty() {
+        return Err("下载内容为空。".to_string());
+    }
+    Ok(bytes)
+}
+
+fn skill_zip_root_and_frontmatter(bytes: &[u8], fallback_name: &str) -> Result<(PathBuf, String), String> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("打开 Skill 压缩包失败: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 Skill 压缩包失败: {e}"))?;
+        let Some(path) = file.enclosed_name() else {
+            continue;
+        };
+        let is_skill_file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            .unwrap_or(false);
+        if !is_skill_file {
+            continue;
+        }
+        let mut text = String::new();
+        file.by_ref()
+            .take(MAX_SKILL_INSTALL_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("读取 SKILL.md 失败: {e}"))?;
+        if text.len() as u64 > MAX_SKILL_INSTALL_BYTES {
+            return Err("SKILL.md 过大，已拒绝安装。".to_string());
+        }
+        let (frontmatter_name, _description) = parse_skill_frontmatter(&text, fallback_name);
+        return Ok((
+            path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            frontmatter_name,
+        ));
+    }
+
+    Err("Skill 压缩包缺少 SKILL.md。".to_string())
+}
+
+fn extract_skill_zip(bytes: &[u8], dst: &Path, package_root: &Path) -> Result<(), String> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("打开 Skill 压缩包失败: {e}"))?;
+    let mut copied = 0usize;
+    let mut extracted_bytes = 0u64;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("读取 Skill 压缩包失败: {e}"))?;
+        let Some(path) = file.enclosed_name() else {
+            continue;
+        };
+        let rel = if package_root.as_os_str().is_empty() {
+            path.as_path()
+        } else {
+            match path.strip_prefix(package_root) {
+                Ok(rel) => rel,
+                Err(_) => continue,
+            }
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if copied >= MAX_SKILL_ZIP_FILES {
+            return Err("Skill 压缩包文件数量过多，已拒绝安装。".to_string());
+        }
+        extracted_bytes = extracted_bytes.saturating_add(file.size());
+        if extracted_bytes > MAX_SKILL_ZIP_EXTRACTED_BYTES {
+            return Err("Skill 压缩包解压后过大，已拒绝安装。".to_string());
+        }
+
+        let target = dst.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&target)
+                .map_err(|e| format!("创建目录失败 {}: {e}", target.to_string_lossy()))?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录失败 {}: {e}", parent.to_string_lossy()))?;
+        }
+        let mut out = std::fs::File::create(&target)
+            .map_err(|e| format!("创建文件失败 {}: {e}", target.to_string_lossy()))?;
+        std::io::copy(&mut file, &mut out)
+            .map_err(|e| format!("写入文件失败 {}: {e}", target.to_string_lossy()))?;
+        copied += 1;
+    }
+
+    if copied == 0 {
+        return Err("Skill 压缩包没有可安装文件。".to_string());
+    }
+    if !dst.join("SKILL.md").is_file() {
+        return Err("Skill 压缩包安装后缺少 SKILL.md。".to_string());
+    }
+    Ok(())
+}
+
 fn install_skill_from_url_blocking(
     url: String,
     name: String,
@@ -2164,6 +2304,87 @@ fn install_skill_from_url_blocking(
         project_root,
         Some(url),
     )
+}
+
+fn install_skill_from_zip_url_blocking(
+    url: String,
+    name: String,
+    slug: String,
+    target_id: String,
+    overwrite: bool,
+    source_url: Option<String>,
+    project_root: Option<String>,
+) -> Result<InstalledSkill, String> {
+    let bytes = download_skill_zip(&url)?;
+    let (package_root, frontmatter_name) = skill_zip_root_and_frontmatter(&bytes, &name)?;
+    let project_root = match project_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(raw) => Some(project_scan_root(raw)?),
+        None => None,
+    };
+    let (target_id, _label, root, _is_default) =
+        skill_install_root(&target_id, project_root.as_deref())?;
+    let installed_name = if name.trim().is_empty() {
+        frontmatter_name
+    } else {
+        name.trim().to_string()
+    };
+    let slug_source = if slug.trim().is_empty() {
+        installed_name.as_str()
+    } else {
+        slug.as_str()
+    };
+    let slug = sanitize_skill_install_slug(slug_source);
+    std::fs::create_dir_all(&root).map_err(|e| format!("创建技能目录失败: {e}"))?;
+    let root = std::fs::canonicalize(&root).map_err(|e| format!("读取技能目录失败: {e}"))?;
+    let target_dir = root.join(&slug);
+    let skill_file = target_dir.join("SKILL.md");
+    let existed = skill_file.is_file();
+    if existed && !overwrite {
+        return Err("目标 skill 已存在。".to_string());
+    }
+
+    if target_dir.exists() && overwrite {
+        let canonical_existing = std::fs::canonicalize(&target_dir)
+            .map_err(|e| format!("读取旧 Skill 目录失败: {e}"))?;
+        if !canonical_existing.starts_with(&root) {
+            return Err("安装路径超出允许目录。".to_string());
+        }
+        std::fs::remove_dir_all(&target_dir)
+            .map_err(|e| format!("清理旧 Skill 目录失败: {e}"))?;
+    }
+    std::fs::create_dir_all(&target_dir).map_err(|e| format!("创建安装目录失败: {e}"))?;
+    let canonical_target =
+        std::fs::canonicalize(&target_dir).map_err(|e| format!("读取安装目录失败: {e}"))?;
+    if !canonical_target.starts_with(&root) {
+        return Err("安装路径超出允许目录。".to_string());
+    }
+
+    extract_skill_zip(&bytes, &target_dir, &package_root)?;
+    let source_meta = serde_json::json!({
+        "name": installed_name.clone(),
+        "slug": slug.clone(),
+        "downloadUrl": url,
+        "sourceUrl": source_url.clone(),
+        "installedAtMs": now_ms(),
+        "installedBy": "FreeUltraCode plugin store"
+    });
+    let _ = std::fs::write(
+        target_dir.join(".freeultracode-source.json"),
+        serde_json::to_string_pretty(&source_meta).unwrap_or_else(|_| "{}".to_string()),
+    );
+
+    Ok(InstalledSkill {
+        name: installed_name,
+        slug,
+        target_id,
+        path: display_preview_path(&target_dir),
+        skill_file: display_preview_path(&skill_file),
+        source_url,
+        overwritten: existed,
+    })
 }
 
 fn install_skill_from_text_blocking(
@@ -2258,6 +2479,34 @@ async fn install_skill_from_url(
 ) -> Result<InstalledSkill, String> {
     let installed = tauri::async_runtime::spawn_blocking(move || {
         install_skill_from_url_blocking(
+            url,
+            name,
+            slug,
+            target_id,
+            overwrite.unwrap_or(false),
+            source_url,
+            project_root,
+        )
+    })
+    .await
+    .map_err(|e| format!("安装任务失败: {e}"))??;
+    let _ = refresh_slash_catalog_async(app).await;
+    Ok(installed)
+}
+
+#[tauri::command]
+async fn install_skill_from_zip_url(
+    app: AppHandle,
+    url: String,
+    name: String,
+    slug: String,
+    target_id: String,
+    overwrite: Option<bool>,
+    source_url: Option<String>,
+    project_root: Option<String>,
+) -> Result<InstalledSkill, String> {
+    let installed = tauri::async_runtime::spawn_blocking(move || {
+        install_skill_from_zip_url_blocking(
             url,
             name,
             slug,
@@ -3480,6 +3729,181 @@ fn detect_project_engine(root: &Path) -> ProjectEngineDetection {
     }
 }
 
+// ===== Jump-to-engine (reveal asset inside the running editor) =====
+//
+// Right-click → "在引擎中定位" tries to bring the file into focus inside the
+// running editor. Only Unreal is wired to a real, stable local channel today:
+// the app already configures RemoteControl (HTTP :30010) for the UE MCP bridge,
+// so we reuse it to run a tiny Python snippet that syncs the Content Browser to
+// the asset. Unity / Godot / Cocos have no equally-stable app-side channel yet,
+// so they degrade to an informative result the UI surfaces as a hint.
+
+const UE_REMOTE_CONTROL_HTTP_PORT: u16 = 30010;
+const UE_PYTHON_LIBRARY_OBJECT: &str =
+    "/Script/PythonScriptPlugin.Default__PythonScriptLibrary";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineRevealResult {
+    ok: bool,
+    /// unreal / unity / godot / cocos / unknown
+    engine: String,
+    /// jumped | not_asset | engine_unreachable | unsupported | error
+    status: String,
+    message: String,
+}
+
+impl EngineRevealResult {
+    fn new(engine: &str, ok: bool, status: &str, message: impl Into<String>) -> Self {
+        Self {
+            ok,
+            engine: engine.to_string(),
+            status: status.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Map an Unreal `.uasset` / `.umap` file path to its mount-point package path
+/// (e.g. `D:/Proj/Content/Maps/Main.umap` → `/Game/Maps/Main`). Returns `None`
+/// for files that are not engine assets (source, config, etc.).
+fn unreal_asset_package_path(root: &Path, file: &Path) -> Option<String> {
+    let ext = file.extension()?.to_string_lossy().to_lowercase();
+    if ext != "uasset" && ext != "umap" {
+        return None;
+    }
+    let rel = file.strip_prefix(root).ok()?;
+    let comps: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    let content_idx = comps.iter().position(|c| c.eq_ignore_ascii_case("Content"))?;
+    // Mount point: project content → /Game, plugin content → /<PluginName>.
+    let mount = if content_idx >= 2 && comps[content_idx - 2].eq_ignore_ascii_case("Plugins") {
+        format!("/{}", comps[content_idx - 1])
+    } else {
+        "/Game".to_string()
+    };
+    let after = &comps[content_idx + 1..];
+    if after.is_empty() {
+        return None;
+    }
+    let mut tail = after.join("/");
+    if let Some(pos) = tail.rfind('.') {
+        tail.truncate(pos);
+    }
+    if tail.is_empty() {
+        return None;
+    }
+    Some(format!("{mount}/{tail}"))
+}
+
+/// Drive a running Unreal editor (via RemoteControl HTTP + Python) to sync the
+/// Content Browser to `package_path`. Runs on a blocking thread (ureq).
+fn unreal_sync_content_browser(package_path: &str) -> EngineRevealResult {
+    // Package paths only contain `/`, letters, digits, `_`, `-` and similar; no
+    // quotes/backslashes, so embedding it in a single-quoted Python literal is
+    // safe. Guard anyway by rejecting characters that could break out.
+    if package_path.contains('\'') || package_path.contains('\\') {
+        return EngineRevealResult::new(
+            "unreal",
+            false,
+            "error",
+            "资产路径包含非法字符，无法在引擎中定位。",
+        );
+    }
+    let python = format!(
+        "import unreal\n\
+asset_path = '{package_path}'\n\
+if unreal.EditorAssetLibrary.does_asset_exist(asset_path):\n\
+    unreal.EditorAssetLibrary.sync_browser_to_objects([asset_path])\n\
+else:\n\
+    raise Exception('asset not found: ' + asset_path)\n"
+    );
+    let url = format!("http://127.0.0.1:{UE_REMOTE_CONTROL_HTTP_PORT}/remote/object/call");
+    let body = serde_json::json!({
+        "objectPath": UE_PYTHON_LIBRARY_OBJECT,
+        "functionName": "ExecutePythonCommand",
+        "parameters": { "PythonCommand": python },
+        "generateTransaction": false,
+    });
+    match ureq::request("PUT", &url)
+        .timeout(std::time::Duration::from_secs(4))
+        .send_json(body)
+    {
+        Ok(_) => EngineRevealResult::new("unreal", true, "jumped", "已在 Unreal 编辑器中定位资产。"),
+        Err(ureq::Error::Status(code, _)) => EngineRevealResult::new(
+            "unreal",
+            false,
+            "error",
+            format!(
+                "Unreal RemoteControl 返回 HTTP {code}。请确认编辑器已启用 RemoteControl/Python 插件（可在项目设置里一键配置 UE MCP）。"
+            ),
+        ),
+        Err(_) => EngineRevealResult::new(
+            "unreal",
+            false,
+            "engine_unreachable",
+            format!(
+                "无法连接到 Unreal 编辑器（127.0.0.1:{UE_REMOTE_CONTROL_HTTP_PORT}）。请先打开该工程的编辑器，并确保已启用 RemoteControl 自动启动。"
+            ),
+        ),
+    }
+}
+
+fn engine_reveal_asset_blocking(root_path: String, file_path: String) -> EngineRevealResult {
+    let root = PathBuf::from(project_expand_path_text(&root_path));
+    let file = PathBuf::from(project_expand_path_text(&file_path));
+    let detection = detect_project_engine(&root);
+    match detection.engine.as_str() {
+        "unreal" => match unreal_asset_package_path(&root, &file) {
+            Some(package_path) => unreal_sync_content_browser(&package_path),
+            None => EngineRevealResult::new(
+                "unreal",
+                false,
+                "not_asset",
+                "该文件不是 Unreal 资产（仅 Content 下的 .uasset/.umap 可在引擎中定位）。",
+            ),
+        },
+        "unity" => EngineRevealResult::new(
+            "unity",
+            false,
+            "unsupported",
+            "暂未支持自动在 Unity 编辑器中定位，请手动切换到 Unity 窗口。",
+        ),
+        "godot" => EngineRevealResult::new(
+            "godot",
+            false,
+            "unsupported",
+            "暂未支持自动在 Godot 编辑器中定位，请手动切换到 Godot 窗口。",
+        ),
+        "cocos" => EngineRevealResult::new(
+            "cocos",
+            false,
+            "unsupported",
+            "暂未支持自动在 Cocos 编辑器中定位，请手动切换到 Cocos 窗口。",
+        ),
+        _ => EngineRevealResult::new(
+            "unknown",
+            false,
+            "unsupported",
+            "当前工作区未识别为受支持的引擎工程（Unreal/Unity/Godot/Cocos）。",
+        ),
+    }
+}
+
+#[tauri::command]
+async fn engine_reveal_asset(root_path: String, file_path: String) -> EngineRevealResult {
+    tauri::async_runtime::spawn_blocking(move || engine_reveal_asset_blocking(root_path, file_path))
+        .await
+        .unwrap_or_else(|err| {
+            EngineRevealResult::new("unknown", false, "error", format!("引擎定位任务失败：{err}"))
+        })
+}
+
 fn project_expand_path_text(input: &str) -> String {
     let mut value = input.trim().to_string();
     if value.starts_with("~/") || value.starts_with("~\\") {
@@ -4600,6 +5024,30 @@ struct BlueprintModeInstallRequest {
     overwrite: Option<bool>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueprintModeTargetRequest {
+    /// UE project root (the folder that contains the .uproject file).
+    root_path: String,
+    /// Optional explicit target directory; defaults to <project>/Plugins/<name>.
+    target_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueprintModeStatusResult {
+    ok: bool,
+    source_url: String,
+    target_dir: String,
+    exists: bool,
+    installed: bool,
+    uplugin_path: Option<String>,
+    version_name: Option<String>,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BlueprintModeInstallResult {
@@ -4615,6 +5063,148 @@ struct BlueprintModeInstallResult {
     notes: Vec<String>,
     warnings: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlueprintModeUninstallResult {
+    ok: bool,
+    target_dir: String,
+    removed: bool,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+    error: Option<String>,
+}
+
+fn blueprint_mode_resolve_target(root: &Path, target_dir: Option<&str>) -> PathBuf {
+    target_dir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("Plugins").join(BLUEPRINT_MODE_PLUGIN_DIRNAME))
+}
+
+fn blueprint_mode_find_uplugin(target: &Path, depth: usize) -> Option<PathBuf> {
+    if depth > 2 {
+        return None;
+    }
+
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(target)
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
+
+    for entry in &entries {
+        let path = entry.path();
+        if path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("uplugin"))
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+    }
+
+    for entry in entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if let Some(path) = blueprint_mode_find_uplugin(&entry.path(), depth + 1) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn blueprint_mode_read_version_name(
+    uplugin_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let text = match std::fs::read_to_string(uplugin_path) {
+        Ok(text) => text,
+        Err(err) => {
+            warnings.push(format!(
+                "读取 .uplugin 失败 {}：{err}",
+                uplugin_path.to_string_lossy()
+            ));
+            return None;
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(doc) => doc,
+        Err(err) => {
+            warnings.push(format!(
+                "解析 .uplugin 失败 {}：{err}",
+                uplugin_path.to_string_lossy()
+            ));
+            return None;
+        }
+    };
+    if let Some(version_name) = doc.get("VersionName").and_then(|v| v.as_str()) {
+        return Some(version_name.to_string());
+    }
+    doc.get("Version")
+        .and_then(|v| v.as_i64())
+        .map(|version| version.to_string())
+}
+
+fn blueprint_mode_status_blocking(
+    req: BlueprintModeTargetRequest,
+) -> Result<BlueprintModeStatusResult, String> {
+    let mut notes = Vec::new();
+    let mut warnings = Vec::new();
+
+    let root = project_scan_root(&req.root_path)?;
+    let target = blueprint_mode_resolve_target(&root, req.target_dir.as_deref());
+    let engine = detect_project_engine(&root);
+    if engine.engine != "unreal" {
+        return Ok(BlueprintModeStatusResult {
+            ok: false,
+            source_url: BLUEPRINT_MODE_SOURCE_URL.to_string(),
+            target_dir: target.to_string_lossy().to_string(),
+            exists: false,
+            installed: false,
+            uplugin_path: None,
+            version_name: None,
+            notes,
+            warnings,
+            error: Some("当前工作区不是 Unreal Engine 工程（未找到 .uproject）。".to_string()),
+        });
+    }
+
+    let exists = target.exists();
+    let uplugin_path = if exists {
+        blueprint_mode_find_uplugin(&target, 0)
+    } else {
+        None
+    };
+    let installed = uplugin_path.is_some();
+    if installed {
+        notes.push("已检测到 BlueprintMode 插件。".to_string());
+    } else if exists {
+        warnings.push("插件目录存在，但未找到 .uplugin。".to_string());
+    } else {
+        notes.push("尚未安装 BlueprintMode 插件。".to_string());
+    }
+    let version_name = uplugin_path
+        .as_deref()
+        .and_then(|path| blueprint_mode_read_version_name(path, &mut warnings));
+
+    Ok(BlueprintModeStatusResult {
+        ok: true,
+        source_url: BLUEPRINT_MODE_SOURCE_URL.to_string(),
+        target_dir: target.to_string_lossy().to_string(),
+        exists,
+        installed,
+        uplugin_path: uplugin_path.map(|path| path.to_string_lossy().to_string()),
+        version_name,
+        notes,
+        warnings,
+        error: None,
+    })
 }
 
 fn blueprint_mode_download_archive() -> Result<Vec<u8>, String> {
@@ -4736,13 +5326,7 @@ fn blueprint_mode_install_blocking(
         });
     }
 
-    let target = req
-        .target_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("Plugins").join(BLUEPRINT_MODE_PLUGIN_DIRNAME));
+    let target = blueprint_mode_resolve_target(&root, req.target_dir.as_deref());
 
     let overwrite = req.overwrite.unwrap_or(false);
     let mut replaced_existing = false;
@@ -4821,12 +5405,111 @@ fn blueprint_mode_install_blocking(
 }
 
 #[tauri::command]
+async fn blueprint_mode_status(
+    request: BlueprintModeTargetRequest,
+) -> Result<BlueprintModeStatusResult, String> {
+    tauri::async_runtime::spawn_blocking(move || blueprint_mode_status_blocking(request))
+        .await
+        .map_err(|e| format!("蓝图插件检测任务失败：{e}"))?
+}
+
+#[tauri::command]
 async fn blueprint_mode_install(
     request: BlueprintModeInstallRequest,
 ) -> Result<BlueprintModeInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || blueprint_mode_install_blocking(request))
         .await
         .map_err(|e| format!("蓝图插件安装任务失败：{e}"))?
+}
+
+fn blueprint_mode_uninstall_blocking(
+    req: BlueprintModeTargetRequest,
+) -> Result<BlueprintModeUninstallResult, String> {
+    let mut notes = Vec::new();
+    let mut warnings = Vec::new();
+
+    let root = project_scan_root(&req.root_path)?;
+    let target = blueprint_mode_resolve_target(&root, req.target_dir.as_deref());
+    let target_dir = target.to_string_lossy().to_string();
+    let engine = detect_project_engine(&root);
+    if engine.engine != "unreal" {
+        return Ok(BlueprintModeUninstallResult {
+            ok: false,
+            target_dir,
+            removed: false,
+            notes,
+            warnings,
+            error: Some("当前工作区不是 Unreal Engine 工程（未找到 .uproject）。".to_string()),
+        });
+    }
+    if !target.exists() {
+        notes.push("BlueprintMode 插件目录不存在，无需卸载。".to_string());
+        return Ok(BlueprintModeUninstallResult {
+            ok: true,
+            target_dir,
+            removed: false,
+            notes,
+            warnings,
+            error: None,
+        });
+    }
+
+    let canonical_plugins = root
+        .join("Plugins")
+        .canonicalize()
+        .map_err(|e| format!("读取 Plugins 目录失败：{e}"))?;
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|e| format!("读取插件目录失败 {}：{e}", target.to_string_lossy()))?;
+    if !canonical_target.starts_with(&canonical_plugins) {
+        return Ok(BlueprintModeUninstallResult {
+            ok: false,
+            target_dir,
+            removed: false,
+            notes,
+            warnings,
+            error: Some("卸载路径超出项目 Plugins 目录。".to_string()),
+        });
+    }
+    let target_name = canonical_target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !target_name.eq_ignore_ascii_case(BLUEPRINT_MODE_PLUGIN_DIRNAME) {
+        return Ok(BlueprintModeUninstallResult {
+            ok: false,
+            target_dir,
+            removed: false,
+            notes,
+            warnings,
+            error: Some("目标目录不是 BlueprintMode 插件目录。".to_string()),
+        });
+    }
+    if blueprint_mode_find_uplugin(&canonical_target, 0).is_none() {
+        warnings.push("目标目录未检测到 .uplugin，仍按 BlueprintMode 目录移除。".to_string());
+    }
+
+    std::fs::remove_dir_all(&canonical_target)
+        .map_err(|e| format!("卸载 BlueprintMode 失败 {}：{e}", target.to_string_lossy()))?;
+    notes.push("已卸载 BlueprintMode 插件。".to_string());
+
+    Ok(BlueprintModeUninstallResult {
+        ok: true,
+        target_dir,
+        removed: true,
+        notes,
+        warnings,
+        error: None,
+    })
+}
+
+#[tauri::command]
+async fn blueprint_mode_uninstall(
+    request: BlueprintModeTargetRequest,
+) -> Result<BlueprintModeUninstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || blueprint_mode_uninstall_blocking(request))
+        .await
+        .map_err(|e| format!("蓝图插件卸载任务失败：{e}"))?
 }
 
 // ===== Godot / Cocos MCP one-click project setup =====
@@ -11428,7 +12111,9 @@ fn extract_json(text: &str) -> String {
 /// Default hard timeout for a single CLI invocation before it is killed.
 const DEFAULT_AI_CLI_TIMEOUT_SECS: u64 = 1800;
 /// Default "no observable progress" timeout for a single CLI invocation.
-const DEFAULT_AI_CLI_IDLE_TIMEOUT_SECS: u64 = 300;
+/// 0 disables idle detection; long-running tools often stay quiet while waiting
+/// for external work such as CI, package builds, or downloads.
+const DEFAULT_AI_CLI_IDLE_TIMEOUT_SECS: u64 = 0;
 const CLI_ERROR_CONTEXT_LIMIT: usize = 1200;
 /// Idle gap (no stdout activity) after which a "still running" heartbeat line is
 /// emitted to the run log, so a long node never looks completely frozen even
@@ -12100,14 +12785,17 @@ fn configured_ai_cli_idle_timeout_secs() -> u64 {
 }
 
 fn ai_cli_idle_timeout_secs(override_secs: Option<u64>) -> u64 {
-    let configured = configured_ai_cli_idle_timeout_secs();
-    if configured == 0 {
-        return 0;
+    if let Ok(raw) = std::env::var("FREEULTRACODE_AI_CLI_IDLE_TIMEOUT_SECS") {
+        if let Ok(secs) = raw.trim().parse::<u64>() {
+            if secs == 0 || secs >= 30 {
+                return secs;
+            }
+        }
     }
     match override_secs.filter(|secs| *secs == 0 || *secs >= 30) {
         Some(0) => 0,
-        Some(dynamic) => configured.max(dynamic),
-        None => configured,
+        Some(dynamic) => dynamic,
+        None => configured_ai_cli_idle_timeout_secs(),
     }
 }
 
@@ -12703,6 +13391,29 @@ async fn ai_cli(
         let progress_model_hint = gateway_progress_model_hint(env_vars.as_ref());
         let extra_workspace_paths =
             normalize_extra_workspace_paths(cwd.as_deref(), extra_workspace_paths);
+        // Telling the CLI about extra dirs via `--add-dir` only *authorizes*
+        // access; it does not *inform* the model those folders exist. Without
+        // this, a model that greps the primary cwd and finds nothing concludes
+        // "not found" even though (e.g.) the engine source lives in a second
+        // configured workspace folder. So when a session has extra workspace
+        // folders, inject a short note describing them. Only do this on the
+        // session's first turn (`resume == false`): a resumed claude session
+        // already carries this note in its warm context, so re-sending it every
+        // turn would just be noise.
+        let extra_workspace_note = if extra_workspace_paths.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "附加工作区目录（与主工作目录同属本次会话上下文，已授予访问权限）：\n{}\n跨项目/引擎源码搜索时，请同时检索这些目录的绝对路径，不要仅因主工作目录未命中就判定“找不到”。",
+                extra_workspace_paths
+                    .iter()
+                    .map(|path| format!("- {path}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let inject_extra_workspace_note =
+            !extra_workspace_note.is_empty() && !resume.unwrap_or(false);
         let binary = match cli_command
             .as_deref()
             .map(cli_runtime::normalize_cli_command_override)
@@ -12950,6 +13661,10 @@ async fn ai_cli(
                 args.push("--add-dir".into());
                 args.push(dir.clone());
             }
+            if inject_extra_workspace_note {
+                args.push("--append-system-prompt".into());
+                args.push(extra_workspace_note.clone());
+            }
         }
 
         let mut cmd = build_launch_command(&binary, &args, &shell);
@@ -12984,6 +13699,14 @@ async fn ai_cli(
         // Write the prompt to stdin on its own thread (so a large prompt can't
         // deadlock against a full pipe), then close stdin to signal EOF.
         let mut stdin_pipe = child.stdin.take();
+        // Codex/Gemini have no `--append-system-prompt`, so the extra-workspace
+        // note (claude gets it as a system-prompt arg above) is prepended to the
+        // prompt fed over stdin instead.
+        let prompt = if inject_extra_workspace_note && (is_codex || is_gemini) {
+            format!("{extra_workspace_note}\n\n{prompt}")
+        } else {
+            prompt
+        };
         let prompt_bytes = prompt.into_bytes();
         let stdin_handle = std::thread::spawn(move || {
             if let Some(mut s) = stdin_pipe.take() {
@@ -13714,6 +14437,73 @@ mod tests {
         assert!(files.iter().any(|file| {
             file.title == "model.glb" && file.kind == "mesh" && file.source == "downloaded"
         }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blueprint_mode_status_detects_installed_plugin() {
+        let dir = std::env::temp_dir().join(format!(
+            "fuc-blueprint-status-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let plugin_dir = dir.join("Plugins").join(BLUEPRINT_MODE_PLUGIN_DIRNAME);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            dir.join("Game.uproject"),
+            r#"{ "FileVersion": 3, "EngineAssociation": "5.3" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("BlueprintMode.uplugin"),
+            r#"{ "FileVersion": 3, "VersionName": "0.1.0" }"#,
+        )
+        .unwrap();
+
+        let status = blueprint_mode_status_blocking(BlueprintModeTargetRequest {
+            root_path: dir.to_string_lossy().to_string(),
+            target_dir: None,
+        })
+        .unwrap();
+
+        assert!(status.ok);
+        assert!(status.exists);
+        assert!(status.installed);
+        assert_eq!(status.version_name.as_deref(), Some("0.1.0"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blueprint_mode_uninstall_removes_default_plugin_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "fuc-blueprint-uninstall-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let plugin_dir = dir.join("Plugins").join(BLUEPRINT_MODE_PLUGIN_DIRNAME);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            dir.join("Game.uproject"),
+            r#"{ "FileVersion": 3, "EngineAssociation": "5.3" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("BlueprintMode.uplugin"),
+            r#"{ "FileVersion": 3, "VersionName": "0.1.0" }"#,
+        )
+        .unwrap();
+
+        let result = blueprint_mode_uninstall_blocking(BlueprintModeTargetRequest {
+            root_path: dir.to_string_lossy().to_string(),
+            target_dir: None,
+        })
+        .unwrap();
+
+        assert!(result.ok);
+        assert!(result.removed);
+        assert!(!plugin_dir.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -15131,6 +15921,7 @@ pub fn run() {
             refresh_slash_catalog,
             skill_install_targets,
             install_skill_from_url,
+            install_skill_from_zip_url,
             install_skill_from_text,
             uninstall_skill,
             scan_model_clis,
@@ -15146,12 +15937,15 @@ pub fn run() {
             open_external,
             open_workspace_directory,
             list_workspace_dir,
+            engine_reveal_asset,
             project_environment_scan,
             project_mcp_probe,
             project_lsp_probe,
             project_lsp_install,
             unity_mcp_setup_project,
+            blueprint_mode_status,
             blueprint_mode_install,
+            blueprint_mode_uninstall,
             godot_mcp_setup_project,
             cocos_mcp_setup_project,
             ue_mcp_ensure_binary,

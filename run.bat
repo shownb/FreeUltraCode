@@ -58,7 +58,7 @@ popd
 if not "!CMD_RC!"=="0" goto npm_fail
 :have_deps
 if exist "%EXE%" (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "app\scripts\stop-running-exe.ps1" "%EXE%"
+  powershell -NoProfile -ExecutionPolicy Bypass -File "app\scripts\stop-freeultracode-instances.ps1"
   if errorlevel 1 goto stop_exe_fail
 )
 echo.
@@ -76,6 +76,8 @@ if "%MODE%"=="build" goto build_only_done
 
 :do_launch
 if not exist "%EXE%" goto no_exe
+powershell -NoProfile -ExecutionPolicy Bypass -File "app\scripts\stop-freeultracode-instances.ps1"
+if errorlevel 1 goto stop_exe_fail
 echo.
 echo [..] launching FreeUltraCode ...
 start "" "%EXE%"

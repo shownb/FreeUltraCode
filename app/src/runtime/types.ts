@@ -175,6 +175,7 @@ export interface ResolvedDirectRoute {
 /** Timeout policy for a single CLI/HTTP call. */
 export interface RunTimeoutPolicy {
   timeoutSeconds: number;
+  /** 0 disables the no-progress watchdog. */
   idleTimeoutSeconds: number;
 }
 

@@ -87,14 +87,14 @@ import {
 } from '@/lib/lspCatalog';
 import {
   GAME_PROJECT_COMMAND_NAMES,
-  buildSlashSuggestions,
+  buildGameSkillSuggestions,
   isGameProjectCommandName,
   slashText,
   type SlashSuggestion,
 } from '@/lib/slashCommands';
 import {
   mcpCategoryLabel,
-  loadMcpRegistryServers,
+  loadOnlineMcpCatalogServers,
   mcpCommandText,
   rankMcpServers,
   type McpServerDefinition,
@@ -127,6 +127,8 @@ import {
   COCOS_MCP_SERVER_ID,
   GODOT_MCP_SERVER_ID,
   blueprintModeInstall,
+  blueprintModeStatus,
+  blueprintModeUninstall,
   listWorkspaceDirectory,
   cocosMcpSetupProject,
   godotMcpSetupProject,
@@ -154,6 +156,8 @@ import {
   type ProjectMcpProbeResult,
   type GenericProjectMcpSetupResult,
   type BlueprintModeInstallResult,
+  type BlueprintModeStatusResult,
+  type BlueprintModeUninstallResult,
   type SkillInstallTarget,
   type SlashCatalogEntry,
   type UnityMcpSetupResult,
@@ -225,8 +229,8 @@ const PROJECT_SETTINGS_EN: Record<string, string> = {
     'When enabled, this project’s game UI design tasks prefer the default channel selected here.',
   '开启后，输入 /sprite-mode-start 或 /sprite 会复用当前生图渠道。':
     'When enabled, /sprite-mode-start or /sprite reuses the current image channel.',
-  '开启后，输入 /sprite-mode-start 或 /sprite 会按下方参数生成 raw sheet 并执行后处理。':
-    'When enabled, /sprite-mode-start or /sprite generates a raw sheet with the parameters below, then runs postprocessing.',
+  '开启后，输入 /sprite-mode-start 或 /sprite 会按下方参数生成可规范化的 raw sheet，并为后处理与验收准备输入。':
+    'When enabled, /sprite-mode-start or /sprite generates a normalizable raw sheet with the parameters below and prepares input for postprocess and acceptance checks.',
   '可用': 'Available',
   '空格分隔；按 LSP stdio 启动参数填写':
     'Space-separated; follow the LSP stdio launch arguments',
@@ -368,7 +372,6 @@ import {
   ThreeDGenerationSettingsPanel,
   SpriteGenerationSettingsPanel,
   RiggingSettingsPanel,
-  GameExpertSettingsPanel,
 } from '@/panels/SettingsModal';
 
 type ProjectSettingsTab =
@@ -379,7 +382,6 @@ type ProjectSettingsTab =
   | 'meshLibrary'
   | 'rigging'
   | 'capturePerf'
-  | 'gameExperts'
   | 'blueprint'
   | 'commands'
   | 'mcp'
@@ -395,7 +397,6 @@ const tabs: { id: ProjectSettingsTab; label: string; Icon: LucideIcon }[] = [
   { id: 'uiDesign', label: 'UI 渠道', Icon: Palette },
   { id: 'rigging', label: '绑定渠道', Icon: Bone },
   { id: 'capturePerf', label: '抓帧/性能', Icon: Activity },
-  { id: 'gameExperts', label: '游戏专家', Icon: Gamepad2 },
   { id: 'blueprint', label: '蓝图', Icon: FileText },
   { id: 'commands', label: '命令', Icon: SlashSquare },
   { id: 'automation', label: '权限/自动化', Icon: SlidersHorizontal },
@@ -504,27 +505,27 @@ function SpritePipelineDiagram({ locale }: { locale: Locale }) {
     },
     {
       icon: SlidersHorizontal,
-      title: locale === 'zh-CN' ? '套 Sprite 协议' : 'Apply Sprite contract',
+      title: locale === 'zh-CN' ? '套 Sprite 合约' : 'Apply Sprite contract',
       desc:
         locale === 'zh-CN'
-          ? 'grid / chroma key / 安全边距'
-          : 'grid / chroma key / safe margin',
+          ? '网格 / 锚点 / 安全边距 / 真实动作'
+          : 'grid / anchor / safe margin / real poses',
     },
     {
       icon: Boxes,
-      title: locale === 'zh-CN' ? '本地后处理' : 'Local postprocess',
+      title: locale === 'zh-CN' ? '规范化准备' : 'Normalization ready',
       desc:
         locale === 'zh-CN'
-          ? '抠底 / 切帧 / 对齐 / 打包'
-          : 'key / slice / align / pack',
+          ? '保留 raw，约束切帧与对齐'
+          : 'keep raw, constrain slicing and alignment',
     },
     {
       icon: Check,
-      title: locale === 'zh-CN' ? '质检并导出' : 'QC and export',
+      title: locale === 'zh-CN' ? '验收目标' : 'Acceptance target',
       desc:
         locale === 'zh-CN'
-          ? 'spritesheet / frames / GIF / metadata'
-          : 'spritesheet / frames / GIF / metadata',
+          ? 'normalized / frames / GIF / manifest / QC'
+          : 'normalized / frames / GIF / manifest / QC',
     },
   ];
 
@@ -537,8 +538,8 @@ function SpritePipelineDiagram({ locale }: { locale: Locale }) {
           </div>
           <div className="mt-1 text-xs text-fg-faint">
             {locale === 'zh-CN'
-              ? 'Sprite 模式只管协议、参数和后处理；底图模型复用生图设置。'
-              : 'Sprite mode owns the contract, parameters, and postprocess; raw image generation reuses image settings.'}
+              ? 'Sprite 模式不是第二套生图渠道；它给现有生图路由增加 raw、规范化、manifest 和验收约束。'
+              : 'Sprite mode is not a second image channel; it adds raw, normalization, manifest, and acceptance constraints to the existing image route.'}
           </div>
         </div>
         <span className="rounded border border-border-soft bg-bg-alt px-2 py-0.5 text-[11px] text-fg-faint">
@@ -587,7 +588,6 @@ const GAME_FEATURE_TABS: ReadonlySet<ProjectSettingsTab> = new Set([
   'meshLibrary',
   'rigging',
   'capturePerf',
-  'gameExperts',
   'blueprint',
   'commands',
 ]);
@@ -879,7 +879,7 @@ function ProjectCommandsSettings() {
     const order = new Map(
       GAME_PROJECT_COMMAND_NAMES.map((name, index) => [name.toLowerCase(), index]),
     );
-    return buildSlashSuggestions([], locale)
+    return buildGameSkillSuggestions(locale)
       .filter((item) => isGameProjectCommandName(item.name))
       .sort(
         (a, b) =>
@@ -2306,16 +2306,16 @@ function McpRegistryView({
       {error ? (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-100">
           {locale === 'zh-CN'
-            ? `在线 MCP Registry 加载失败：${error}`
-            : `Failed to load online MCP registry: ${error}`}
+            ? `在线 MCP 仓库加载失败：${error}`
+            : `Failed to load online MCP catalog: ${error}`}
         </div>
       ) : null}
 
       {loading ? (
         <div className="rounded-lg border border-border-soft bg-bg-alt px-3 py-2 text-[11px] text-fg-faint">
           {locale === 'zh-CN'
-            ? '正在加载在线 MCP Registry...'
-            : 'Loading online MCP registry…'}
+            ? '正在加载在线 MCP 仓库...'
+            : 'Loading online MCP catalog…'}
         </div>
       ) : null}
 
@@ -2334,6 +2334,7 @@ function McpRegistryView({
             const connectionText = installable
               ? mcpCommandText(server)
               : server.connectionUrl ?? server.url ?? server.sourceUrl;
+            const hasRemoteUrl = !installable && Boolean(server.url?.trim());
             const copied = copiedId === server.id;
             return (
               <section
@@ -2369,7 +2370,13 @@ function McpRegistryView({
                   </span>
                   {!installable ? (
                     <span className="rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300">
-                      {locale === 'zh-CN' ? `远程 ${server.transport}` : `Remote ${server.transport}`}
+                      {hasRemoteUrl
+                        ? locale === 'zh-CN'
+                          ? `远程 ${server.transport}`
+                          : `Remote ${server.transport}`
+                        : locale === 'zh-CN'
+                          ? '索引条目'
+                          : 'Index entry'}
                     </span>
                   ) : null}
                   {server.version ? (
@@ -3116,8 +3123,6 @@ export default function ProjectSettingsModal({
 }: ProjectSettingsModalProps) {
   const [tab, setTab] = useState<ProjectSettingsTab>(embedTab ?? 'overview');
   const locale = useStore((s) => s.locale);
-  const gameExpertSettings = useStore((s) => s.gameExpertSettings);
-  const setGameExpertSettings = useStore((s) => s.setGameExpertSettings);
 
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const dragState = useRef<{
@@ -3218,6 +3223,7 @@ export default function ProjectSettingsModal({
   const [onlineMcpServers, setOnlineMcpServers] = useState<McpServerDefinition[]>(
     [],
   );
+  const [onlineMcpQuery, setOnlineMcpQuery] = useState('');
   const [onlineMcpLoading, setOnlineMcpLoading] = useState(false);
   const [onlineMcpError, setOnlineMcpError] = useState<string | null>(null);
   const [languageScan, setLanguageScan] = useState<ProjectLanguageScan>(() =>
@@ -3232,13 +3238,19 @@ export default function ProjectSettingsModal({
   const [ueSetupStep, setUeSetupStep] = useState<string | null>(null);
   const [ueSetupResult, setUeSetupResult] = useState<UeMcpSetupResult | null>(null);
   const [ueSetupError, setUeSetupError] = useState<string | null>(null);
-  const [blueprintInstallBusy, setBlueprintInstallBusy] = useState(false);
+  const [blueprintAction, setBlueprintAction] = useState<
+    'install' | 'update' | 'uninstall' | null
+  >(null);
+  const [blueprintStatusBusy, setBlueprintStatusBusy] = useState(false);
+  const [blueprintStatus, setBlueprintStatus] =
+    useState<BlueprintModeStatusResult | null>(null);
   const [blueprintInstallResult, setBlueprintInstallResult] =
     useState<BlueprintModeInstallResult | null>(null);
+  const [blueprintUninstallResult, setBlueprintUninstallResult] =
+    useState<BlueprintModeUninstallResult | null>(null);
   const [blueprintInstallError, setBlueprintInstallError] = useState<string | null>(
     null,
   );
-  const [blueprintInstallOverwrite, setBlueprintInstallOverwrite] = useState(false);
   const [godotSetupBusy, setGodotSetupBusy] = useState(false);
   const [godotSetupStep, setGodotSetupStep] = useState<string | null>(null);
   const [godotSetupResult, setGodotSetupResult] =
@@ -3683,13 +3695,14 @@ export default function ProjectSettingsModal({
     [installedCapturePerfSkills, loadCapturePerfTargets, locale, workspacePath],
   );
 
-  const loadOnlineMcpServers = useCallback(async (signal?: AbortSignal) => {
+  const loadOnlineMcpServers = useCallback(async (signal?: AbortSignal, query = '') => {
     setOnlineMcpLoading(true);
     setOnlineMcpError(null);
     try {
-      const servers = await loadMcpRegistryServers(signal);
+      const servers = await loadOnlineMcpCatalogServers(signal, { query });
       if (signal?.aborted) return;
       setOnlineMcpServers(servers);
+      setOnlineMcpQuery(query);
     } catch (err) {
       if (signal?.aborted) return;
       setOnlineMcpError(describeError(err));
@@ -3702,9 +3715,23 @@ export default function ProjectSettingsModal({
     if (tab !== 'mcp' || mcpSubTab !== 'registry') return;
     if (onlineMcpServers.length > 0) return;
     const controller = new AbortController();
-    void loadOnlineMcpServers(controller.signal);
+    void loadOnlineMcpServers(controller.signal, '');
     return () => controller.abort();
   }, [loadOnlineMcpServers, mcpSubTab, onlineMcpServers.length, tab]);
+
+  useEffect(() => {
+    if (tab !== 'mcp' || mcpSubTab !== 'registry') return;
+    const query = mcpQuery.trim();
+    if (query === onlineMcpQuery.trim()) return;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => {
+      void loadOnlineMcpServers(controller.signal, query);
+    }, query ? 350 : 0);
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [loadOnlineMcpServers, mcpQuery, mcpSubTab, onlineMcpQuery, tab]);
 
   // Skill descriptions come from the backend slash catalog (parsed SKILL.md
   // frontmatter). We index them by skill folder name so installed-skill cards
@@ -3935,8 +3962,8 @@ export default function ProjectSettingsModal({
       ) {
         setStatus(
           locale === 'zh-CN'
-            ? `${definition.title} 是远程 MCP Registry 条目；已提供地址复制，不写入项目配置。`
-            : `${definition.title} is a remote MCP registry entry; the address is copyable and not written to project config.`,
+            ? `${definition.title} 暂不能直接写入项目配置；已提供地址复制。`
+            : `${definition.title} cannot be written directly to project config yet; the address is copyable.`,
         );
         return;
       }
@@ -4607,7 +4634,35 @@ export default function ProjectSettingsModal({
     }
   }, [persistSettings, settings, workspacePath, locale]);
 
-  const installBlueprintModePlugin = useCallback(async () => {
+  const refreshBlueprintModeStatus = useCallback(async () => {
+    if (!tauriAvailable() || !workspacePath.trim()) {
+      setBlueprintStatus(null);
+      return;
+    }
+    setBlueprintStatusBusy(true);
+    setBlueprintInstallError(null);
+    try {
+      const result = await blueprintModeStatus({
+        rootPath: workspacePath,
+        targetDir: null,
+      });
+      setBlueprintStatus(result);
+      if (!result.ok && result.error) {
+        setBlueprintInstallError(result.error);
+      }
+    } catch (err) {
+      setBlueprintInstallError(describeError(err));
+    } finally {
+      setBlueprintStatusBusy(false);
+    }
+  }, [workspacePath]);
+
+  useEffect(() => {
+    if (tab !== 'blueprint') return;
+    void refreshBlueprintModeStatus();
+  }, [refreshBlueprintModeStatus, tab]);
+
+  const installBlueprintModePlugin = useCallback(async (mode: 'install' | 'update') => {
     if (!tauriAvailable()) {
       setBlueprintInstallError(tr('一键安装需要在桌面应用中运行。', locale));
       return;
@@ -4616,15 +4671,16 @@ export default function ProjectSettingsModal({
       setBlueprintInstallError(tr('未指定工作区路径。', locale));
       return;
     }
-    setBlueprintInstallBusy(true);
+    setBlueprintAction(mode);
     setBlueprintInstallError(null);
     setBlueprintInstallResult(null);
+    setBlueprintUninstallResult(null);
     setStatus(null);
     try {
       const result = await blueprintModeInstall({
         rootPath: workspacePath,
         targetDir: null,
-        overwrite: blueprintInstallOverwrite,
+        overwrite: mode === 'update',
       });
       setBlueprintInstallResult(result);
       if (!result.ok) {
@@ -4636,21 +4692,72 @@ export default function ProjectSettingsModal({
         );
         return;
       }
+      await refreshBlueprintModeStatus();
       setStatus(
         locale === 'zh-CN'
-          ? 'BlueprintMode 插件已安装；重启 Unreal Editor 后生效。'
-          : 'BlueprintMode plugin installed; restart Unreal Editor to load it.',
+          ? mode === 'update'
+            ? 'BlueprintMode 插件已更新；重启 Unreal Editor 后生效。'
+            : 'BlueprintMode 插件已安装；重启 Unreal Editor 后生效。'
+          : mode === 'update'
+            ? 'BlueprintMode plugin updated; restart Unreal Editor to load it.'
+            : 'BlueprintMode plugin installed; restart Unreal Editor to load it.',
       );
     } catch (err) {
       setBlueprintInstallError(describeError(err));
     } finally {
-      setBlueprintInstallBusy(false);
+      setBlueprintAction(null);
     }
   }, [
-    blueprintInstallOverwrite,
     locale,
+    refreshBlueprintModeStatus,
     workspacePath,
   ]);
+
+  const uninstallBlueprintModePlugin = useCallback(async () => {
+    if (!tauriAvailable()) {
+      setBlueprintInstallError(tr('一键安装需要在桌面应用中运行。', locale));
+      return;
+    }
+    if (!workspacePath.trim()) {
+      setBlueprintInstallError(tr('未指定工作区路径。', locale));
+      return;
+    }
+    setBlueprintAction('uninstall');
+    setBlueprintInstallError(null);
+    setBlueprintInstallResult(null);
+    setBlueprintUninstallResult(null);
+    setStatus(null);
+    try {
+      const result = await blueprintModeUninstall({
+        rootPath: workspacePath,
+        targetDir: null,
+      });
+      setBlueprintUninstallResult(result);
+      if (!result.ok) {
+        setBlueprintInstallError(
+          result.error ||
+            (locale === 'zh-CN'
+              ? 'BlueprintMode 插件卸载失败。'
+              : 'BlueprintMode plugin uninstall failed.'),
+        );
+        return;
+      }
+      await refreshBlueprintModeStatus();
+      setStatus(
+        result.removed
+          ? locale === 'zh-CN'
+            ? 'BlueprintMode 插件已卸载。'
+            : 'BlueprintMode plugin uninstalled.'
+          : locale === 'zh-CN'
+            ? 'BlueprintMode 插件未安装。'
+            : 'BlueprintMode plugin is not installed.',
+      );
+    } catch (err) {
+      setBlueprintInstallError(describeError(err));
+    } finally {
+      setBlueprintAction(null);
+    }
+  }, [locale, refreshBlueprintModeStatus, workspacePath]);
 
   const setupGodotMcp = useCallback(async () => {
     if (!tauriAvailable()) {
@@ -4899,8 +5006,8 @@ export default function ProjectSettingsModal({
                 label={locale === 'zh-CN' ? '这是游戏项目' : 'This is a game project'}
                 hint={
                   locale === 'zh-CN'
-                    ? '开启后显示 Mesh、在线模型库、UI、绑骨、抓帧/性能、游戏专家、UE 蓝图和游戏命令等游戏项目 Tab。自动检测会识别 Unity、Unreal Engine、Godot 和 Cocos；其他引擎可在这里手动开启。'
-                    : 'Shows game project tabs such as Mesh, online model library, UI, rigging, capture/performance, Game Experts, UE Blueprint, and game commands. Auto-detect recognizes Unity, Unreal Engine, Godot, and Cocos; enable this manually for other engines.'
+                    ? '开启后显示 Mesh、在线模型库、UI、绑骨、抓帧/性能、UE 蓝图和游戏命令等游戏项目 Tab。团队组织在信息流旁的组织架构中查看，岗位属性与 Skill 可双击节点在文件内容页打开。自动检测会识别 Unity、Unreal Engine、Godot 和 Cocos；其他引擎可在这里手动开启。'
+                    : 'Shows game project tabs such as Mesh, online model library, UI, rigging, capture/performance, UE Blueprint, and game commands. Team organization lives beside the stream; double-click a role node to open its properties and Skills in the file content view. Auto-detect recognizes Unity, Unreal Engine, Godot, and Cocos; enable this manually for other engines.'
                 }
                 checked={settings.gameFeatures.isGameProject}
                 onChange={setGameProjectEnabled}
@@ -5089,8 +5196,8 @@ export default function ProjectSettingsModal({
                 </div>
                 <div className="mt-1 text-xs leading-relaxed text-fg-faint">
                   {locale === 'zh-CN'
-                    ? '控制当前项目是否启用 Sprite 生成入口。生成来源复用生图设置；这里仅维护 Sprite 协议参数和后处理流程。'
-                    : 'Controls whether this project enables Sprite generation. The image source reuses image settings; this tab only owns Sprite contract parameters and postprocess flow.'}
+                    ? '控制当前项目是否启用 Sprite 生成入口。生成来源复用生图设置；这里维护 Sprite 合约参数、raw sheet 规格和后处理验收目标。'
+                    : 'Controls whether this project enables Sprite generation. The image source reuses image settings; this tab owns Sprite contract parameters, raw-sheet specs, and postprocess acceptance targets.'}
                 </div>
               </div>
               <span className="rounded border border-border-soft bg-bg-alt px-2 py-0.5 text-[11px] text-fg-faint">
@@ -5102,7 +5209,7 @@ export default function ProjectSettingsModal({
           <ToggleRow
             label={tr('启用 Sprite 模式', locale)}
             hint={tr(
-              '开启后，输入 /sprite-mode-start 或 /sprite 会按下方参数生成 raw sheet 并执行后处理。',
+              '开启后，输入 /sprite-mode-start 或 /sprite 会按下方参数生成可规范化的 raw sheet，并为后处理与验收准备输入。',
               locale,
             )}
             checked={settings.sprite.enabled}
@@ -5316,86 +5423,6 @@ export default function ProjectSettingsModal({
       );
     }
 
-    if (tab === 'gameExperts') {
-      const detectedEngine = scan?.engine.engine ?? 'unknown';
-      const autoMode = settings.automation.autoDetect;
-      return (
-        <div className="grid gap-4">
-          <section className="rounded-md border border-border bg-panel-2 p-4">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="text-sm font-semibold text-fg">{tr('游戏专家', locale)}</div>
-                <div className="mt-1 text-xs leading-relaxed text-fg-faint">
-                  {locale === 'zh-CN'
-                    ? `当前检测：${scan?.engine.label ?? '未识别'}。自动检测开启时，UE / Unity / Godot / Cocos 项目会默认开启游戏专家；Unity、Unreal、Godot 会自动选择对应专家引擎，Cocos 使用自动。`
-                    : `Detected: ${scan?.engine.label ?? 'Unrecognized'}. When auto-detect is on, UE / Unity / Godot / Cocos projects enable Game Experts; Unity, Unreal, and Godot auto-select the matching expert engine while Cocos uses Auto.`}
-                </div>
-              </div>
-              <span
-                className={cn(
-                  'rounded border px-2 py-0.5 text-[11px]',
-                  detectedEngine === 'unknown'
-                    ? 'border-border-soft bg-bg-alt text-fg-faint'
-                    : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
-                )}
-              >
-                {autoMode ? tr('自动检测', locale) : tr('手动设置', locale)}
-              </span>
-            </div>
-          </section>
-
-          <ToggleRow
-            label={tr('启用游戏专家', locale)}
-            hint={tr('控制当前项目是否启用游戏专家，并在游戏项目中自动选择对应引擎。', locale)}
-            checked={settings.gameFeatures.gameExperts}
-            onChange={(checked) => updateGameFeatures({ gameExperts: checked })}
-          />
-
-          <div className="grid gap-3 rounded-md border border-border bg-panel-2 p-4">
-            <SettingsRow
-              label={tr('游戏专家引擎', locale)}
-              hint={tr('自动检测开启时会跟随项目类型；非游戏项目使用自动。', locale)}
-            >
-              <select
-                value={settings.gameFeatures.gameExpertEngine}
-                onChange={(event) => {
-                  const gameExpertEngine = event.currentTarget
-                    .value as ProjectSettings['gameFeatures']['gameExpertEngine'];
-                  updateGameFeatures({
-                    gameExpertEngine,
-                  });
-                }}
-                className="h-9 w-full rounded-md border border-border bg-bg px-2 text-sm text-fg outline-none focus:border-accent"
-              >
-                <option value="auto">{tr('自动', locale)}</option>
-                <option value="unity">Unity</option>
-                <option value="unreal">Unreal / UE</option>
-                <option value="godot">Godot</option>
-              </select>
-            </SettingsRow>
-            <div className="flex flex-wrap gap-2 text-[11px] text-fg-faint">
-              <span className="inline-flex items-center gap-1 rounded border border-border-soft bg-bg-alt px-2 py-1">
-                <Gamepad2 size={12} />
-                {locale === 'zh-CN' ? '专家：' : 'Experts: '}
-                {settings.gameFeatures.gameExperts
-                  ? tr('开启', locale)
-                  : locale === 'zh-CN'
-                    ? '关闭'
-                    : 'Off'}
-              </span>
-            </div>
-          </div>
-
-          <GameExpertSettingsPanel
-            locale={locale}
-            settings={gameExpertSettings}
-            setSettings={setGameExpertSettings}
-            embedded
-          />
-        </div>
-      );
-    }
-
     if (tab === 'blueprint') {
       const desktop = tauriAvailable();
       const ueMcpServer = settings.mcp.servers.find(
@@ -5404,6 +5431,40 @@ export default function ProjectSettingsModal({
       const ueMcpConnected =
         settings.mcp.enabled && ueMcpServer?.enabled && ueMcpServer.lastProbe?.ok;
       const ueMcpConfigured = Boolean(ueMcpServer);
+      const blueprintInstalled =
+        blueprintStatus?.installed ?? blueprintInstallResult?.ok ?? false;
+      const blueprintTargetExists =
+        blueprintStatus?.exists ?? blueprintInstallResult?.ok ?? false;
+      const blueprintUninstallBusy = blueprintAction === 'uninstall';
+      const blueprintAnyBusy = blueprintStatusBusy || blueprintAction !== null;
+      const blueprintStatusText = blueprintStatusBusy
+        ? tr('检测中...', locale)
+        : blueprintInstalled
+          ? tr('已安装', locale)
+          : blueprintTargetExists
+            ? locale === 'zh-CN'
+              ? '目录异常'
+              : 'Directory issue'
+            : locale === 'zh-CN'
+              ? '待安装'
+              : 'Needs install';
+      const blueprintReportTarget =
+        blueprintStatus?.targetDir ||
+        blueprintInstallResult?.targetDir ||
+        blueprintUninstallResult?.targetDir ||
+        '';
+      const blueprintReportSource =
+        blueprintStatus?.sourceUrl || blueprintInstallResult?.sourceUrl || '';
+      const blueprintReportNotes = [
+        ...(blueprintStatus?.notes ?? []),
+        ...(blueprintInstallResult?.notes ?? []),
+        ...(blueprintUninstallResult?.notes ?? []),
+      ];
+      const blueprintReportWarnings = [
+        ...(blueprintStatus?.warnings ?? []),
+        ...(blueprintInstallResult?.warnings ?? []),
+        ...(blueprintUninstallResult?.warnings ?? []),
+      ];
 
       return (
         <div className="grid gap-4">
@@ -5448,12 +5509,13 @@ export default function ProjectSettingsModal({
               <div className="rounded border border-border-soft bg-bg-alt p-3">
                 <div className="text-[11px] text-fg-faint">BlueprintMode</div>
                 <div className="mt-1 text-sm font-semibold text-fg">
-                  {blueprintInstallResult?.ok
-                    ? tr('已安装', locale)
-                    : locale === 'zh-CN'
-                      ? '待安装'
-                      : 'Needs install'}
+                  {blueprintStatusText}
                 </div>
+                {blueprintStatus?.versionName ? (
+                  <div className="mt-1 truncate text-[11px] text-fg-faint">
+                    v{blueprintStatus.versionName}
+                  </div>
+                ) : null}
               </div>
             </div>
 
@@ -5463,31 +5525,79 @@ export default function ProjectSettingsModal({
                 : 'The plugin is downloaded from GitHub and installed under the project Plugins directory.'}
             </div>
 
-            <ToggleRow
-              label={locale === 'zh-CN' ? '覆盖已有插件目录' : 'Overwrite existing plugin'}
-              hint={
-                locale === 'zh-CN'
-                  ? '目标目录已存在时才需要开启。'
-                  : 'Enable only when the target directory already exists.'
-              }
-              checked={blueprintInstallOverwrite}
-              onChange={setBlueprintInstallOverwrite}
-            />
-
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => void installBlueprintModePlugin()}
-                disabled={!desktop || blueprintInstallBusy}
-                className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/15 px-3 py-1.5 text-xs font-semibold text-fg hover:bg-accent/25 disabled:border-border disabled:bg-bg-alt disabled:text-fg-faint"
+                onClick={() => void refreshBlueprintModeStatus()}
+                disabled={!desktop || blueprintAnyBusy}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg-alt px-3 py-1.5 text-xs text-fg-dim hover:border-accent hover:text-fg disabled:opacity-50"
               >
-                <Download size={13} />
-                {blueprintInstallBusy
-                  ? tr('安装中...', locale)
-                  : locale === 'zh-CN'
-                    ? '安装 BlueprintMode'
-                    : 'Install BlueprintMode'}
+                <RefreshCw
+                  size={13}
+                  className={blueprintStatusBusy ? 'animate-spin' : undefined}
+                />
+                {tr('重新检测', locale)}
               </button>
+              {blueprintTargetExists ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void installBlueprintModePlugin('update')}
+                    disabled={!desktop || blueprintAnyBusy}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/15 px-3 py-1.5 text-xs font-semibold text-fg hover:bg-accent/25 disabled:border-border disabled:bg-bg-alt disabled:text-fg-faint"
+                  >
+                    {blueprintAction === 'update' ? (
+                      <RefreshCw size={13} className="animate-spin" />
+                    ) : (
+                      <Download size={13} />
+                    )}
+                    {blueprintAction === 'update'
+                      ? locale === 'zh-CN'
+                        ? '更新中...'
+                        : 'Updating...'
+                      : locale === 'zh-CN'
+                        ? '更新 BlueprintMode'
+                        : 'Update BlueprintMode'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void uninstallBlueprintModePlugin()}
+                    disabled={!desktop || blueprintAnyBusy}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg-alt px-3 py-1.5 text-xs text-fg-dim hover:border-red-400 hover:text-red-200 disabled:opacity-50"
+                  >
+                    {blueprintUninstallBusy ? (
+                      <RefreshCw size={13} className="animate-spin" />
+                    ) : (
+                      <Trash2 size={13} />
+                    )}
+                    {blueprintUninstallBusy
+                      ? locale === 'zh-CN'
+                        ? '卸载中...'
+                        : 'Uninstalling...'
+                      : locale === 'zh-CN'
+                        ? '卸载 BlueprintMode'
+                        : 'Uninstall BlueprintMode'}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void installBlueprintModePlugin('install')}
+                  disabled={!desktop || blueprintAnyBusy}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/15 px-3 py-1.5 text-xs font-semibold text-fg hover:bg-accent/25 disabled:border-border disabled:bg-bg-alt disabled:text-fg-faint"
+                >
+                  {blueprintAction === 'install' ? (
+                    <RefreshCw size={13} className="animate-spin" />
+                  ) : (
+                    <Download size={13} />
+                  )}
+                  {blueprintAction === 'install'
+                    ? tr('安装中...', locale)
+                    : locale === 'zh-CN'
+                      ? '安装 BlueprintMode'
+                      : 'Install BlueprintMode'}
+                </button>
+              )}
             </div>
 
             {!desktop ? (
@@ -5500,21 +5610,27 @@ export default function ProjectSettingsModal({
                 {blueprintInstallError}
               </div>
             ) : null}
-            {blueprintInstallResult ? (
+            {blueprintStatus || blueprintInstallResult || blueprintUninstallResult ? (
               <div className="grid gap-1 rounded-md border border-border-soft bg-bg-alt px-3 py-2 text-[11px] leading-relaxed text-fg-faint">
                 <div>
                   {locale === 'zh-CN' ? '来源：' : 'Source: '}
-                  {blueprintInstallResult.sourceUrl || tr('未指定', locale)}
+                  {blueprintReportSource || tr('未指定', locale)}
                 </div>
                 <div>
                   {locale === 'zh-CN' ? '目标：' : 'Target: '}
-                  {blueprintInstallResult.targetDir || tr('未指定', locale)}
+                  {blueprintReportTarget || tr('未指定', locale)}
                 </div>
-                {blueprintInstallResult.notes.map((note) => (
-                  <div key={note}>{note}</div>
+                {blueprintStatus?.upluginPath ? (
+                  <div>
+                    {locale === 'zh-CN' ? '插件：' : 'Plugin: '}
+                    {blueprintStatus.upluginPath}
+                  </div>
+                ) : null}
+                {blueprintReportNotes.map((note, index) => (
+                  <div key={`${index}:${note}`}>{note}</div>
                 ))}
-                {blueprintInstallResult.warnings.map((warning) => (
-                  <div key={warning} className="text-amber-200">
+                {blueprintReportWarnings.map((warning, index) => (
+                  <div key={`${index}:${warning}`} className="text-amber-200">
                     {warning}
                   </div>
                 ))}
@@ -5847,7 +5963,7 @@ export default function ProjectSettingsModal({
               configuredIds={configuredMcpIds}
               loading={onlineMcpLoading}
               error={onlineMcpError}
-              onRefresh={() => void loadOnlineMcpServers()}
+              onRefresh={() => void loadOnlineMcpServers(undefined, mcpQuery.trim())}
               onInstall={installCatalogMcpServer}
               onUninstall={removeServer}
             />

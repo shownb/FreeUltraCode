@@ -5,6 +5,26 @@ import AIDock from './AIDock';
 import { defaultBlueprint } from '@/core/defaultBlueprint';
 import { defaultComposer, samplePromptGroups } from '@/store/sampleSessions';
 import { useStore } from '@/store/useStore';
+import {
+  blueprintModeInstall,
+  blueprintModeStatus,
+} from '@/lib/tauri';
+import {
+  DEFAULT_IMAGE_GENERATION_SETTINGS,
+  saveImageGenerationSettings,
+} from '@/lib/imageGeneration';
+import {
+  DEFAULT_MUSIC_GENERATION_SETTINGS,
+  saveMusicGenerationSettings,
+} from '@/lib/musicGeneration';
+import {
+  DEFAULT_THREE_D_GENERATION_SETTINGS,
+  saveThreeDGenerationSettings,
+} from '@/lib/threeDGeneration';
+import {
+  DEFAULT_UI_DESIGN_CHANNEL_SETTINGS,
+  saveUiDesignChannelSettings,
+} from '@/lib/uiDesignChannels';
 
 const slashCatalogMock = vi.hoisted(() => ({
   entries: [
@@ -107,6 +127,9 @@ const slashCatalogMock = vi.hoisted(() => ({
   ],
 }));
 
+const blueprintModeStatusMock = vi.hoisted(() => vi.fn());
+const blueprintModeInstallMock = vi.hoisted(() => vi.fn());
+
 vi.mock('@/lib/tauri', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/tauri')>();
   return {
@@ -117,6 +140,8 @@ vi.mock('@/lib/tauri', async (importOriginal) => {
       ready: true,
       entries: slashCatalogMock.entries,
     }),
+    blueprintModeStatus: blueprintModeStatusMock,
+    blueprintModeInstall: blueprintModeInstallMock,
     onSlashCatalogUpdated: async () => () => {},
   };
 });
@@ -125,6 +150,49 @@ vi.mock('@/lib/tauri', async (importOriginal) => {
   true;
 
 function resetStore(adapter: 'claude-code' | 'codex' | 'gemini' = 'claude-code'): void {
+  saveImageGenerationSettings({
+    ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+    preferredProviderId: 'siliconflow',
+    providerKeys: { siliconflow: 'sk-test' },
+  });
+  saveMusicGenerationSettings({
+    ...DEFAULT_MUSIC_GENERATION_SETTINGS,
+    preferredProviderId: 'elevenlabs-music',
+    providerKeys: { 'elevenlabs-music': 'sk-test' },
+  });
+  saveThreeDGenerationSettings({
+    ...DEFAULT_THREE_D_GENERATION_SETTINGS,
+    enabled: true,
+    preferredProviderId: 'meshy',
+    providerKeys: { meshy: 'sk-test' },
+  });
+  saveUiDesignChannelSettings({
+    ...DEFAULT_UI_DESIGN_CHANNEL_SETTINGS,
+    enabled: true,
+    preferredChannelId: 'pencil',
+  });
+  vi.mocked(blueprintModeStatus).mockResolvedValue({
+    ok: true,
+    sourceUrl: 'https://example.test/BlueprintMode.zip',
+    targetDir: 'E:\\Game\\Demo\\Plugins\\BlueprintMode',
+    exists: true,
+    installed: true,
+    upluginPath: 'E:\\Game\\Demo\\Plugins\\BlueprintMode\\BlueprintMode.uplugin',
+    versionName: 'test',
+    notes: ['已检测到 BlueprintMode 插件。'],
+    warnings: [],
+    error: null,
+  });
+  vi.mocked(blueprintModeInstall).mockResolvedValue({
+    ok: true,
+    sourceUrl: 'https://example.test/BlueprintMode.zip',
+    targetDir: 'E:\\Game\\Demo\\Plugins\\BlueprintMode',
+    filesCopied: 3,
+    replacedExisting: false,
+    notes: ['已安装 BlueprintMode 插件。'],
+    warnings: [],
+    error: null,
+  });
   const workflow = defaultBlueprint('Slash suggestions');
   useStore.setState({
     mode: 'design',
@@ -210,6 +278,13 @@ function flushAnimationFrame(): Promise<void> {
   });
 }
 
+async function flushAsyncWork(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 afterEach(() => {
   window.localStorage.clear();
   document.body.innerHTML = '';
@@ -254,7 +329,7 @@ describe('AIDock slash suggestions', () => {
     }
   });
 
-  it('keeps app-only commands like /image-mode-start when a backend catalog is present', async () => {
+  it('keeps app-only commands like /image-mode-start in the # game-skill menu', async () => {
     resetStore();
     const view = await renderDock();
 
@@ -262,7 +337,7 @@ describe('AIDock slash suggestions', () => {
       const input = textarea(view.container);
 
       await act(async () => {
-        typeTextarea(input, '/image-mode');
+        typeTextarea(input, '#image-mode');
       });
 
       const image = Array.from(
@@ -277,7 +352,7 @@ describe('AIDock slash suggestions', () => {
       expect(input.value).toBe('/image-mode-start ');
 
       await act(async () => {
-        typeTextarea(input, '/blueprint-mode');
+        typeTextarea(input, '#blueprint-mode');
       });
 
       const blueprint = Array.from(
@@ -289,7 +364,27 @@ describe('AIDock slash suggestions', () => {
     }
   });
 
-  it('keeps app-only commands visible in the default slash menu when the adapter catalog is long', async () => {
+  it('shows the image-to-game command in the # game-skill menu', async () => {
+    resetStore();
+    const view = await renderDock();
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(input, '#image-to');
+      });
+
+      const imageToGame = Array.from(
+        view.container.querySelectorAll('[role="option"]'),
+      ).find((option) => option.textContent?.includes('/image-to-game'));
+      expect(imageToGame).toBeInstanceOf(HTMLElement);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('keeps the game-skill menu independent of a long adapter catalog', async () => {
     const originalEntries = slashCatalogMock.entries;
     slashCatalogMock.entries = Array.from({ length: 14 }, (_, index) => ({
       id: `command:codex:/codex-${index}`,
@@ -316,17 +411,23 @@ describe('AIDock slash suggestions', () => {
     try {
       const input = textarea(view.container);
 
+      // The `/` menu surfaces the CLI catalog; GameSkills no longer appear there.
       await act(async () => {
         typeTextarea(input, '/');
       });
+      const slashMenu = view.container.querySelector('#fuc-slash-suggestions');
+      const slashText = slashMenu?.textContent ?? '';
+      expect(slashText).toContain('/codex-13');
+      expect(slashText).not.toContain('/image-mode-start');
 
-      const menu = view.container.querySelector('#fuc-slash-suggestions');
-      const menuText = menu?.textContent ?? '';
-      expect(menuText).toContain('/codex-13');
-      expect(menuText).toContain('/image-mode-start');
-      expect(menu?.querySelectorAll('[role="option"]').length).toBeGreaterThan(
-        10,
+      // The `#` menu surfaces the GameSkills regardless of the adapter catalog.
+      await act(async () => {
+        typeTextarea(input, '#image-mode');
+      });
+      const gameMenu = view.container.querySelector(
+        '#fuc-game-skill-suggestions',
       );
+      expect(gameMenu?.textContent ?? '').toContain('/image-mode-start');
     } finally {
       slashCatalogMock.entries = originalEntries;
       await view.cleanup();
@@ -476,6 +577,47 @@ describe('AIDock slash suggestions', () => {
       expect(generateImagePrompt).toHaveBeenCalledWith('一张赛博朋克海报');
       expect(sendPrompt).not.toHaveBeenCalled();
       expect(input.value).toBe('');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('warns and blocks image commands when the selected image provider is not ready', async () => {
+    resetStore();
+    saveImageGenerationSettings({
+      ...DEFAULT_IMAGE_GENERATION_SETTINGS,
+      preferredProviderId: 'openai-image',
+      providerKeys: {},
+    });
+    const generateImagePrompt = vi.fn();
+    const sendPrompt = vi.fn(() => true);
+    useStore.setState({ generateImagePrompt, sendPrompt });
+    const view = await renderDock();
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(input, '/image 画一张猫');
+      });
+
+      const tip = view.container.querySelector('[data-testid="blocked-send-tip"]');
+      expect(tip?.textContent).toContain('设置 > 生图');
+      expect(tip?.textContent).toContain('OpenAI Images');
+
+      await act(async () => {
+        input.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            ctrlKey: true,
+            bubbles: true,
+          }),
+        );
+      });
+
+      expect(generateImagePrompt).not.toHaveBeenCalled();
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(input.value).toBe('/image 画一张猫');
     } finally {
       await view.cleanup();
     }
@@ -799,7 +941,11 @@ describe('AIDock slash suggestions', () => {
     resetStore();
     const generateBlueprintPrompt = vi.fn();
     const sendPrompt = vi.fn(() => true);
-    useStore.setState({ generateBlueprintPrompt, sendPrompt });
+    useStore.setState({
+      composer: { ...defaultComposer, workspace: 'E:\\Game\\Demo' },
+      generateBlueprintPrompt,
+      sendPrompt,
+    });
     const view = await renderDock();
 
     const submitEnter = (input: HTMLTextAreaElement) =>
@@ -818,6 +964,7 @@ describe('AIDock slash suggestions', () => {
         typeTextarea(input, '/blueprint-mode-start --target BP_Player --context full');
         submitEnter(input);
       });
+      await flushAsyncWork();
       expect(useStore.getState().composer.blueprintMode).toBe(true);
       expect(useStore.getState().composer.blueprintModeStartedAt).toBeGreaterThan(0);
       expect(useStore.getState().composer.blueprintModeArgs).toBe(
@@ -871,7 +1018,11 @@ describe('AIDock slash suggestions', () => {
     resetStore();
     const generateBlueprintPrompt = vi.fn();
     const sendPrompt = vi.fn(() => true);
-    useStore.setState({ generateBlueprintPrompt, sendPrompt });
+    useStore.setState({
+      composer: { ...defaultComposer, workspace: 'E:\\Game\\Demo' },
+      generateBlueprintPrompt,
+      sendPrompt,
+    });
     const view = await renderDock();
 
     try {
@@ -890,6 +1041,7 @@ describe('AIDock slash suggestions', () => {
           }),
         );
       });
+      await flushAsyncWork();
 
       expect(useStore.getState().composer.blueprintMode).toBe(true);
       expect(useStore.getState().composer.blueprintModeArgs).toBe(
@@ -898,6 +1050,145 @@ describe('AIDock slash suggestions', () => {
       expect(generateBlueprintPrompt).toHaveBeenCalledWith('添加按 E 开门逻辑');
       expect(sendPrompt).not.toHaveBeenCalled();
       expect(input.value).toBe('');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('toggles sticky MetaHuman MVP mode via /metahuman-mode-start and /metahuman-mode-end', async () => {
+    resetStore();
+    const generateMetaHumanPrompt = vi.fn();
+    const sendPrompt = vi.fn(() => true);
+    useStore.setState({ generateMetaHumanPrompt, sendPrompt });
+    const view = await renderDock();
+
+    const submitEnter = (input: HTMLTextAreaElement) =>
+      input.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          ctrlKey: true,
+          bubbles: true,
+        }),
+      );
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(input, '/metahuman-mode-start 80% 亚洲硬朗脸，20% 成熟港风');
+        submitEnter(input);
+      });
+
+      expect(useStore.getState().composer.metahumanMode).toBe(true);
+      expect(useStore.getState().composer.metahumanModeStartedAt).toBeGreaterThan(0);
+      expect(useStore.getState().composer.uiMode).toBe(false);
+      expect(useStore.getState().composer.blueprintMode).toBe(false);
+      expect(generateMetaHumanPrompt).toHaveBeenCalledWith(
+        '80% 亚洲硬朗脸，20% 成熟港风',
+      );
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(
+        useStore
+          .getState()
+          .messages.some(
+            (m) =>
+              m.role === 'system' && m.text.includes('已进入 MetaHuman MVP 模式'),
+          ),
+      ).toBe(true);
+
+      await act(async () => {
+        typeTextarea(input, '先给我三版参考图 brief');
+        submitEnter(input);
+      });
+      expect(generateMetaHumanPrompt).toHaveBeenLastCalledWith(
+        '先给我三版参考图 brief',
+      );
+      expect(sendPrompt).not.toHaveBeenCalled();
+
+      await act(async () => {
+        typeTextarea(input, '/metahuman-mode-end');
+        submitEnter(input);
+      });
+      expect(useStore.getState().composer.metahumanMode).toBe(false);
+      expect(useStore.getState().composer.metahumanModeStartedAt).toBeNull();
+      expect(
+        useStore
+          .getState()
+          .messages.some(
+            (m) =>
+              m.role === 'system' && m.text.includes('已退出 MetaHuman MVP 模式'),
+          ),
+      ).toBe(true);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('asks to install BlueprintMode before entering UE Blueprint mode', async () => {
+    resetStore();
+    vi.mocked(blueprintModeStatus).mockResolvedValue({
+      ok: true,
+      sourceUrl: 'https://example.test/BlueprintMode.zip',
+      targetDir: 'E:\\Game\\Demo\\Plugins\\BlueprintMode',
+      exists: false,
+      installed: false,
+      upluginPath: null,
+      versionName: null,
+      notes: ['尚未安装 BlueprintMode 插件。'],
+      warnings: [],
+      error: null,
+    });
+    useStore.setState({
+      composer: {
+        ...defaultComposer,
+        workspace: 'E:\\Game\\Demo',
+      },
+    });
+    const generateBlueprintPrompt = vi.fn();
+    const sendPrompt = vi.fn(() => true);
+    useStore.setState({ generateBlueprintPrompt, sendPrompt });
+    const view = await renderDock();
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(
+          input,
+          '/blueprint-mode-start --target BP_Door 添加按 E 开门逻辑',
+        );
+        input.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            ctrlKey: true,
+            bubbles: true,
+          }),
+        );
+      });
+      await flushAsyncWork();
+
+      expect(useStore.getState().composer.blueprintMode).toBe(false);
+      expect(view.container.textContent).toContain(
+        '当前 UE 项目未安装 BlueprintMode 插件',
+      );
+      const installButton = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>('button'),
+      ).find((button) => button.textContent?.trim() === '安装 BlueprintMode 插件');
+      expect(installButton).toBeTruthy();
+
+      await act(async () => {
+        installButton?.click();
+      });
+      await flushAsyncWork();
+
+      expect(blueprintModeInstall).toHaveBeenCalledWith({
+        rootPath: 'E:\\Game\\Demo',
+        targetDir: null,
+        overwrite: false,
+      });
+      expect(useStore.getState().composer.blueprintMode).toBe(true);
+      expect(useStore.getState().composer.blueprintModeArgs).toBe('--target BP_Door');
+      expect(generateBlueprintPrompt).toHaveBeenCalledWith('添加按 E 开门逻辑');
     } finally {
       await view.cleanup();
     }
@@ -1228,6 +1519,46 @@ describe('AIDock slash suggestions', () => {
       );
       expect(sendPrompt).toHaveBeenCalledWith(
         expect.stringContaining('请求：\n检查 README'),
+      );
+      expect(runUltracodePrompt).not.toHaveBeenCalled();
+      expect(input.value).toBe('');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('expands /image-to-game into the image-driven game analysis prompt', async () => {
+    resetStore();
+    const sendPrompt = vi.fn(() => true);
+    const runUltracodePrompt = vi.fn();
+    useStore.setState({ sendPrompt, runUltracodePrompt });
+    const view = await renderDock();
+
+    try {
+      const input = textarea(view.container);
+
+      await act(async () => {
+        typeTextarea(input, '/image-to-game 这张横版像素场景截图');
+        input.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            ctrlKey: true,
+            bubbles: true,
+          }),
+        );
+      });
+
+      expect(sendPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('执行图像驱动游戏开发分析'),
+      );
+      expect(sendPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('优先按当前工作区检测/配置的项目引擎拆解'),
+      );
+      expect(sendPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('不要默认使用 Godot'),
+      );
+      expect(sendPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('请求：\n这张横版像素场景截图'),
       );
       expect(runUltracodePrompt).not.toHaveBeenCalled();
       expect(input.value).toBe('');

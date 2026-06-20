@@ -24,6 +24,10 @@ export interface ModelCallTiming {
 
 export interface CliTimeoutPolicy {
   timeoutSeconds: number;
+  /**
+   * No-progress timeout in seconds. 0 disables the idle watchdog; long-running
+   * tool calls can stay silent while waiting for external work such as CI.
+   */
   idleTimeoutSeconds: number;
 }
 
@@ -232,31 +236,22 @@ export function timeoutPolicyForSelection(
   const boost = promptBoostSeconds(prompt);
   const base =
     profile.tier === 'fast'
-      ? { hard: 1800, idle: 300 }
+      ? { hard: 1800 }
       : profile.tier === 'standard'
-        ? { hard: 2400, idle: 450 }
-        : { hard: 3600, idle: 900 };
+        ? { hard: 2400 }
+        : { hard: 3600 };
 
   const observedHard =
     profile.ewmaMs == null
       ? base.hard
       : Math.ceil(profile.ewmaMs / 1000) * 3 + 300;
-  const observedIdle =
-    profile.firstProgressEwmaMs == null
-      ? base.idle
-      : Math.ceil(profile.firstProgressEwmaMs / 1000) * 2 + 120;
-
   return {
     timeoutSeconds: clampSeconds(
       Math.max(base.hard, observedHard) + boost,
       600,
       7200,
     ),
-    idleTimeoutSeconds: clampSeconds(
-      Math.max(base.idle, observedIdle) + Math.floor(boost / 2),
-      180,
-      1800,
-    ),
+    idleTimeoutSeconds: 0,
   };
 }
 

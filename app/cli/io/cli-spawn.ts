@@ -83,8 +83,8 @@ function codexToolArgs(item: Record<string, unknown>): Record<string, unknown> |
 
 /** Default hard timeout (s) before the child is killed (mirrors lib.rs). */
 const DEFAULT_TIMEOUT_SECS = 1800;
-/** Default "no observable progress" timeout (s) (mirrors lib.rs). */
-const DEFAULT_IDLE_TIMEOUT_SECS = 300;
+/** Default "no observable progress" timeout (s) (mirrors lib.rs). 0 disables. */
+const DEFAULT_IDLE_TIMEOUT_SECS = 0;
 
 /** Options for {@link spawnCliAgent}. */
 export interface SpawnCliAgentOpts {
@@ -126,17 +126,14 @@ function resolveTimeoutSecs(override?: number): number {
 /** Clamp + env-override the idle timeout (mirrors ai_cli_idle_timeout_secs). 0 disables. */
 function resolveIdleTimeoutSecs(override?: number): number {
   const raw = process.env.FREEULTRACODE_AI_CLI_IDLE_TIMEOUT_SECS;
-  let configured = DEFAULT_IDLE_TIMEOUT_SECS;
   if (raw != null && raw.trim() !== '') {
     const n = Number(raw.trim());
-    if (Number.isFinite(n) && (n === 0 || n >= 30)) configured = Math.floor(n);
+    if (Number.isFinite(n) && (n === 0 || n >= 30)) return Math.floor(n);
   }
-  if (configured === 0) return 0;
   if (typeof override === 'number' && (override === 0 || override >= 30)) {
-    if (override === 0) return 0;
-    return Math.max(configured, Math.floor(override));
+    return Math.floor(override);
   }
-  return configured;
+  return DEFAULT_IDLE_TIMEOUT_SECS;
 }
 
 function flagEnabled(value: string | undefined): boolean {

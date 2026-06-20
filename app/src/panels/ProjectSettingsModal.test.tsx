@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import ProjectSettingsModal from './ProjectSettingsModal';
 import { DEFAULT_GAME_EXPERT_SETTINGS } from '@/lib/gameExperts';
 import {
+  blueprintModeInstall,
+  blueprintModeStatus,
+  blueprintModeUninstall,
   installSkillFromUrl,
   openExternal,
   probeProjectLspServer,
@@ -31,6 +34,9 @@ vi.mock('@/lib/tauri', async () => {
     installSkillFromText: vi.fn(),
     installSkillFromUrl: vi.fn(),
     uninstallSkill: vi.fn(),
+    blueprintModeStatus: vi.fn(),
+    blueprintModeInstall: vi.fn(),
+    blueprintModeUninstall: vi.fn(),
     tauriAvailable: vi.fn(() => false),
     scanProjectEnvironment: vi.fn(),
     unityMcpSetupProject: vi.fn(),
@@ -269,7 +275,6 @@ describe('ProjectSettingsModal game project tabs', () => {
         'UI 渠道',
         '绑定渠道',
         '抓帧/性能',
-        '游戏专家',
         '蓝图',
         '命令',
         '权限/自动化',
@@ -278,6 +283,88 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).not.toContain('MCP');
       expect(tabText).not.toContain('LSP');
       expect(tabText).not.toContain('Skills');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('detects installed BlueprintMode and exposes update/uninstall actions', async () => {
+    vi.mocked(blueprintModeStatus).mockResolvedValue({
+      ok: true,
+      sourceUrl: 'https://github.com/wellingfeng/ue-blueprint-mode',
+      targetDir: `${workspace.path}\\Plugins\\BlueprintMode`,
+      exists: true,
+      installed: true,
+      upluginPath: `${workspace.path}\\Plugins\\BlueprintMode\\BlueprintMode.uplugin`,
+      versionName: '0.1.0',
+      notes: ['已检测到 BlueprintMode 插件。'],
+      warnings: [],
+      error: null,
+    });
+    vi.mocked(blueprintModeInstall).mockResolvedValue({
+      ok: true,
+      sourceUrl: 'https://github.com/wellingfeng/ue-blueprint-mode',
+      targetDir: `${workspace.path}\\Plugins\\BlueprintMode`,
+      filesCopied: 3,
+      replacedExisting: true,
+      notes: ['已从 GitHub 下载并安装 3 个文件。'],
+      warnings: [],
+      error: null,
+    });
+    vi.mocked(blueprintModeUninstall).mockResolvedValue({
+      ok: true,
+      targetDir: `${workspace.path}\\Plugins\\BlueprintMode`,
+      removed: true,
+      notes: ['已卸载 BlueprintMode 插件。'],
+      warnings: [],
+      error: null,
+    });
+
+    const view = await renderProjectSettingsModal();
+
+    try {
+      vi.mocked(tauriAvailable).mockReturnValue(true);
+      const blueprintTab = Array.from(
+        view.container.querySelectorAll('nav [role="tab"]'),
+      ).find((tab) => tab.textContent?.trim() === '蓝图');
+
+      await act(async () => {
+        (blueprintTab as HTMLButtonElement).click();
+      });
+      await settle();
+
+      expect(blueprintModeStatus).toHaveBeenCalledWith({
+        rootPath: workspace.path,
+        targetDir: null,
+      });
+      expect(view.container.textContent).toContain('已安装');
+      expect(view.container.textContent).toContain('更新 BlueprintMode');
+      expect(view.container.textContent).toContain('卸载 BlueprintMode');
+
+      const updateButton = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>('button'),
+      ).find((button) => button.textContent?.trim() === '更新 BlueprintMode');
+      await act(async () => {
+        updateButton?.click();
+      });
+      await settle();
+      expect(blueprintModeInstall).toHaveBeenCalledWith({
+        rootPath: workspace.path,
+        targetDir: null,
+        overwrite: true,
+      });
+
+      const uninstallButton = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>('button'),
+      ).find((button) => button.textContent?.trim() === '卸载 BlueprintMode');
+      await act(async () => {
+        uninstallButton?.click();
+      });
+      await settle();
+      expect(blueprintModeUninstall).toHaveBeenCalledWith({
+        rootPath: workspace.path,
+        targetDir: null,
+      });
     } finally {
       await view.cleanup();
     }
@@ -486,6 +573,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       );
       expect(commandNames).toEqual([
         '/game',
+        '/image-to-game',
         '/mesh-mode-start',
         '/mesh-mode-end',
         '/mesh-search',
@@ -494,6 +582,8 @@ describe('ProjectSettingsModal game project tabs', () => {
         '/sprite-mode-end',
         '/blueprint-mode-start',
         '/blueprint-mode-end',
+        '/metahuman-mode-start',
+        '/metahuman-mode-end',
         '/ui-mode-start',
         '/ui-mode-end',
       ]);
@@ -526,9 +616,10 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(view.container.textContent).toContain('/sprite-mode-start');
       expect(view.container.textContent).toContain('设计流程');
       expect(view.container.textContent).toContain('复用生图路由');
-      expect(view.container.textContent).toContain('套 Sprite 协议');
-      expect(view.container.textContent).toContain('本地后处理');
-      expect(view.container.textContent).toContain('质检并导出');
+      expect(view.container.textContent).toContain('套 Sprite 合约');
+      expect(view.container.textContent).toContain('规范化准备');
+      expect(view.container.textContent).toContain('验收目标');
+      expect(view.container.textContent).toContain('raw sheet 规格');
       expect(view.container.textContent).toContain('Sheet 网格');
       expect(view.container.textContent).not.toContain('默认 Sprite 渠道');
       expect(view.container.textContent).not.toContain('商用渠道');
@@ -731,7 +822,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).toContain('在线模型库');
       expect(tabText).toContain('绑定渠道');
       expect(tabText).toContain('抓帧/性能');
-      expect(tabText).toContain('游戏专家');
+      expect(tabText).not.toContain('游戏专家');
       expect(tabText).toContain('命令');
       expect(tabText).not.toContain('蓝图');
       expect(view.container.textContent).toContain('游戏项目：开启');
@@ -769,7 +860,7 @@ describe('ProjectSettingsModal game project tabs', () => {
       expect(tabText).toContain('在线模型库');
       expect(tabText).toContain('绑定渠道');
       expect(tabText).toContain('抓帧/性能');
-      expect(tabText).toContain('游戏专家');
+      expect(tabText).not.toContain('游戏专家');
       expect(tabText).toContain('命令');
       expect(tabText).not.toContain('蓝图');
     } finally {

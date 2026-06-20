@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   GAME_PROJECT_COMMAND_NAMES,
+  GAME_SKILL_STATIC_ENTRIES,
   PROJECT_COMMAND_NAMES,
   STATIC_SLASH_ENTRIES,
+  buildGameSkillSuggestions,
   buildSlashSuggestions,
   isGameProjectCommandName,
   isProjectCommandName,
@@ -68,15 +70,21 @@ describe('slashEntrySourceAdapter', () => {
 });
 
 describe('withAppOnlyStaticEntries', () => {
-  it('appends app-only static entries the catalog does not enumerate', () => {
+  it('appends generic prompt shortcuts the catalog does not enumerate', () => {
     const merged = withAppOnlyStaticEntries([catalogEntry({})]);
     const names = merged.map((entry) => entry.name);
     expect(names).toContain('/status');
-    // App-only feature commands are folded back in.
-    expect(names).toContain('/image-mode-start');
-    expect(names).toContain('/sprite-mode-start');
-    expect(names).toContain('/blueprint-mode-start');
-    expect(names).toContain('/screenshot');
+    // Generic prompt shortcuts are folded back into the `/` menu.
+    expect(names).toContain('/plan');
+    expect(names).toContain('/review');
+    // GameSkills now live behind the `#游戏Skill` trigger, NOT the `/` menu.
+    expect(names).not.toContain('/image-mode-start');
+    expect(names).not.toContain('/image-to-game');
+    expect(names).not.toContain('/video-to-frames');
+    expect(names).not.toContain('/sprite-mode-start');
+    expect(names).not.toContain('/blueprint-mode-start');
+    expect(names).not.toContain('/metahuman-mode-start');
+    expect(names).not.toContain('/screenshot');
   });
 
   it('does not duplicate an entry already present in the catalog', () => {
@@ -106,10 +114,15 @@ describe('project command allowlist', () => {
   it('matches names case-insensitively and trims whitespace', () => {
     expect(isProjectCommandName('/ultracode')).toBe(true);
     expect(isProjectCommandName('  /Deep-Research ')).toBe(true);
+    expect(isProjectCommandName('  /IMAGE-TO-GAME ')).toBe(true);
+    expect(isProjectCommandName('  /VIDEO-TO-FRAMES ')).toBe(true);
     expect(isGameProjectCommandName('/sprite-mode-start')).toBe(true);
     expect(isGameProjectCommandName('/blueprint-mode-start')).toBe(true);
+    expect(isGameProjectCommandName('/metahuman-mode-start')).toBe(true);
+    expect(isGameProjectCommandName('  /METAHUMAN-MODE-END ')).toBe(true);
     expect(isGameProjectCommandName('  /BLUEPRINT-MODE-END ')).toBe(true);
     expect(isGameProjectCommandName('  /SPRITE ')).toBe(true);
+    expect(isGameProjectCommandName('  /IMAGE-TO-GAME ')).toBe(true);
     expect(isProjectCommandName('/sprite-mode-start')).toBe(false);
     expect(isGameProjectCommandName('/game')).toBe(true);
     expect(isGameProjectCommandName('  /MESH-MODE-START ')).toBe(true);
@@ -119,9 +132,9 @@ describe('project command allowlist', () => {
     expect(isProjectCommandName('/plan')).toBe(false);
   });
 
-  it('every allowlisted command has a static entry to render', () => {
+  it('every allowlisted command has a game-skill static entry to render', () => {
     const staticNames = new Set(
-      STATIC_SLASH_ENTRIES.map((entry) => entry.name.toLowerCase()),
+      GAME_SKILL_STATIC_ENTRIES.map((entry) => entry.name.toLowerCase()),
     );
     for (const name of PROJECT_COMMAND_NAMES) {
       expect(staticNames.has(name.toLowerCase())).toBe(true);
@@ -132,12 +145,14 @@ describe('project command allowlist', () => {
   });
 
   it('excludes generic prompt shortcuts from the project list', () => {
-    const projectOnly = buildSlashSuggestions([], 'en-US').filter((item) =>
+    const projectOnly = buildGameSkillSuggestions('en-US').filter((item) =>
       isProjectCommandName(item.name),
     );
     const names = projectOnly.map((item) => item.name);
     expect(names).toContain('/ultracode');
     expect(names).toContain('/deep-research');
+    expect(names).toContain('/image-to-game');
+    expect(names).toContain('/video-to-frames');
     expect(names).not.toContain('/sprite');
     expect(names).not.toContain('/sprite-mode-start');
     expect(names).not.toContain('/sprite-mode-end');
@@ -146,12 +161,25 @@ describe('project command allowlist', () => {
     expect(names).not.toContain('/review');
   });
 
+  it('keeps the video-to-frames command wired to the local Skill prompt', () => {
+    const command = buildGameSkillSuggestions('zh-CN').find(
+      (item) => item.name === '/video-to-frames',
+    );
+    expect(command?.label).toBe('视频转动画帧');
+    expect(command?.detail).toContain('video-to-animation-frames Skill');
+    expect(command?.insertText).toContain('video-to-animation-frames');
+    expect(command?.insertText).toContain(
+      '.codex/skills/video-to-animation-frames/scripts/video_to_animation_frames.py',
+    );
+  });
+
   it('groups sprite, mesh, and ui commands under the game project list', () => {
-    const gameOnly = buildSlashSuggestions([], 'en-US').filter((item) =>
+    const gameOnly = buildGameSkillSuggestions('en-US').filter((item) =>
       isGameProjectCommandName(item.name),
     );
     const names = gameOnly.map((item) => item.name);
     expect(names).toContain('/game');
+    expect(names).toContain('/image-to-game');
     expect(names).toContain('/mesh-mode-start');
     expect(names).toContain('/mesh-search');
     expect(names).toContain('/sprite');
@@ -159,6 +187,8 @@ describe('project command allowlist', () => {
     expect(names).toContain('/sprite-mode-end');
     expect(names).toContain('/blueprint-mode-start');
     expect(names).toContain('/blueprint-mode-end');
+    expect(names).toContain('/metahuman-mode-start');
+    expect(names).toContain('/metahuman-mode-end');
     expect(names).toContain('/ui-mode-start');
     expect(names).toContain('/ui-mode-end');
   });

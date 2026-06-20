@@ -15,6 +15,7 @@ import {
   ArrowUpToLine,
   Check,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Copy,
   Eye,
@@ -133,13 +134,25 @@ import type { Message } from '@/store/types';
 import {
   SLASH_COMMANDS,
   buildSlashSuggestions,
+  buildGameSkillSuggestions,
   slashText,
   type SlashSuggestion,
 } from '@/lib/slashCommands';
 import {
+  guardSlashCommandText,
+  type SlashCommandGuardSettings,
+} from '@/lib/slashCommandGuards';
+import {
   parseGameExpertCommand,
   gameExpertMenuEntries,
 } from '@/lib/gameExperts';
+import {
+  buildGameOrgTree,
+  flattenGameOrgNodes,
+  loadGameOrgDefinition,
+  type GameOrgNodeDefinition,
+  type ResolvedGameOrgNode,
+} from '@/lib/gameOrg';
 import {
   loadDockHeight,
   loadPaneWidth,
@@ -157,6 +170,8 @@ import {
 import { shouldRefocusComposerAfterAppend } from '@/lib/composerEntryPolicy';
 import {
   tauriAvailable,
+  blueprintModeInstall,
+  blueprintModeStatus,
   localModelStatus,
   listWorkspaceDirectory,
   onSlashCatalogUpdated,
@@ -204,6 +219,9 @@ import { translatePublicText } from '@/lib/publicTranslation';
 import { captureConversation } from '@/lib/sessionScreenshot';
 import { recordConversationGif } from '@/lib/sessionGif';
 import UltracodeRunCard from '@/panels/UltracodeRunCard';
+import GameTeamPanel, {
+  OPEN_GAME_TEAM_DETAILS_EVENT,
+} from '@/panels/GameTeamPanel';
 import FileText from '@/components/ai/FileText';
 import FilePreviewDrawer from '@/components/ai/FilePreviewDrawer';
 import type { FileRef } from '@/components/ai/lib/filePath';
@@ -416,6 +434,12 @@ interface SlashTrigger {
   query: string;
 }
 
+// Row variants for the inline `$组织架构` tree menu.
+type OrgMentionOption =
+  | { kind: 'back' }
+  | { kind: 'insert-self'; node: ResolvedGameOrgNode }
+  | { kind: 'node'; node: ResolvedGameOrgNode; hasChildren: boolean };
+
 interface FileMentionTrigger {
   start: number;
   end: number;
@@ -495,6 +519,36 @@ function findSlashTrigger(text: string, caret: number): SlashTrigger | null {
 
   const beforeCaret = text.slice(0, caret);
   const match = /(^|\s)\/([^\s/]*)$/.exec(beforeCaret);
+  if (!match) return null;
+
+  const query = match[2] ?? '';
+  const start = beforeCaret.length - query.length - 1;
+  return { start, end: caret, query };
+}
+
+// `#`-triggered GameSkill picker. Mirrors findSlashTrigger but listens for a
+// leading `#` so the FreeUltraCode-introduced GameSkills get their own discovery
+// surface ("#游戏Skill"). Picking an entry still inserts the canonical
+// `/command` token, so all existing submit-time routing and channel guards keep
+// working unchanged.
+function findGameSkillTrigger(text: string, caret: number): SlashTrigger | null {
+  if (caret < 1) return null;
+
+  const beforeCaret = text.slice(0, caret);
+  const match = /(^|\s)#([^\s#]*)$/.exec(beforeCaret);
+  if (!match) return null;
+
+  const query = match[2] ?? '';
+  const start = beforeCaret.length - query.length - 1;
+  return { start, end: caret, query };
+}
+
+// Mirrors findSlashTrigger but for the `$组织架构` inline tree menu, keyed on `$`.
+function findOrgMentionTrigger(text: string, caret: number): SlashTrigger | null {
+  if (caret < 1) return null;
+
+  const beforeCaret = text.slice(0, caret);
+  const match = /(^|\s)\$([^\s$]*)$/.exec(beforeCaret);
   if (!match) return null;
 
   const query = match[2] ?? '';
@@ -1384,6 +1438,77 @@ function splitInteractionOption(option: string): { title: string; detail: string
   return { title: option.trim(), detail: '' };
 }
 
+const BLUEPRINT_MODE_INSTALL_PROMPT =
+  '当前 UE 项目未安装 BlueprintMode 插件。是否现在安装？';
+const BLUEPRINT_MODE_INSTALL_LABEL = '安装 BlueprintMode 插件';
+
+interface BlueprintModeStartPayload {
+  modeArgs: string | null;
+  prompt: string;
+}
+
+function tokenizeCommandPayload(
+  raw: string,
+): Array<{ value: string; start: number; end: number }> {
+  const tokens: Array<{ value: string; start: number; end: number }> = [];
+  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|[^\s]+/g;
+  for (const match of raw.matchAll(re)) {
+    const value = match[1] ?? match[2] ?? match[0];
+    tokens.push({
+      value,
+      start: match.index ?? 0,
+      end: (match.index ?? 0) + match[0].length,
+    });
+  }
+  return tokens;
+}
+
+function blueprintFlagExpectsValue(flag: string): boolean {
+  if (flag.includes('=')) return false;
+  return new Set([
+    '--target',
+    '--context',
+    '--parent',
+    '--class',
+    '--asset',
+    '--path',
+    '--folder',
+    '--name',
+    '--package',
+    '--project',
+    '--map',
+    '--level',
+  ]).has(flag.toLowerCase());
+}
+
+function parseBlueprintModeStartPayload(rawPayload: string): BlueprintModeStartPayload {
+  const raw = rawPayload.trim();
+  if (!raw) return { modeArgs: null, prompt: '' };
+
+  const tokens = tokenizeCommandPayload(raw);
+  let index = 0;
+  let argsEnd = 0;
+  let promptStart = raw.length;
+
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (!token.value.startsWith('-')) {
+      promptStart = token.start;
+      break;
+    }
+    argsEnd = token.end;
+    index += 1;
+    if (blueprintFlagExpectsValue(token.value) && index < tokens.length) {
+      argsEnd = tokens[index].end;
+      index += 1;
+    }
+  }
+
+  const modeArgs = raw.slice(0, argsEnd).trim() || null;
+  const prompt = raw.slice(promptStart).trim();
+  return { modeArgs, prompt };
+}
+
 /**
  * Renders a node's interaction request (select / input / confirm) inside the
  * AI-return stream. States:
@@ -1704,7 +1829,10 @@ export default function AIDock({
   const generateSpeechPrompt = useStore((s) => s.generateSpeechPrompt);
   const generateSpritePrompt = useStore((s) => s.generateSpritePrompt);
   const generateComfyPrompt = useStore((s) => s.generateComfyPrompt);
+  const generateWorldPrompt = useStore((s) => s.generateWorldPrompt);
   const generateUiPrompt = useStore((s) => s.generateUiPrompt);
+  const generateBlueprintPrompt = useStore((s) => s.generateBlueprintPrompt);
+  const generateMetaHumanPrompt = useStore((s) => s.generateMetaHumanPrompt);
   const searchMeshLibraryPrompt = useStore((s) => s.searchMeshLibraryPrompt);
   const runUltracodePrompt = useStore((s) => s.runUltracodePrompt);
   const appendChatNote = useStore((s) => s.appendChatNote);
@@ -1802,7 +1930,10 @@ export default function AIDock({
   const draftRef = useRef(draft);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const slashTriggerRef = useRef<SlashTrigger | null>(null);
+  const gameSkillTriggerRef = useRef<SlashTrigger | null>(null);
   const fileMentionTriggerRef = useRef<FileMentionTrigger | null>(null);
+  const orgMentionTriggerRef = useRef<SlashTrigger | null>(null);
+  const orgMentionRef = useRef<HTMLDivElement>(null);
   const lastComposerFocusVersion = useRef(composerFocusVersion);
   const messageRefs = useRef(new Map<string, HTMLLIElement>());
   const activeSearchMatchNodeRef = useRef<HTMLElement | null>(null);
@@ -1836,11 +1967,6 @@ export default function AIDock({
   // a brand-new session prepares its working directory, so it locks once the
   // conversation starts. Only meaningful for chat/simple sessions with a cwd.
   const startupModeLocked = isReadOnly || messages.length > 0;
-  // New-session layout: in the chat surface, before any message lands, the input
-  // box floats in the vertical center (just under the hero prompt) instead of
-  // being pinned to the bottom. Once the conversation starts it returns to the
-  // bottom so the transcript can grow above it.
-  const centerInput = isChat && messages.length === 0;
   const sendShortcutHint = useMemo(
     () =>
       `${describeShortcutBinding(shortcutSettings['composer-send'])} ${t(
@@ -1856,14 +1982,37 @@ export default function AIDock({
   const [chatTitleEditing, setChatTitleEditing] = useState(false);
   const [chatTitleDraft, setChatTitleDraft] = useState('');
   const [chatTitleSaving, setChatTitleSaving] = useState(false);
+  // The organization chart is no longer a top tab beside the stream; it pops up
+  // from a `$组织架构` trigger at the input bottom and collapses on outside click.
+  const [orgPanelOpen, setOrgPanelOpen] = useState(false);
+  // New-session layout: in the chat surface, before any message lands, the input
+  // box floats in the vertical center.
+  const centerInput = isChat && messages.length === 0;
   const [returnSearchOpen, setReturnSearchOpen] = useState(false);
   const [returnSearch, setReturnSearch] = useState('');
   const [activeSearchMatchIndex, setActiveSearchMatchIndex] = useState(0);
   const [slashTrigger, setSlashTrigger] = useState<SlashTrigger | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
+  const [gameSkillTrigger, setGameSkillTrigger] =
+    useState<SlashTrigger | null>(null);
+  const [activeGameSkillIndex, setActiveGameSkillIndex] = useState(0);
   const [fileMentionTrigger, setFileMentionTrigger] =
     useState<FileMentionTrigger | null>(null);
   const [activeFileMentionIndex, setActiveFileMentionIndex] = useState(0);
+  // `$` at a word boundary opens an inline, searchable multi-level tree menu of
+  // the organization chart (drill down level by level, then insert the role's
+  // command). This is distinct from the bottom `$组织架构` button, which opens
+  // the full blueprint popup panel.
+  const [orgMentionTrigger, setOrgMentionTrigger] =
+    useState<SlashTrigger | null>(null);
+  const [activeOrgMentionIndex, setActiveOrgMentionIndex] = useState(0);
+  // The branch the inline menu is currently drilled into (null = root level).
+  const [orgMentionParentId, setOrgMentionParentId] = useState<string | null>(
+    null,
+  );
+  const [orgDefinition, setOrgDefinition] = useState<GameOrgNodeDefinition>(
+    () => loadGameOrgDefinition(),
+  );
   const [fileMentionListing, setFileMentionListing] =
     useState<FileMentionListing>({
       status: 'idle',
@@ -1880,7 +2029,10 @@ export default function AIDock({
   const blockedSendTipText =
     blockedSendTip === 'model-switched-while-chatting'
       ? t(locale, 'dock.modelSwitchBlockedTip')
-      : '';
+      : typeof blockedSendTip === 'object' &&
+          blockedSendTip?.kind === 'slash-command-unavailable'
+        ? blockedSendTip.message
+        : '';
 
   useEffect(() => {
     if (!blockedSendTip) return;
@@ -1991,6 +2143,20 @@ export default function AIDock({
         : [],
     [activeAdapterSlashSuggestions, slashTrigger],
   );
+  // GameSkill suggestions powering the `#游戏Skill` menu. Always sourced from the
+  // GameSkill registry (independent of the backend slash catalog / adapter scope)
+  // so the FreeUltraCode-introduced skills get a clean, app-curated surface.
+  const gameSkillSuggestions = useMemo(
+    () => buildGameSkillSuggestions(locale),
+    [locale],
+  );
+  const filteredGameSkillSuggestions = useMemo(
+    () =>
+      gameSkillTrigger
+        ? filterSlashSuggestions(gameSkillSuggestions, gameSkillTrigger.query)
+        : [],
+    [gameSkillSuggestions, gameSkillTrigger],
+  );
   const fileMentionOptions = useMemo(
     () =>
       fileMentionTrigger
@@ -2003,7 +2169,85 @@ export default function AIDock({
   );
   const slashOpen =
     !isReadOnly && slashTrigger !== null && filteredSlashSuggestions.length > 0;
+  const gameSkillOpen =
+    !isReadOnly &&
+    gameSkillTrigger !== null &&
+    filteredGameSkillSuggestions.length > 0;
   const fileMentionOpen = !isReadOnly && fileMentionTrigger !== null;
+  // Resolved organization tree for the inline `$` menu. Root is the team; its
+  // `children` form the first level the menu drills through.
+  const orgTree = useMemo(
+    () => buildGameOrgTree(gameExpertSettings, locale, orgDefinition),
+    [gameExpertSettings, locale, orgDefinition],
+  );
+  const orgNodesFlat = useMemo(
+    () => flattenGameOrgNodes(orgTree),
+    [orgTree],
+  );
+  const orgNodeById = useMemo(() => {
+    const map = new Map<string, ResolvedGameOrgNode>();
+    for (const node of orgNodesFlat) map.set(node.id, node);
+    return map;
+  }, [orgNodesFlat]);
+  // The node whose children the menu currently lists (null = root level).
+  const orgMentionParent = orgMentionParentId
+    ? orgNodeById.get(orgMentionParentId) ?? null
+    : null;
+  const orgMentionQuery = orgMentionTrigger?.query.trim() ?? '';
+  const orgMentionOptions = useMemo<OrgMentionOption[]>(() => {
+    if (!orgMentionTrigger) return [];
+    const query = orgMentionTrigger.query.trim().toLocaleLowerCase();
+    // Search mode: flat match across every node, regardless of drill level.
+    if (query) {
+      return orgNodesFlat
+        .filter((node) => node.id !== orgTree.id)
+        .filter((node) => {
+          const haystack = [
+            node.label,
+            node.role,
+            node.summary,
+            ...node.path,
+            ...node.groupLabels,
+          ]
+            .join(' ')
+            .toLocaleLowerCase();
+          return haystack.includes(query);
+        })
+        .slice(0, 30)
+        .map<OrgMentionOption>((node) => ({
+          kind: 'node',
+          node,
+          hasChildren: node.children.length > 0,
+        }));
+    }
+    // Tree-navigation mode: list the current branch's children, with a back row
+    // and a self-insert row when drilled past the root.
+    const parent = orgMentionParentId
+      ? orgNodeById.get(orgMentionParentId) ?? null
+      : null;
+    const levelNodes = parent ? parent.children : orgTree.children;
+    const out: OrgMentionOption[] = [];
+    if (parent) {
+      out.push({ kind: 'back' });
+      out.push({ kind: 'insert-self', node: parent });
+    }
+    for (const node of levelNodes) {
+      out.push({ kind: 'node', node, hasChildren: node.children.length > 0 });
+    }
+    return out;
+  }, [
+    orgMentionParentId,
+    orgMentionTrigger,
+    orgNodeById,
+    orgNodesFlat,
+    orgTree,
+  ]);
+  const orgMentionOpen =
+    !isReadOnly && orgMentionTrigger !== null && orgMentionOptions.length > 0;
+  useEffect(() => {
+    if (activeOrgMentionIndex < orgMentionOptions.length) return;
+    setActiveOrgMentionIndex(0);
+  }, [activeOrgMentionIndex, orgMentionOptions.length]);
   useEffect(() => {
     if (activeFileMentionIndex < fileMentionOptions.length) return;
     setActiveFileMentionIndex(0);
@@ -2484,6 +2728,25 @@ export default function AIDock({
     },
     [],
   );
+  const slashGuardSettings = useMemo<SlashCommandGuardSettings>(
+    () => ({
+      image: imageSettings,
+      music: musicSettings,
+      threeD: threeDSettings,
+      video: videoSettings,
+      speech: speechSettings,
+    }),
+    [imageSettings, musicSettings, speechSettings, threeDSettings, videoSettings],
+  );
+  const currentSlashGuard = useMemo(
+    () => guardSlashCommandText(draft, composer, slashGuardSettings),
+    [composer, draft, slashGuardSettings],
+  );
+  const slashGuardTipText =
+    currentSlashGuard && !currentSlashGuard.ok
+      ? currentSlashGuard.message ?? ''
+      : '';
+  const composerTipText = blockedSendTipText || slashGuardTipText;
   const channelSelectOptions = useMemo<SelectOption[]>(
     () => {
       const defaultOptions = RUNTIME_ADAPTERS.flatMap((adapter) => {
@@ -2966,6 +3229,191 @@ export default function AIDock({
     () => fileMentionRootFolders.map(workspacePathKey).join('|'),
     [fileMentionRootFolders],
   );
+  const enterBlueprintMode = useCallback((
+    modeArgs: string | null | undefined,
+    prompt: string | undefined,
+  ) => {
+    const currentComposer = useStore.getState().composer;
+    const wasBlueprintMode = currentComposer.blueprintMode;
+    const startedAt = wasBlueprintMode
+      ? currentComposer.blueprintModeStartedAt ?? Date.now()
+      : Date.now();
+    setComposer({
+      imageMode: false,
+      imageModeStartedAt: null,
+      musicMode: false,
+      musicModeStartedAt: null,
+      threeDMode: false,
+      threeDModeStartedAt: null,
+      comfyMode: false,
+      comfyModeStartedAt: null,
+      videoMode: false,
+      videoModeStartedAt: null,
+      spriteMode: false,
+      spriteModeStartedAt: null,
+      speechMode: false,
+      speechModeStartedAt: null,
+      uiMode: false,
+      uiModeStartedAt: null,
+      metahumanMode: false,
+      metahumanModeStartedAt: null,
+      worldMode: false,
+      worldModeStartedAt: null,
+      blueprintMode: true,
+      blueprintModeStartedAt: startedAt,
+      blueprintModeArgs: modeArgs?.trim() || null,
+    });
+    if (!wasBlueprintMode) {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '🧩 已进入 UE 蓝图模式 · 之后每条消息会按 Unreal Blueprint 创建、修改、编译和校验处理，发送 /blueprint-mode-end 退出'
+          : '🧩 UE Blueprint mode on · every message now targets Unreal Blueprint creation, editing, compilation, and verification; send /blueprint-mode-end to exit',
+        'system',
+      );
+    }
+    const firstPrompt = prompt?.trim();
+    if (firstPrompt) generateBlueprintPrompt(firstPrompt);
+  }, [appendChatNote, generateBlueprintPrompt, locale, setComposer]);
+
+  const requestBlueprintModeInstall = useCallback((
+    rootPath: string,
+    modeArgs: string | null,
+    prompt: string,
+  ) => {
+    appendChatNote(BLUEPRINT_MODE_INSTALL_PROMPT, 'assistant', {
+      interaction: {
+        type: 'confirm',
+        prompt: BLUEPRINT_MODE_INSTALL_PROMPT,
+        confirmLabel: BLUEPRINT_MODE_INSTALL_LABEL,
+        cancelLabel: t(locale, 'common.cancel'),
+      },
+      appAction: {
+        type: 'blueprint-mode-install',
+        rootPath,
+        modeArgs,
+        prompt,
+      },
+    });
+  }, [appendChatNote, locale]);
+
+  const startBlueprintModeFromCommand = useCallback(async (payload: string) => {
+    const { modeArgs, prompt } = parseBlueprintModeStartPayload(payload);
+    const rootPath = (workspaceCwd || activeWorkspacePath).trim();
+    if (!rootPath) {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '⚠️ 先选择 Unreal Engine 项目目录，才能检查或安装 BlueprintMode 插件。'
+          : '⚠️ Select an Unreal Engine project folder before checking or installing BlueprintMode.',
+      );
+      return;
+    }
+    if (!tauriAvailable()) {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '⚠️ BlueprintMode 插件检查和安装需要在桌面应用中运行。'
+          : '⚠️ BlueprintMode plugin checks and installation require the desktop app.',
+      );
+      return;
+    }
+    try {
+      const status = await blueprintModeStatus({ rootPath, targetDir: null });
+      if (!status.ok) {
+        appendChatNote(
+          status.error ||
+            (locale === 'zh-CN'
+              ? '⚠️ 当前工作区无法启用 BlueprintMode。'
+              : '⚠️ BlueprintMode cannot be enabled for this workspace.'),
+        );
+        return;
+      }
+      if (status.installed) {
+        enterBlueprintMode(modeArgs, prompt);
+        return;
+      }
+      requestBlueprintModeInstall(rootPath, modeArgs, prompt);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      appendChatNote(
+        locale === 'zh-CN'
+          ? `⚠️ 检查 BlueprintMode 插件失败：${msg}`
+          : `⚠️ Failed to check BlueprintMode plugin: ${msg}`,
+      );
+    }
+  }, [
+    activeWorkspacePath,
+    appendChatNote,
+    enterBlueprintMode,
+    locale,
+    requestBlueprintModeInstall,
+    workspaceCwd,
+  ]);
+  const handleInteractionAnswer = useCallback((
+    message: Message,
+    answer: InteractionAnswer,
+  ) => {
+    answerInteraction(message.id, answer);
+    const action = message.appAction;
+    if (action?.type !== 'blueprint-mode-install') return;
+    if (answer.kind !== 'confirm' || !answer.confirmed) {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '已取消安装 BlueprintMode，未进入 UE 蓝图模式。'
+          : 'BlueprintMode installation cancelled; UE Blueprint mode was not enabled.',
+        'system',
+      );
+      return;
+    }
+    void (async () => {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '正在安装 BlueprintMode 插件…'
+          : 'Installing BlueprintMode plugin...',
+        'system',
+      );
+      try {
+        const result = await blueprintModeInstall({
+          rootPath: action.rootPath,
+          targetDir: null,
+          overwrite: false,
+        });
+        if (!result.ok) {
+          appendChatNote(
+            result.error ||
+              (locale === 'zh-CN'
+                ? 'BlueprintMode 插件安装失败。'
+                : 'BlueprintMode plugin installation failed.'),
+          );
+          return;
+        }
+        appendChatNote(
+          locale === 'zh-CN'
+            ? '✅ BlueprintMode 插件已安装；若 Unreal Editor 已打开，请重启后生效。'
+            : '✅ BlueprintMode plugin installed; restart Unreal Editor if it is already open.',
+          'system',
+        );
+        enterBlueprintMode(action.modeArgs, action.prompt);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        appendChatNote(
+          locale === 'zh-CN'
+            ? `BlueprintMode 插件安装失败：${msg}`
+            : `BlueprintMode plugin installation failed: ${msg}`,
+        );
+      }
+    })();
+  }, [answerInteraction, appendChatNote, enterBlueprintMode, locale]);
+
+  const handleInteractionDismiss = useCallback((message: Message) => {
+    dismissInteraction(message.id);
+    if (message.appAction?.type === 'blueprint-mode-install') {
+      appendChatNote(
+        locale === 'zh-CN'
+          ? '已取消安装 BlueprintMode，未进入 UE 蓝图模式。'
+          : 'BlueprintMode installation cancelled; UE Blueprint mode was not enabled.',
+        'system',
+      );
+    }
+  }, [appendChatNote, dismissInteraction, locale]);
   useEffect(() => {
     if (!fileMentionTrigger || isReadOnly) return;
 
@@ -3121,6 +3569,62 @@ export default function AIDock({
     () => loadPaneWidth(CHAT_INPUT_HEIGHT_KEY) ?? CHAT_INPUT_HEIGHT,
   );
   const dockRef = useRef<HTMLDivElement>(null);
+  const orgPanelRef = useRef<HTMLDivElement>(null);
+  const inputSectionRef = useRef<HTMLElement>(null);
+  // Live height of the input composer section. The `$组织架构` popup anchors its
+  // bottom edge to this so it never overlaps the (variable-height) input bar.
+  const [inputSectionHeight, setInputSectionHeight] = useState(0);
+
+  // Track the input section height while the popup is open so the popup always
+  // floats just above the composer instead of covering it.
+  useEffect(() => {
+    if (!orgPanelOpen) return;
+    const el = inputSectionRef.current;
+    if (!el) return;
+    const measure = () => setInputSectionHeight(el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [orgPanelOpen]);
+
+  // Collapse the organization popup when clicking anywhere outside of it (the
+  // trigger button toggles it directly, so ignore clicks that land on it).
+  useEffect(() => {
+    if (!orgPanelOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const panel = orgPanelRef.current;
+      const target = event.target as HTMLElement | null;
+      if (panel && target && panel.contains(target)) return;
+      if (target && target.closest('[data-org-panel-trigger]')) return;
+      setOrgPanelOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOrgPanelOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [orgPanelOpen]);
+
+  // Keep the inline `$` menu's org definition fresh: reload when the popup
+  // panel closes (it may have edited the chart) and on cross-tab storage edits.
+  useEffect(() => {
+    if (orgPanelOpen) return;
+    setOrgDefinition(loadGameOrgDefinition());
+  }, [orgPanelOpen]);
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && !event.key.includes('gameOrgDefinition')) return;
+      setOrgDefinition(loadGameOrgDefinition());
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
 
   const setActiveSearchMatchNode = useCallback((node: HTMLElement | null) => {
     activeSearchMatchNodeRef.current = node;
@@ -3341,16 +3845,36 @@ export default function AIDock({
     setActiveSlashIndex(0);
   }, []);
 
+  const closeGameSkillSuggestions = useCallback(() => {
+    gameSkillTriggerRef.current = null;
+    setGameSkillTrigger(null);
+    setActiveGameSkillIndex(0);
+  }, []);
+
   const closeFileMentionSuggestions = useCallback(() => {
     fileMentionTriggerRef.current = null;
     setFileMentionTrigger(null);
     setActiveFileMentionIndex(0);
   }, []);
 
+  const closeOrgMentionSuggestions = useCallback(() => {
+    orgMentionTriggerRef.current = null;
+    setOrgMentionTrigger(null);
+    setActiveOrgMentionIndex(0);
+    setOrgMentionParentId(null);
+  }, []);
+
   const closeComposerSuggestions = useCallback(() => {
     closeSlashSuggestions();
+    closeGameSkillSuggestions();
     closeFileMentionSuggestions();
-  }, [closeFileMentionSuggestions, closeSlashSuggestions]);
+    closeOrgMentionSuggestions();
+  }, [
+    closeFileMentionSuggestions,
+    closeGameSkillSuggestions,
+    closeOrgMentionSuggestions,
+    closeSlashSuggestions,
+  ]);
 
   const syncSlashTrigger = useCallback(
     (target: HTMLTextAreaElement | null = inputRef.current) => {
@@ -3372,6 +3896,28 @@ export default function AIDock({
       setActiveSlashIndex(0);
     },
     [closeSlashSuggestions, isReadOnly],
+  );
+
+  const syncGameSkillTrigger = useCallback(
+    (target: HTMLTextAreaElement | null = inputRef.current) => {
+      if (!target || isReadOnly || target.selectionStart !== target.selectionEnd) {
+        closeGameSkillSuggestions();
+        return;
+      }
+
+      const next = findGameSkillTrigger(target.value, target.selectionStart);
+      const prev = gameSkillTriggerRef.current;
+      const unchanged =
+        prev?.start === next?.start &&
+        prev?.end === next?.end &&
+        prev?.query === next?.query;
+      if (unchanged) return;
+
+      gameSkillTriggerRef.current = next;
+      setGameSkillTrigger(next);
+      setActiveGameSkillIndex(0);
+    },
+    [closeGameSkillSuggestions, isReadOnly],
   );
 
   const syncFileMentionTrigger = useCallback(
@@ -3397,12 +3943,48 @@ export default function AIDock({
     [closeFileMentionSuggestions, isReadOnly],
   );
 
+  const syncOrgMentionTrigger = useCallback(
+    (target: HTMLTextAreaElement | null = inputRef.current) => {
+      if (
+        !isChat ||
+        !target ||
+        isReadOnly ||
+        target.selectionStart !== target.selectionEnd
+      ) {
+        closeOrgMentionSuggestions();
+        return;
+      }
+
+      const next = findOrgMentionTrigger(target.value, target.selectionStart);
+      const prev = orgMentionTriggerRef.current;
+      const unchanged =
+        prev?.start === next?.start &&
+        prev?.end === next?.end &&
+        prev?.query === next?.query;
+      if (unchanged) return;
+
+      orgMentionTriggerRef.current = next;
+      setOrgMentionTrigger(next);
+      setActiveOrgMentionIndex(0);
+      // Leaving the `$` token entirely resets the drill level for next time.
+      if (!next) setOrgMentionParentId(null);
+    },
+    [closeOrgMentionSuggestions, isChat, isReadOnly],
+  );
+
   const syncComposerSuggestions = useCallback(
     (target: HTMLTextAreaElement | null = inputRef.current) => {
       syncSlashTrigger(target);
+      syncGameSkillTrigger(target);
       syncFileMentionTrigger(target);
+      syncOrgMentionTrigger(target);
     },
-    [syncFileMentionTrigger, syncSlashTrigger],
+    [
+      syncFileMentionTrigger,
+      syncGameSkillTrigger,
+      syncOrgMentionTrigger,
+      syncSlashTrigger,
+    ],
   );
 
   const insertComposerText = useCallback(
@@ -3458,6 +4040,147 @@ export default function AIDock({
       });
     },
     [closeSlashSuggestions, isReadOnly, setComposerDraft],
+  );
+
+  // Replaces the active `#…` token with the GameSkill's canonical `/command`
+  // token. We deliberately insert the slash command (not the protocol text) so
+  // every existing submit-time route and channel guard keeps working unchanged —
+  // `#` is purely a discovery surface for the FreeUltraCode GameSkills.
+  const applyGameSkillSuggestion = useCallback(
+    (suggestion: SlashSuggestion) => {
+      if (isReadOnly) return;
+
+      const trigger = gameSkillTriggerRef.current;
+      if (!trigger) return;
+
+      const current = draftRef.current;
+      const start = clampSelection(trigger.start, current.length);
+      const end = clampSelection(trigger.end, current.length);
+      const after = current.slice(end);
+      const spacer = after.length > 0 && /^\s/.test(after) ? '' : ' ';
+      const inserted = `${suggestion.name}${spacer}`;
+      const next = current.slice(0, start) + inserted + after;
+      const caret = start + inserted.length;
+
+      draftRef.current = next;
+      selectionRef.current = { start: caret, end: caret };
+      setComposerDraft(next);
+      closeGameSkillSuggestions();
+
+      window.requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!(el instanceof HTMLTextAreaElement)) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
+    },
+    [closeGameSkillSuggestions, isReadOnly, setComposerDraft],
+  );
+
+  // Replaces the active `$…` token with a role's command text and closes the
+  // inline menu (the terminal action when picking a node).
+  const insertOrgMentionCommand = useCallback(
+    (node: ResolvedGameOrgNode) => {
+      if (isReadOnly) return;
+      const trigger = orgMentionTriggerRef.current;
+      if (!trigger) return;
+
+      const command = (node.commandText ?? '').trim();
+      const current = draftRef.current;
+      const start = clampSelection(trigger.start, current.length);
+      const end = clampSelection(trigger.end, current.length);
+      const after = current.slice(end);
+      const spacer = command && after.length > 0 && /^\s/.test(after) ? '' : ' ';
+      const inserted = command ? `${command}${spacer}` : '';
+      const next = current.slice(0, start) + inserted + after;
+      const caret = start + inserted.length;
+
+      draftRef.current = next;
+      selectionRef.current = { start: caret, end: caret };
+      setComposerDraft(next);
+      closeOrgMentionSuggestions();
+
+      window.requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!(el instanceof HTMLTextAreaElement)) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
+    },
+    [closeOrgMentionSuggestions, isReadOnly, setComposerDraft],
+  );
+
+  // Drills the inline menu into a branch: clears the typed query (back to the
+  // `$` token) and lists the branch's children.
+  const drillOrgMention = useCallback(
+    (parentId: string | null) => {
+      const trigger = orgMentionTriggerRef.current;
+      setOrgMentionParentId(parentId);
+      setActiveOrgMentionIndex(0);
+      if (!trigger || trigger.query.length === 0) return;
+      // Strip any typed query so the navigation view (not search) is shown.
+      const current = draftRef.current;
+      const start = clampSelection(trigger.start, current.length);
+      const end = clampSelection(trigger.end, current.length);
+      const next = current.slice(0, start + 1) + current.slice(end);
+      const caret = start + 1;
+      const resetTrigger: SlashTrigger = { start, end: caret, query: '' };
+      orgMentionTriggerRef.current = resetTrigger;
+      draftRef.current = next;
+      selectionRef.current = { start: caret, end: caret };
+      setComposerDraft(next);
+      setOrgMentionTrigger(resetTrigger);
+      window.requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!(el instanceof HTMLTextAreaElement)) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
+    },
+    [setComposerDraft],
+  );
+
+  // Handles a click/Enter on any inline-menu row.
+  const applyOrgMentionOption = useCallback(
+    (option: OrgMentionOption) => {
+      if (isReadOnly) return;
+      if (option.kind === 'back') {
+        const parent = orgMentionParentId
+          ? orgNodeById.get(orgMentionParentId) ?? null
+          : null;
+        // Find the node whose children include the current branch. If that is
+        // the root, the menu returns to the top (null) level rather than
+        // listing the root node itself.
+        const owner = parent
+          ? orgNodesFlat.find((candidate) =>
+              candidate.children.some((child) => child.id === parent.id),
+            ) ?? null
+          : null;
+        const grandparentId =
+          owner && owner.id !== orgTree.id ? owner.id : null;
+        drillOrgMention(grandparentId);
+        return;
+      }
+      if (option.kind === 'insert-self') {
+        insertOrgMentionCommand(option.node);
+        return;
+      }
+      // A branch node drills in; a leaf inserts its command immediately.
+      if (option.hasChildren) {
+        drillOrgMention(option.node.id);
+      } else {
+        insertOrgMentionCommand(option.node);
+      }
+    },
+    [
+      drillOrgMention,
+      insertOrgMentionCommand,
+      isReadOnly,
+      orgMentionParentId,
+      orgNodeById,
+      orgNodesFlat,
+      orgTree,
+    ],
   );
 
   const applyFileMentionOption = useCallback(
@@ -3546,6 +4269,34 @@ export default function AIDock({
     openSlashMenu();
     window.requestAnimationFrame(openSlashMenu);
   }, [closeFileMentionSuggestions, insertComposerText, isReadOnly]);
+
+  const startGameSkill = useCallback(() => {
+    if (isReadOnly) return;
+    const current = draftRef.current;
+    const start = clampSelection(selectionRef.current.start, current.length);
+    const prefix = start > 0 && !/\s/.test(current[start - 1] ?? '') ? ' ' : '';
+    const triggerStart = start + prefix.length;
+    const nextTrigger: SlashTrigger = {
+      start: triggerStart,
+      end: triggerStart + 1,
+      query: '',
+    };
+    const openGameSkillMenu = () => {
+      gameSkillTriggerRef.current = nextTrigger;
+      setGameSkillTrigger(nextTrigger);
+      setActiveGameSkillIndex(0);
+    };
+    insertComposerText(`${prefix}#`);
+    closeSlashSuggestions();
+    closeFileMentionSuggestions();
+    openGameSkillMenu();
+    window.requestAnimationFrame(openGameSkillMenu);
+  }, [
+    closeFileMentionSuggestions,
+    closeSlashSuggestions,
+    insertComposerText,
+    isReadOnly,
+  ]);
 
   const handlePaste = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
@@ -3695,6 +4446,14 @@ export default function AIDock({
         : 0,
     );
   }, [filteredSlashSuggestions.length]);
+
+  useEffect(() => {
+    setActiveGameSkillIndex((current) =>
+      filteredGameSkillSuggestions.length > 0
+        ? Math.min(current, filteredGameSkillSuggestions.length - 1)
+        : 0,
+    );
+  }, [filteredGameSkillSuggestions.length]);
 
   useEffect(() => {
     if (returnSearchOpen) focusSearchInput();
@@ -4250,6 +5009,16 @@ export default function AIDock({
     const text = (overrideText ?? draft).trim();
     if (!text) return;
     closeComposerSuggestions();
+    const sendGuard = guardSlashCommandText(text, composer, slashGuardSettings);
+    if (sendGuard && !sendGuard.ok) {
+      useStore.setState({
+        blockedSendTip: {
+          kind: 'slash-command-unavailable',
+          message: sendGuard.message ?? '当前指令缺少必要渠道配置。',
+        },
+      });
+      return;
+    }
     // The user is sending something — always follow the new content to the
     // bottom regardless of where they had scrolled. We pin intent here so a
     // stale non-bottom snapshot can't suppress the post-render scroll.
@@ -4301,6 +5070,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasImageMode) {
@@ -4350,6 +5123,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasMusicMode) {
@@ -4400,6 +5177,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasVideoMode) {
@@ -4450,6 +5231,10 @@ export default function AIDock({
         speechModeStartedAt: startedAt,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasSpeechMode) {
@@ -4500,6 +5285,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasSpriteMode) {
@@ -4548,6 +5337,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasThreeDMode) {
@@ -4590,6 +5383,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: false,
         uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasComfyMode) {
@@ -4607,6 +5404,60 @@ export default function AIDock({
       if (wasComfyMode) {
         appendChatNote(t(locale, 'dock.comfyModeExited'), 'system');
       }
+      return;
+    }
+    const worldModeStart = /^\/(?:worldmodel|world-model)-mode-start(?:\s+([\s\S]*))?$/i.exec(text);
+    if (worldModeStart) {
+      const wasWorldMode = composer.worldMode;
+      const startedAt = wasWorldMode
+        ? composer.worldModeStartedAt ?? Date.now()
+        : Date.now();
+      setComposer({
+        imageMode: false,
+        imageModeStartedAt: null,
+        musicMode: false,
+        musicModeStartedAt: null,
+        threeDMode: false,
+        threeDModeStartedAt: null,
+        comfyMode: false,
+        comfyModeStartedAt: null,
+        videoMode: false,
+        videoModeStartedAt: null,
+        spriteMode: false,
+        spriteModeStartedAt: null,
+        speechMode: false,
+        speechModeStartedAt: null,
+        uiMode: false,
+        uiModeStartedAt: null,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: true,
+        worldModeStartedAt: startedAt,
+      });
+      clearDraftIfNeeded();
+      if (!wasWorldMode) {
+        appendChatNote(t(locale, 'dock.worldModeEntered'), 'system');
+      }
+      const prompt = (worldModeStart[1] ?? '').trim();
+      if (prompt) generateWorldPrompt(prompt);
+      return;
+    }
+    const worldModeEnd = /^\/(?:worldmodel|world-model)-mode-end(?:\s+([\s\S]*))?$/i.exec(text);
+    if (worldModeEnd) {
+      const wasWorldMode = composer.worldMode;
+      setComposer({ worldMode: false, worldModeStartedAt: null });
+      clearDraftIfNeeded();
+      if (wasWorldMode) {
+        appendChatNote(t(locale, 'dock.worldModeExited'), 'system');
+      }
+      return;
+    }
+    const worldMatch = /^\/(?:worldmodel|world-model|世界模型)(?:\s+([\s\S]*))?$/iu.exec(text);
+    if (worldMatch) {
+      const prompt = (worldMatch[1] ?? '').trim();
+      if (!prompt) return;
+      generateWorldPrompt(text);
+      clearDraftIfNeeded();
       return;
     }
     const uiModeStart = /^\/ui-mode-start(?:\s+([\s\S]*))?$/i.exec(text);
@@ -4632,6 +5483,10 @@ export default function AIDock({
         speechModeStartedAt: null,
         uiMode: true,
         uiModeStartedAt: startedAt,
+        metahumanMode: false,
+        metahumanModeStartedAt: null,
+        worldMode: false,
+        worldModeStartedAt: null,
       });
       clearDraftIfNeeded();
       if (!wasUiMode) {
@@ -4648,6 +5503,80 @@ export default function AIDock({
       clearDraftIfNeeded();
       if (wasUiMode) {
         appendChatNote(t(locale, 'dock.uiModeExited'), 'system');
+      }
+      return;
+    }
+    const metahumanModeStart = /^\/metahuman-mode-start(?:\s+([\s\S]*))?$/i.exec(text);
+    if (metahumanModeStart) {
+      const wasMetaHumanMode = composer.metahumanMode;
+      const startedAt = wasMetaHumanMode
+        ? composer.metahumanModeStartedAt ?? Date.now()
+        : Date.now();
+      setComposer({
+        imageMode: false,
+        imageModeStartedAt: null,
+        musicMode: false,
+        musicModeStartedAt: null,
+        threeDMode: false,
+        threeDModeStartedAt: null,
+        comfyMode: false,
+        comfyModeStartedAt: null,
+        videoMode: false,
+        videoModeStartedAt: null,
+        spriteMode: false,
+        spriteModeStartedAt: null,
+        speechMode: false,
+        speechModeStartedAt: null,
+        uiMode: false,
+        uiModeStartedAt: null,
+        blueprintMode: false,
+        blueprintModeStartedAt: null,
+        blueprintModeArgs: null,
+        worldMode: false,
+        worldModeStartedAt: null,
+        metahumanMode: true,
+        metahumanModeStartedAt: startedAt,
+      });
+      clearDraftIfNeeded();
+      if (!wasMetaHumanMode) {
+        appendChatNote(t(locale, 'dock.metahumanModeEntered'), 'system');
+      }
+      const prompt = (metahumanModeStart[1] ?? '').trim();
+      if (prompt) generateMetaHumanPrompt(prompt);
+      return;
+    }
+    const metahumanModeEnd = /^\/metahuman-mode-end(?:\s+([\s\S]*))?$/i.exec(text);
+    if (metahumanModeEnd) {
+      const wasMetaHumanMode = composer.metahumanMode;
+      setComposer({ metahumanMode: false, metahumanModeStartedAt: null });
+      clearDraftIfNeeded();
+      if (wasMetaHumanMode) {
+        appendChatNote(t(locale, 'dock.metahumanModeExited'), 'system');
+      }
+      return;
+    }
+    const blueprintModeStart = /^\/blueprint-mode-start(?:\s+([\s\S]*))?$/i.exec(text);
+    if (blueprintModeStart) {
+      clearDraftIfNeeded();
+      void startBlueprintModeFromCommand((blueprintModeStart[1] ?? '').trim());
+      return;
+    }
+    const blueprintModeEnd = /^\/blueprint-mode-end(?:\s+([\s\S]*))?$/i.exec(text);
+    if (blueprintModeEnd) {
+      const wasBlueprintMode = composer.blueprintMode;
+      setComposer({
+        blueprintMode: false,
+        blueprintModeStartedAt: null,
+        blueprintModeArgs: null,
+      });
+      clearDraftIfNeeded();
+      if (wasBlueprintMode) {
+        appendChatNote(
+          locale === 'zh-CN'
+            ? '↩ 已退出 UE 蓝图模式 · 已切回 AI 编程渠道与模型'
+            : '↩ UE Blueprint mode off · switched back to the AI coding channel and model',
+          'system',
+        );
       }
       return;
     }
@@ -4737,8 +5666,23 @@ export default function AIDock({
       clearDraftIfNeeded();
       return;
     }
+    if (composer.worldMode && !text.startsWith('/')) {
+      generateWorldPrompt(text);
+      clearDraftIfNeeded();
+      return;
+    }
     if (composer.uiMode && !text.startsWith('/')) {
       generateUiPrompt(text);
+      clearDraftIfNeeded();
+      return;
+    }
+    if (composer.metahumanMode && !text.startsWith('/')) {
+      generateMetaHumanPrompt(text);
+      clearDraftIfNeeded();
+      return;
+    }
+    if (composer.blueprintMode && !text.startsWith('/')) {
+      generateBlueprintPrompt(text);
       clearDraftIfNeeded();
       return;
     }
@@ -4762,7 +5706,10 @@ export default function AIDock({
       })();
       return;
     }
-    const promptText = expandSlashRequest(text, activeAdapterSlashSuggestions);
+    const promptText = expandSlashRequest(text, [
+      ...activeAdapterSlashSuggestions,
+      ...gameSkillSuggestions,
+    ]);
     void (async () => {
       if (!(await ensureSelectedLocalChannelReady())) return;
       // Worktree startup mode: before the very first message, prepare an
@@ -4856,12 +5803,16 @@ export default function AIDock({
   }, [messages, locale, chatTitle]);
   const headerActionButtonClass =
     'flex h-7 shrink-0 items-center gap-1 rounded-md border border-border bg-panel-2 px-2 text-xs text-fg-dim transition-colors hover:border-accent hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40';
+  const openTeamDetailsFromMain = useCallback((nodeId: string) => {
+    window.dispatchEvent(
+      new CustomEvent(OPEN_GAME_TEAM_DETAILS_EVENT, { detail: { nodeId } }),
+    );
+  }, []);
   const conversationActions = isChat && (
     <>
       <button
         type="button"
         onClick={() => void handleCopyConversation()}
-        disabled={messages.length === 0}
         title={t(locale, 'dock.copyConversation')}
         className={headerActionButtonClass}
       >
@@ -4871,7 +5822,6 @@ export default function AIDock({
       <button
         type="button"
         onClick={() => void handleExportConversation()}
-        disabled={messages.length === 0}
         title={t(locale, 'dock.exportConversation')}
         className={headerActionButtonClass}
       >
@@ -5166,9 +6116,12 @@ export default function AIDock({
           (centerInput ? 'shrink-0' : 'flex-1')
         }
       >
-        {!centerInput && (
-        <header className="fuc-ai-return-header relative flex flex-wrap items-center gap-2 border-b border-border-soft px-3 py-2">
-          {isChat && searchToggleButton}
+        <header
+          className={
+            'fuc-ai-return-header flex flex-wrap items-center gap-2 border-b border-border-soft px-3 py-2 ' +
+            (centerInput ? 'absolute left-0 right-0 top-0 z-20 bg-bg/95' : 'relative')
+          }
+        >
           {isChat ? (
             chatTitleEditing ? (
               <input
@@ -5230,7 +6183,7 @@ export default function AIDock({
           )}
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {conversationActions}
-            {!isChat && searchToggleButton}
+            {searchToggleButton}
           </div>
           {returnSearchOpen && (
             <div
@@ -5311,7 +6264,6 @@ export default function AIDock({
             </div>
           )}
         </header>
-        )}
         <div className={'relative min-h-0 ' + (centerInput ? '' : 'flex-1')}>
           {captureStatus && (
             <div
@@ -5444,12 +6396,13 @@ export default function AIDock({
                           locale={locale}
                           active={
                             (m.interactionStatus ?? 'pending') === 'pending' &&
-                            (mode === 'running' ||
+                            (!!m.appAction ||
+                              mode === 'running' ||
                               activeAiEditing ||
                               activeChatting)
                           }
-                          onAnswer={(answer) => answerInteraction(m.id, answer)}
-                          onDismiss={() => dismissInteraction(m.id)}
+                          onAnswer={(answer) => handleInteractionAnswer(m, answer)}
+                          onDismiss={() => handleInteractionDismiss(m)}
                         />
                       ) : normalizedSearch ? (
                         // While a return search is active we fall back to the
@@ -5577,9 +6530,10 @@ export default function AIDock({
           read as one big input area, with controls anchored at the bottom edge:
           left = + (add file), permission, workspace; right = runtime + send. */}
       <section
+        ref={inputSectionRef}
         className={
           'relative flex shrink-0 flex-col bg-transparent p-3 ' +
-          (centerInput ? 'mx-auto w-full max-w-4xl px-4 sm:px-6' : '')
+          (centerInput ? 'mx-auto w-full max-w-6xl px-4 sm:px-6' : '')
         }
         style={
           isChat
@@ -5590,6 +6544,96 @@ export default function AIDock({
         }
         aria-label={t(locale, 'dock.aiInput') + (isReadOnly ? t(locale, 'dock.readonlySuffix') : '')}
       >
+        {orgMentionOpen && (
+          <div
+            ref={orgMentionRef}
+            id="fuc-org-mention-suggestions"
+            role="listbox"
+            aria-label={t(locale, 'dock.tabOrganization')}
+            className="absolute bottom-[calc(100%+0.375rem)] left-3 right-3 z-50 max-h-72 overflow-y-auto rounded-md border border-border bg-panel shadow-2xl"
+          >
+            <div className="flex items-center gap-1.5 border-b border-border-soft px-2.5 py-1.5 text-[11px] text-fg-faint">
+              <GitBranch size={12} className="shrink-0 text-accent" />
+              <span className="truncate">
+                {orgMentionQuery
+                  ? t(locale, 'dock.tabOrganization')
+                  : orgMentionParent
+                    ? orgMentionParent.path.join(' / ')
+                    : orgTree.label}
+              </span>
+            </div>
+            {orgMentionOptions.map((option, index) => {
+              const active = index === activeOrgMentionIndex;
+              const rowClass =
+                'flex w-full min-w-0 items-center gap-2 border-l-2 px-2.5 py-2 text-left transition-colors ' +
+                (active
+                  ? 'border-l-accent bg-accent/20 text-fg ring-1 ring-inset ring-accent/40'
+                  : 'border-l-transparent text-fg-dim hover:border-l-accent/50 hover:bg-border-soft hover:text-fg');
+              if (option.kind === 'back') {
+                return (
+                  <button
+                    key="__org-back"
+                    id={`fuc-org-mention-suggestion-${index}`}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setActiveOrgMentionIndex(index)}
+                    onClick={() => applyOrgMentionOption(option)}
+                    className={rowClass}
+                  >
+                    <ChevronUp size={14} className="shrink-0 -rotate-90" />
+                    <span className="truncate text-sm">
+                      {t(locale, 'common.back')}
+                    </span>
+                  </button>
+                );
+              }
+              const node = option.node;
+              const isSelf = option.kind === 'insert-self';
+              const hasChildren = option.kind === 'node' && option.hasChildren;
+              return (
+                <button
+                  key={`${option.kind}-${node.id}`}
+                  id={`fuc-org-mention-suggestion-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveOrgMentionIndex(index)}
+                  onClick={() => applyOrgMentionOption(option)}
+                  className={rowClass}
+                >
+                  <GitBranch
+                    size={14}
+                    className={
+                      'shrink-0 ' + (active ? 'text-accent' : 'text-fg-faint')
+                    }
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">
+                      {node.label}
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs text-fg-faint">
+                      {isSelf
+                        ? t(locale, 'dock.orgMentionInsertSelf')
+                        : orgMentionQuery
+                          ? node.path.join(' / ')
+                          : node.role}
+                    </span>
+                  </span>
+                  {hasChildren && !orgMentionQuery && (
+                    <ChevronRight
+                      size={14}
+                      className="shrink-0 text-fg-faint"
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {slashOpen && (
           <div
             id="fuc-slash-suggestions"
@@ -5640,6 +6684,61 @@ export default function AIDock({
                         }
                       >
                         {suggestion.kind}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs text-fg-faint">
+                      {suggestion.detail}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {gameSkillOpen && (
+          <div
+            id="fuc-game-skill-suggestions"
+            role="listbox"
+            aria-label={t(locale, 'dock.gameSkillSuggestions')}
+            className="absolute bottom-[calc(100%+0.375rem)] left-3 right-3 z-50 max-h-64 overflow-y-auto rounded-md border border-border bg-panel shadow-2xl"
+          >
+            <div className="sticky top-0 border-b border-border-soft bg-panel px-2.5 py-1.5 text-[11px] font-medium text-fg-faint">
+              {t(locale, 'dock.hintGameSkill')}
+            </div>
+            {filteredGameSkillSuggestions.map((suggestion, index) => {
+              const active = index === activeGameSkillIndex;
+              return (
+                <button
+                  key={suggestion.id}
+                  id={`fuc-game-skill-suggestion-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveGameSkillIndex(index)}
+                  onClick={() => applyGameSkillSuggestion(suggestion)}
+                  className={
+                    'flex w-full items-start gap-2 border-l-2 px-2.5 py-2 text-left transition-colors ' +
+                    (active
+                      ? 'border-l-accent bg-accent/20 text-fg ring-1 ring-inset ring-accent/40'
+                      : 'border-l-transparent text-fg-dim hover:border-l-accent/50 hover:bg-border-soft hover:text-fg')
+                  }
+                >
+                  <span
+                    className={
+                      'mt-0.5 rounded border px-1.5 py-0.5 font-mono text-[11px] leading-none ' +
+                      (active
+                        ? 'border-accent bg-accent text-bg'
+                        : 'border-border bg-bg text-accent')
+                    }
+                  >
+                    {suggestion.name}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-sm font-medium">
+                        {suggestion.label}
                       </span>
                     </span>
                     <span className="mt-0.5 block truncate text-xs text-fg-faint">
@@ -5869,8 +6968,12 @@ export default function AIDock({
             ref={inputRef}
             value={draft}
             onChange={(e) => {
-              draftRef.current = e.target.value;
-              setComposerDraft(e.target.value);
+              const next = e.target.value;
+              // `$` at a word boundary now opens an inline searchable tree menu
+              // (handled by syncComposerSuggestions), not the popup panel. The
+              // `$` stays in the draft as the active trigger token, mirroring `/`.
+              draftRef.current = next;
+              setComposerDraft(next);
               rememberSelection(e.currentTarget);
               syncComposerSuggestions(e.currentTarget);
             }}
@@ -5893,6 +6996,38 @@ export default function AIDock({
             onBlur={closeComposerSuggestions}
             onPaste={handlePaste}
             onKeyDown={(e) => {
+              if (orgMentionOpen) {
+                if (e.key === 'ArrowDown' && orgMentionOptions.length > 0) {
+                  e.preventDefault();
+                  setActiveOrgMentionIndex((index) =>
+                    (index + 1) % orgMentionOptions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'ArrowUp' && orgMentionOptions.length > 0) {
+                  e.preventDefault();
+                  setActiveOrgMentionIndex(
+                    (index) =>
+                      (index - 1 + orgMentionOptions.length) %
+                      orgMentionOptions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  closeOrgMentionSuggestions();
+                  return;
+                }
+                if (
+                  (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey)) &&
+                  orgMentionOptions.length > 0
+                ) {
+                  e.preventDefault();
+                  const option = orgMentionOptions[activeOrgMentionIndex];
+                  if (option) applyOrgMentionOption(option);
+                  return;
+                }
+              }
               if (fileMentionOpen) {
                 if (e.key === 'ArrowDown' && fileMentionOptions.length > 0) {
                   e.preventDefault();
@@ -5954,6 +7089,36 @@ export default function AIDock({
                   return;
                 }
               }
+              if (gameSkillOpen) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setActiveGameSkillIndex((index) =>
+                    (index + 1) % filteredGameSkillSuggestions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setActiveGameSkillIndex(
+                    (index) =>
+                      (index - 1 + filteredGameSkillSuggestions.length) %
+                      filteredGameSkillSuggestions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  closeGameSkillSuggestions();
+                  return;
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey)) {
+                  e.preventDefault();
+                  const suggestion =
+                    filteredGameSkillSuggestions[activeGameSkillIndex];
+                  if (suggestion) applyGameSkillSuggestion(suggestion);
+                  return;
+                }
+              }
               if (matchesShortcut(e.nativeEvent, shortcutSettings['composer-send'])) {
                 e.preventDefault();
                 closeComposerSuggestions();
@@ -5995,22 +7160,32 @@ export default function AIDock({
                           ? t(locale, 'dock.speechModePlaceholder')
                           : composer.uiMode
                             ? t(locale, 'dock.uiModePlaceholder')
-                            : t(locale, 'dock.placeholder')
+                            : composer.metahumanMode
+                              ? t(locale, 'dock.metahumanModePlaceholder')
+                            : composer.blueprintMode
+                              ? t(locale, 'dock.blueprintModePlaceholder')
+                            : composer.worldMode
+                              ? t(locale, 'dock.worldModePlaceholder')
+                              : t(locale, 'dock.placeholder')
             }
-            aria-expanded={slashOpen || fileMentionOpen}
+            aria-expanded={slashOpen || gameSkillOpen || fileMentionOpen}
             aria-controls={
               fileMentionOpen
                 ? 'fuc-file-mention-suggestions'
                 : slashOpen
                   ? 'fuc-slash-suggestions'
-                  : undefined
+                  : gameSkillOpen
+                    ? 'fuc-game-skill-suggestions'
+                    : undefined
             }
             aria-activedescendant={
               fileMentionOpen && fileMentionOptions.length > 0
                 ? `fuc-file-mention-suggestion-${activeFileMentionIndex}`
                 : slashOpen
                   ? `fuc-slash-suggestion-${activeSlashIndex}`
-                  : undefined
+                  : gameSkillOpen
+                    ? `fuc-game-skill-suggestion-${activeGameSkillIndex}`
+                    : undefined
             }
             className={
               'min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-relaxed text-fg outline-none placeholder:text-fg-faint ' +
@@ -6035,14 +7210,14 @@ export default function AIDock({
             </div>
           )}
 
-          {blockedSendTipText && (
+          {composerTipText && (
             <div
               role="status"
               aria-live="polite"
               data-testid="blocked-send-tip"
               className="mx-2 mb-1 rounded-md border border-status-error/40 bg-status-error/10 px-2.5 py-1.5 text-xs leading-snug text-status-error"
             >
-              {blockedSendTipText}
+              {composerTipText}
             </div>
           )}
 
@@ -6131,6 +7306,18 @@ export default function AIDock({
             <button
               type="button"
               onMouseDown={(e) => e.preventDefault()}
+              onClick={startGameSkill}
+              disabled={isReadOnly}
+              title={t(locale, 'dock.hintGameSkill')}
+              aria-label={t(locale, 'dock.hintGameSkill')}
+              className={cn(composerToolButtonClass, 'gap-1 font-medium')}
+            >
+              <span className="font-mono text-sm font-semibold">#</span>
+              <span>{t(locale, 'dock.hintGameSkill')}</span>
+            </button>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={startFileMention}
               disabled={isReadOnly}
               title={t(locale, 'dock.hintMention')}
@@ -6140,11 +7327,29 @@ export default function AIDock({
               <span className="font-mono text-sm font-semibold">@</span>
               <span>{t(locale, 'dock.hintMentionShort')}</span>
             </button>
+            {isChat && (
+              <button
+                type="button"
+                data-org-panel-trigger
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setOrgPanelOpen((open) => !open)}
+                aria-pressed={orgPanelOpen}
+                title={t(locale, 'dock.tabOrganization')}
+                aria-label={t(locale, 'dock.tabOrganization')}
+                className={cn(
+                  composerToolButtonClass,
+                  'gap-1 font-medium',
+                  orgPanelOpen && 'bg-border-soft/55 text-fg',
+                )}
+              >
+                <span className="font-mono text-sm font-semibold">$</span>
+                <span>{t(locale, 'dock.tabOrganization')}</span>
+              </button>
+            )}
 
-            {/* Session cache TTL — choose how long the session context is kept
-                alive between turns. Editable only before the conversation
-                starts (no messages yet); locked once the first message is sent
-                so a single session keeps one consistent TTL. */}
+            {/* Session cache TTL — chosen before the conversation starts and
+                locked once the first message is sent so a single session keeps
+                one consistent value. */}
             <Select
               title={
                 cacheTtlLocked
@@ -6285,6 +7490,37 @@ export default function AIDock({
           </div>
         </div>
       </section>
+      {isChat && orgPanelOpen && (
+        <div
+          ref={orgPanelRef}
+          role="dialog"
+          aria-label={t(locale, 'dock.tabOrganization')}
+          className="fuc-ai-input--blueprint absolute inset-x-4 top-12 z-40 flex flex-col overflow-hidden rounded-xl border shadow-2xl"
+          style={{ bottom: (inputSectionHeight || 112) + 12 }}
+        >
+          <div className="flex shrink-0 items-center gap-2 border-b border-border-soft px-3 py-2">
+            <GitBranch size={14} className="shrink-0 text-accent" />
+            <span className="text-sm font-medium text-fg">
+              {t(locale, 'dock.tabOrganization')}
+            </span>
+            <button
+              type="button"
+              onClick={() => setOrgPanelOpen(false)}
+              title={t(locale, 'common.close')}
+              aria-label={t(locale, 'common.close')}
+              className="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-fg-dim transition-colors hover:bg-border-soft/55 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            >
+              <X size={15} />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <GameTeamPanel
+              mode="organization"
+              onOpenDetails={openTeamDetailsFromMain}
+            />
+          </div>
+        </div>
+      )}
       <FilePreviewDrawer
         refData={filePreviewRef}
         cwd={workspaceCwd || undefined}

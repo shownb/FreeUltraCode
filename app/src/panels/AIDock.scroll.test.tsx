@@ -18,6 +18,7 @@ class ResizeObserverStub {
   }
 
   observe = vi.fn();
+  unobserve = vi.fn();
   disconnect = vi.fn();
 
   trigger(): void {
@@ -169,6 +170,63 @@ async function pressCtrlEnter(el: HTMLTextAreaElement): Promise<void> {
 }
 
 describe('AIDock stream scroll state', () => {
+  it('opens the organization chart from the $组织架构 popup trigger', async () => {
+    resetChatSession('s_org_tabs', chatMessages('org'));
+    const view = await renderChatDock();
+
+    try {
+      // The org chart is no longer a top tab; it lives behind a `$组织架构`
+      // trigger at the input bottom that pops up a blueprint panel.
+      const trigger = Array.from(
+        view.container.querySelectorAll<HTMLButtonElement>(
+          'button[data-org-panel-trigger]',
+        ),
+      ).find((button) => button.textContent?.includes('组织架构'));
+      expect(trigger).toBeInstanceOf(HTMLButtonElement);
+
+      // Closed by default — the chart content is not mounted yet.
+      expect(view.container.textContent).not.toContain('制作人');
+
+      await act(async () => {
+        trigger?.click();
+      });
+
+      expect(view.container.textContent).toContain('制作人');
+      expect(view.container.textContent).toContain('技术总监');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it('opens the inline organization tree menu when typing $ (not the popup)', async () => {
+    resetChatSession('s_org_dollar', chatMessages('org'));
+    const view = await renderChatDock();
+
+    try {
+      const input = composerTextarea(view.container);
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        'value',
+      )?.set;
+
+      await act(async () => {
+        if (setter) setter.call(input, '$');
+        else input.value = '$';
+        input.setSelectionRange(1, 1);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      // The inline tree menu is mounted; the full blueprint popup is not.
+      const menu = view.container.querySelector('#fuc-org-mention-suggestions');
+      expect(menu).toBeInstanceOf(HTMLElement);
+      expect(menu?.textContent).toContain('制作人');
+      // The `$` token stays in the draft as the active trigger.
+      expect(input.value).toBe('$');
+    } finally {
+      await view.cleanup();
+    }
+  });
+
   it('restores each session scroll instead of carrying the previous session position', async () => {
     resetChatSession('s1', chatMessages('s1'));
     const view = await renderChatDock();

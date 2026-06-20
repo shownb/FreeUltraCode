@@ -1457,6 +1457,89 @@ describe('simple-workflow chat mode', () => {
     ).toBe(true);
   });
 
+  it('mints a fresh native session when claude rejects the id as already in use', async () => {
+    window.localStorage.clear();
+    await historyStore.ready();
+    const workspace = await historyStore.resolveWorkspaceByPath('');
+    const record = await historyStore.createSession({
+      workspaceId: workspace.id,
+      isWorkflow: false,
+      messages: [],
+      title: 'Chat',
+    });
+    resetStore(simpleBlueprint('Chat'));
+    const session = {
+      id: record.id,
+      workspaceId: workspace.id,
+      title: record.title,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      isWorkflow: false,
+      messageCount: 0,
+    };
+    useStore.setState({
+      historyReady: true,
+      activeWorkspaceId: workspace.id,
+      activeSessionId: record.id,
+      workspaces: [workspace],
+      sessions: [session],
+      sessionTree: { [workspace.id]: [session] },
+      locale: 'zh-CN',
+    });
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.tauriAvailable.mockReturnValue(true);
+    gatewayMocks.resolveDirectGatewayRoute.mockReturnValue(null);
+    gatewayMocks.resolveCliGatewayRoute.mockImplementation(async (selection) => ({
+      selection,
+      adapter: 'claude-code',
+      modelClass: selection.modelClass,
+      model: selection.modelClass,
+      transport: 'cli',
+      mode: 'cli',
+      label: 'Claude Code',
+      source: 'global',
+      cliCommand: 'claude',
+    }));
+    const calls: Array<{
+      prompt: string;
+      opts: { sessionId?: string; resume?: boolean };
+    }> = [];
+    tauriMocks.aiEditViaCli.mockImplementation(async (prompt, _adapter, opts) => {
+      calls.push({ prompt, opts });
+      // The very first create collides with a stale, still-locked id that a
+      // prior (unclean) turn registered on disk.
+      if (calls.length === 1) {
+        throw new Error(
+          `CLI "claude" 退出码 1: Error: Session ID ${opts.sessionId} is already in use.`,
+        );
+      }
+      return '换了新会话后的回答。';
+    });
+
+    useStore.getState().sendPrompt('第一轮问题');
+    await waitFor(
+      () => !useStore.getState().aiStreaming && calls.length === 2,
+      'already-in-use fallback CLI chat call',
+    );
+
+    // First attempt creates (resume=false); the collision triggers a fresh id,
+    // also created cold rather than resumed.
+    expect(calls[0].opts.resume).toBe(false);
+    expect(calls[0].opts.sessionId).toEqual(expect.any(String));
+    expect(calls[1].opts.resume).toBe(false);
+    expect(calls[1].opts.sessionId).toEqual(expect.any(String));
+    expect(calls[1].opts.sessionId).not.toBe(calls[0].opts.sessionId);
+    expect(calls[1].prompt).toContain('第一轮问题');
+    expect(
+      useStore
+        .getState()
+        .messages.some(
+          (m) =>
+            m.role === 'assistant' && m.text.includes('换了新会话后的回答。'),
+        ),
+    ).toBe(true);
+  });
+
   it('mints a fresh native session id when a failed CLI chat is retried', async () => {
     window.localStorage.clear();
     await historyStore.ready();
@@ -2072,6 +2155,49 @@ describe('simple-workflow chat mode', () => {
     expect(prompt).toContain('所有模型请求都应优先使用这些实时工具');
     expect(prompt).toContain('ue-mcp-for-all-versions');
     expect(prompt).toContain('优先使用 Unreal MCP 工具读取编辑器实时状态');
+  });
+
+  it('injects the configured project engine into simple chat prompts', async () => {
+    resetStore(simpleBlueprint('Simple chat'));
+    mockDirectRoute();
+    useStore.setState({
+      activeWorkspaceId: 'ws-unreal',
+      workspaces: [
+        {
+          id: 'ws-unreal',
+          path: 'E:\\uug_mcp\\ue-mcp-for-all-versions\\test_project_ue57\\Unity\\Unreal',
+          name: 'Unreal',
+          updatedAt: Date.now(),
+          sessionCount: 0,
+          metadata: {
+            projectSettings: {
+              schemaVersion: 1,
+              engine: 'unreal',
+            },
+          },
+        },
+      ],
+    });
+    const systems: string[] = [];
+    gatewayMocks.completeGatewayText.mockImplementation(async (request) => {
+      systems.push(String(request.system));
+      return '按 Unreal 项目拆解。';
+    });
+
+    useStore.getState().sendPrompt('对游戏图片进行游戏技术设计分析');
+
+    await waitFor(
+      () =>
+        !useStore.getState().aiStreaming &&
+        useStore.getState().messages.some((m) => m.role === 'assistant'),
+      'project engine simple chat answer',
+    );
+
+    expect(systems[0]).toContain('【项目引擎】');
+    expect(systems[0]).toContain('当前项目引擎：Unreal Engine');
+    expect(systems[0]).toContain('优先按 Unreal Engine 项目实现');
+    expect(systems[0]).toContain('不要改用 Godot');
+    expect(systems[0]).not.toContain('默认以 Godot');
   });
 
   it('shows the route and strips route/tool logs from the next transcript', async () => {

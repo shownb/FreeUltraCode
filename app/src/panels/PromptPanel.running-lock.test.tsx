@@ -473,6 +473,9 @@ describe('PromptPanel running lock', () => {
       expect(view.container.textContent).not.toContain(
         '在右侧描述你的意图，AI 将据此操作画布并在此回显。',
       );
+      expect(buttonByText(view.container, '复制').disabled).toBe(false);
+      expect(buttonByText(view.container, '导出').disabled).toBe(false);
+      expect(buttonByText(view.container, '新会话').disabled).toBe(false);
     } finally {
       await view.cleanup();
     }

@@ -106,6 +106,28 @@ describe('FilePreviewDrawer', () => {
     expect(aside?.style.width).not.toBe('');
   });
 
+  it('renders custom content without reading a local file', async () => {
+    await act(async () => {
+      root.render(
+        createElement(FilePreviewDrawer, {
+          refData: null,
+          customContent: {
+            label: '团队详情',
+            path: '游戏团队 / 技术总监',
+            meta: '团队属性与 Skill',
+            children: createElement('div', {}, '技术总监 Skill'),
+          },
+          onClose: vi.fn(),
+        }),
+      );
+    });
+
+    expect(previewLocalFile).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('团队详情');
+    expect(container.textContent).toContain('游戏团队 / 技术总监');
+    expect(container.textContent).toContain('技术总监 Skill');
+  });
+
   it('closes when the user clicks outside the preview drawer', async () => {
     vi.mocked(previewLocalFile).mockReturnValue(new Promise(() => {}));
     const onClose = vi.fn();

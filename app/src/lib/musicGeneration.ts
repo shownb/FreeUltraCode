@@ -15,12 +15,15 @@ export type BuiltInMusicProviderId =
   | 'tempolor-instrumental'
   | 'mubert'
   | 'sunoapi-music'
+  | 'kie-suno-music'
+  | 'suno-relay-music'
   | 'sonauto-song'
   | 'sonauto-instrumental'
   | 'fal-ace-step'
   | 'fal-stable-audio'
   | 'minimax-music-free'
   | 'minimax-302-music'
+  | 'ali-fun-music'
   | 'huggingface-musicgen'
   | 'huggingface-audioldm2'
   | 'huggingface-tango2'
@@ -50,7 +53,10 @@ type MusicProviderApiKind =
   | 'tempolor-music'
   | 'mubert'
   | 'sunoapi-music'
+  | 'kie-suno-music'
+  | 'suno-relay-music'
   | 'sonauto-music'
+  | 'ali-fun-music'
   | 'fal-music'
   | 'huggingface-inference'
   | 'generic-online-music'
@@ -323,6 +329,40 @@ export const MUSIC_PROVIDERS: MusicProviderDefinition[] = [
     note: '第三方 Suno API 服务。适合需要 Suno 模型链路的用户；非 Suno 官方，商用前需单独核授权和地区可用性。',
   },
   {
+    id: 'kie-suno-music',
+    label: 'Kie.ai Suno',
+    category: 'commercial',
+    apiKind: 'kie-suno-music',
+    defaultModel: 'V5',
+    models: ['V5', 'V4_5PLUS', 'V4_5', 'V4', 'V3_5'],
+    needsKey: true,
+    local: false,
+    defaultBaseUrl: 'https://api.kie.ai',
+    supportsBaseUrl: true,
+    endpointPlaceholder: 'https://api.kie.ai',
+    credentialUrl: 'https://kie.ai/api-key',
+    keyLabel: 'Kie.ai API Key',
+    keyPlaceholder: 'Bearer token',
+    note: '第三方 Suno API 聚合服务（kie.ai）。国内网络可直连，提交后轮询 record-info 取音频；非 Suno 官方，商用前需自行确认授权与可用性。',
+  },
+  {
+    id: 'suno-relay-music',
+    label: 'Suno 中转 (one-api)',
+    category: 'commercial',
+    apiKind: 'suno-relay-music',
+    defaultModel: 'chirp-v4',
+    models: ['chirp-v4', 'chirp-v3-5', 'chirp-v3-0'],
+    needsKey: true,
+    local: false,
+    defaultBaseUrl: 'https://api.302.ai',
+    supportsBaseUrl: true,
+    endpointPlaceholder: 'https://api.302.ai',
+    credentialUrl: 'https://dash.302.ai/dashboard/auth',
+    keyLabel: '中转平台 API Key',
+    keyPlaceholder: 'Bearer token',
+    note: '通用 Suno 中转标准（one-api/new-api 的 /suno/submit/music + /suno/fetch）。适配 302.AI、云雾等国内聚合平台；把 Base URL 改成你的中转域名即可。非 Suno 官方。',
+  },
+  {
     id: 'sonauto-song',
     label: 'Sonauto Song',
     category: 'commercial',
@@ -425,6 +465,23 @@ export const MUSIC_PROVIDERS: MusicProviderDefinition[] = [
     keyLabel: '302.AI API Key',
     keyPlaceholder: 'sk-...',
     note: '302.AI MiniMax 兼容聚合渠道。适合国内网络环境和低频试用；非 MiniMax 官方直连。',
+  },
+  {
+    id: 'ali-fun-music',
+    label: '阿里百炼 Fun 音乐',
+    category: 'commercial',
+    apiKind: 'ali-fun-music',
+    defaultModel: 'fun-music-v1',
+    models: ['fun-music-v1'],
+    needsKey: true,
+    local: false,
+    defaultBaseUrl: 'https://dashscope.aliyuncs.com/api/v1',
+    supportsBaseUrl: true,
+    endpointPlaceholder: 'https://dashscope.aliyuncs.com/api/v1',
+    credentialUrl: 'https://bailian.console.aliyun.com/?apiKey=1',
+    keyLabel: 'DashScope API Key',
+    keyPlaceholder: 'sk-...',
+    note: '阿里云百炼 Fun 音乐大模型，国内大厂直连。同步返回，支持提示词或歌词、男声/女声、中英文；提示词单行走 prompt 自动写词，多行歌词走 lyrics。',
   },
   {
     id: 'huggingface-musicgen',
@@ -1072,8 +1129,14 @@ async function generateWithProvider(
       return generateMubert(prompt, model, settings, targetDurationSeconds, signal);
     case 'sunoapi-music':
       return generateSunoApiMusic(prompt, model, settings, signal);
+    case 'kie-suno-music':
+      return generateKieSunoMusic(prompt, model, settings, signal);
+    case 'suno-relay-music':
+      return generateSunoRelayMusic(prompt, model, settings, signal);
     case 'sonauto-music':
       return generateSonautoMusic(providerId, prompt, model, settings, signal);
+    case 'ali-fun-music':
+      return generateAliFunMusic(prompt, model, settings, signal);
     case 'fal-music':
       return generateFalMusic(providerId, prompt, model, settings, targetDurationSeconds, signal);
     case 'huggingface-inference':
@@ -1434,6 +1497,103 @@ async function generateSunoApiMusic(
   throw new Error('SunoAPI.org job timed out before audio was ready.');
 }
 
+async function generateKieSunoMusic(
+  prompt: string,
+  model: string,
+  settings: MusicGenerationSettings,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const apiKey = settings.providerKeys['kie-suno-music']?.trim();
+  if (!apiKey) throw new Error('Kie.ai API key is missing.');
+  const baseUrl = musicProviderBaseUrl('kie-suno-music', settings);
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  const response = await fetch(`${baseUrl}/api/v1/generate`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      prompt,
+      customMode: false,
+      instrumental: false,
+      model,
+    }),
+    signal,
+  });
+  const started = await readJsonResponse(response);
+  assertProviderJsonOk(started, 'Kie.ai Suno');
+  const immediate = audiosFromJson(started);
+  if (immediate.length > 0) return immediate;
+  const taskId = taskIdFromJson(started);
+  if (!taskId) throw new Error('Kie.ai Suno did not return a task id.');
+  for (let i = 0; i < 120; i += 1) {
+    await delay(3000, signal);
+    const statusResponse = await fetch(
+      `${baseUrl}/api/v1/generate/record-info?taskId=${encodeURIComponent(taskId)}`,
+      { headers, signal },
+    );
+    const status = await readJsonResponse(statusResponse);
+    assertProviderJsonOk(status, 'Kie.ai Suno');
+    const state = jsonState(status);
+    if (isFailedState(state)) {
+      throw new Error(providerErrorMessage(status) || 'Kie.ai Suno generation failed.');
+    }
+    const audios = audiosFromJson(status);
+    if (audios.length > 0 && isSuccessState(state, status)) return audios;
+  }
+  throw new Error('Kie.ai Suno job timed out before audio was ready.');
+}
+
+async function generateSunoRelayMusic(
+  prompt: string,
+  model: string,
+  settings: MusicGenerationSettings,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const apiKey = settings.providerKeys['suno-relay-music']?.trim();
+  if (!apiKey) throw new Error('Suno relay API key is missing.');
+  const baseUrl = musicProviderBaseUrl('suno-relay-music', settings);
+  const headers = {
+    Authorization: apiKey.toLowerCase().startsWith('bearer ') ? apiKey : `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  // one-api/new-api 中转标准：/suno/submit/music 提交，/suno/fetch/{id} 轮询。
+  const response = await fetch(`${baseUrl}/suno/submit/music`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      gpt_description_prompt: prompt,
+      prompt: looksLikeLyrics(prompt) ? prompt : '',
+      make_instrumental: false,
+      mv: model,
+    }),
+    signal,
+  });
+  const started = await readJsonResponse(response);
+  assertProviderJsonOk(started, 'Suno 中转');
+  const immediate = audiosFromJson(started);
+  if (immediate.length > 0) return immediate;
+  const taskId = taskIdFromJson(started);
+  if (!taskId) throw new Error('Suno relay did not return a task id.');
+  for (let i = 0; i < 120; i += 1) {
+    await delay(3000, signal);
+    const statusResponse = await fetch(
+      `${baseUrl}/suno/fetch/${encodeURIComponent(taskId)}`,
+      { headers, signal },
+    );
+    const status = await readJsonResponse(statusResponse);
+    assertProviderJsonOk(status, 'Suno 中转');
+    const state = jsonState(status);
+    if (isFailedState(state)) {
+      throw new Error(providerErrorMessage(status) || 'Suno 中转 generation failed.');
+    }
+    const audios = audiosFromJson(status);
+    if (audios.length > 0 && isSuccessState(state, status)) return audios;
+  }
+  throw new Error('Suno 中转 job timed out before audio was ready.');
+}
+
 async function generateSonautoMusic(
   providerId: MusicProviderId,
   prompt: string,
@@ -1496,6 +1656,40 @@ async function generateSonautoMusic(
     }
   }
   throw new Error('Sonauto job timed out before audio was ready.');
+}
+
+async function generateAliFunMusic(
+  prompt: string,
+  model: string,
+  settings: MusicGenerationSettings,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const apiKey = settings.providerKeys['ali-fun-music']?.trim();
+  if (!apiKey) throw new Error('DashScope API key is missing.');
+  const input: Record<string, unknown> = { gender: 'female' };
+  // 多行文本视为歌词走 lyrics，单行描述走 prompt 由模型自动写词。
+  if (looksLikeLyrics(prompt)) {
+    input.lyrics = prompt;
+  } else {
+    input.prompt = prompt;
+  }
+  const response = await fetch(
+    `${musicProviderBaseUrl('ali-fun-music', settings)}/services/audio/music/generation`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, input }),
+      signal,
+    },
+  );
+  const json = await readJsonResponse(response);
+  assertProviderJsonOk(json, '阿里百炼 Fun 音乐');
+  const audios = audiosFromJson(json);
+  if (audios.length > 0) return audios;
+  throw new Error('阿里百炼 Fun 音乐 returned no audio.');
 }
 
 async function generateFalMusic(

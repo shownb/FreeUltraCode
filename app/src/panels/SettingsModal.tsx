@@ -53,6 +53,7 @@ import {
 import { cn } from '@/lib/cn';
 import type { GatewaySelection } from '@/core/ir';
 import {
+  ensureRequiredPersonalInstructions,
   personalInstructionsForSelection,
   personalInstructionsKey,
   personalInstructionsSample,
@@ -108,7 +109,7 @@ import {
 } from '@/lib/tauri';
 import {
   PROJECT_COMMAND_NAMES,
-  buildSlashSuggestions,
+  buildGameSkillSuggestions,
   isProjectCommandName,
   type SlashSuggestion,
 } from '@/lib/slashCommands';
@@ -244,6 +245,17 @@ import {
   type VideoProviderId,
 } from '@/lib/videoGeneration';
 import {
+  loadWorldModelGenerationSettings,
+  saveWorldModelGenerationSettings,
+  worldModelProviders,
+  worldModelProviderBaseUrl,
+  worldModelProviderModel,
+  worldModelProviderReady,
+  type WorldModelGenerationSettings,
+  type WorldModelProviderDefinition,
+  type WorldModelProviderId,
+} from '@/lib/worldModel';
+import {
   createCustomSpeechProviderId,
   loadSpeechGenerationSettings,
   saveSpeechGenerationSettings,
@@ -326,6 +338,7 @@ type SettingsTab =
   | 'imageGeneration'
   | 'musicGeneration'
   | 'videoGeneration'
+  | 'worldModelGeneration'
   | 'speechGeneration'
   | 'threeDGeneration'
   | 'rigging'
@@ -352,6 +365,7 @@ const tabs: { id: SettingsTab; labelKey: TranslationKey; Icon: LucideIcon }[] = 
   { id: 'imageGeneration', labelKey: 'settings.tabs.imageGeneration', Icon: Sparkles },
   { id: 'musicGeneration', labelKey: 'settings.tabs.musicGeneration', Icon: Music },
   { id: 'videoGeneration', labelKey: 'settings.tabs.videoGeneration', Icon: Video },
+  { id: 'worldModelGeneration', labelKey: 'settings.tabs.worldModelGeneration', Icon: Globe },
   { id: 'speechGeneration', labelKey: 'settings.tabs.speechGeneration', Icon: Volume2 },
   { id: 'commands', labelKey: 'settings.tabs.commands', Icon: SlashSquare },
   { id: 'mcp', labelKey: 'settings.tabs.mcp', Icon: Terminal },
@@ -689,6 +703,10 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               ) : tab === 'videoGeneration' ? (
                 <ErrorBoundary label={t(locale, 'settings.tabs.videoGeneration')}>
                   <VideoGenerationSettingsPanel locale={locale} />
+                </ErrorBoundary>
+              ) : tab === 'worldModelGeneration' ? (
+                <ErrorBoundary label={t(locale, 'settings.tabs.worldModelGeneration')}>
+                  <WorldModelGenerationSettingsPanel locale={locale} />
                 </ErrorBoundary>
               ) : tab === 'speechGeneration' ? (
                 <ErrorBoundary label={t(locale, 'settings.tabs.speechGeneration')}>
@@ -1215,7 +1233,15 @@ function PersonalizationSettings({
                 setDraft(entry.key, '');
                 setPersonalInstructions('', entry.selection);
               }}
-              onSave={() => setPersonalInstructions(draft, entry.selection)}
+              onSave={() => {
+                // Persist, then sync the draft to the normalized value the store
+                // actually stored (trimmed + required larkdoc section appended).
+                // Otherwise the draft keeps differing from the saved value and
+                // the button never flips to "已保存", making it look like the
+                // save did not stick.
+                setPersonalInstructions(draft, entry.selection);
+                setDraft(entry.key, ensureRequiredPersonalInstructions(draft));
+              }}
             />
           );
         })}
@@ -4980,6 +5006,233 @@ function VideoGenerationSettingsPanel({ locale }: { locale: Locale }) {
 
 const videoProviderCategoryOrder: VideoProviderCategory[] = ['commercial', 'free'];
 
+// Interactive playable world-model channel settings. Compact, focused panel: a
+// default-provider picker plus per-provider key / endpoint inputs. Mirrors the
+// video panel's persistence pattern but without custom-provider authoring, since
+// the world-model catalog is curated and live-session providers vary widely.
+function WorldModelGenerationSettingsPanel({ locale }: { locale: Locale }) {
+  const [settings, setSettings] = useState<WorldModelGenerationSettings>(() =>
+    loadWorldModelGenerationSettings(),
+  );
+
+  const update = (patch: Partial<WorldModelGenerationSettings>) => {
+    const next = { ...settings, ...patch };
+    saveWorldModelGenerationSettings(next);
+    setSettings(next);
+  };
+
+  const providers = worldModelProviders(settings);
+  const providerOptions = providers.map((provider) => ({
+    id: provider.id,
+    label: provider.label,
+    hint:
+      (provider.category === 'commercial'
+        ? t(locale, 'settings.worldModelGeneration.commercial')
+        : t(locale, 'settings.worldModelGeneration.free')) +
+      ' · ' +
+      (worldModelProviderReady(provider.id, settings)
+        ? t(locale, 'settings.worldModelGeneration.ready')
+        : provider.hasPublicApi
+          ? t(locale, 'settings.worldModelGeneration.needsConfig')
+          : t(locale, 'settings.worldModelGeneration.previewOnly')),
+  }));
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className="text-lg font-semibold text-fg">
+          {t(locale, 'settings.worldModelGeneration.title')}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-fg-faint">
+          {t(locale, 'settings.worldModelGeneration.description')}
+        </p>
+      </div>
+
+      <SettingRow
+        title={t(locale, 'settings.worldModelGeneration.enabledLabel')}
+        description={t(locale, 'settings.worldModelGeneration.enabledDesc')}
+      >
+        <SwitchControl
+          checked={settings.enabled}
+          onChange={(enabled) => update({ enabled })}
+        />
+      </SettingRow>
+
+      <SettingRow
+        title={t(locale, 'settings.worldModelGeneration.defaultProviderLabel')}
+        description={t(locale, 'settings.worldModelGeneration.defaultProviderDesc')}
+      >
+        <div className="w-full min-w-[14rem]">
+          <SelectControl
+            value={settings.preferredProviderId}
+            options={providerOptions}
+            onChange={(id) =>
+              update({ preferredProviderId: id as WorldModelProviderId })
+            }
+            icon={<Globe size={15} strokeWidth={2.1} />}
+          />
+        </div>
+      </SettingRow>
+
+      <section className="rounded-lg border border-border bg-bg-alt p-4">
+        <div className={SETTINGS_PROVIDER_GRID_CLASS}>
+          {providers.map((provider) => (
+            <WorldModelProviderSettingsRow
+              key={provider.id}
+              provider={provider}
+              settings={settings}
+              locale={locale}
+              onChange={(next) => {
+                saveWorldModelGenerationSettings(next);
+                setSettings(next);
+              }}
+            />
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function WorldModelProviderSettingsRow({
+  provider,
+  settings,
+  locale,
+  onChange,
+}: {
+  provider: WorldModelProviderDefinition;
+  settings: WorldModelGenerationSettings;
+  locale: Locale;
+  onChange: (settings: WorldModelGenerationSettings) => void;
+}) {
+  const [showKey, setShowKey] = useState(false);
+  const keyValue = settings.providerKeys[provider.id] ?? '';
+  const baseUrl = settings.providerBaseUrls[provider.id] ?? '';
+  const effectiveBaseUrl = worldModelProviderBaseUrl(provider.id, settings);
+  const model = worldModelProviderModel(provider.id, settings);
+  const ready = worldModelProviderReady(provider.id, settings);
+  const KeyIcon = showKey ? EyeOff : Eye;
+
+  const patchProvider = (
+    patch: Partial<{ key: string; baseUrl: string; model: string }>,
+  ) => {
+    const next: WorldModelGenerationSettings = {
+      ...settings,
+      providerKeys: { ...settings.providerKeys },
+      providerBaseUrls: { ...settings.providerBaseUrls },
+      providerModels: { ...settings.providerModels },
+    };
+    if (patch.key !== undefined) {
+      const value = patch.key.trim();
+      if (value) next.providerKeys[provider.id] = value;
+      else delete next.providerKeys[provider.id];
+    }
+    if (patch.baseUrl !== undefined) {
+      const value = patch.baseUrl.trim();
+      if (value) next.providerBaseUrls[provider.id] = value;
+      else delete next.providerBaseUrls[provider.id];
+    }
+    if (patch.model !== undefined) {
+      const value = patch.model.trim();
+      if (value) next.providerModels[provider.id] = value;
+      else delete next.providerModels[provider.id];
+    }
+    onChange(next);
+  };
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-panel p-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 text-sm font-medium text-fg">
+            <Globe size={13} className="shrink-0 text-accent" />
+            <span className="truncate">{provider.label}</span>
+          </div>
+          <p className="mt-0.5 text-xs leading-relaxed text-fg-faint">{provider.note}</p>
+        </div>
+        <StatusBadge
+          state={ready ? 'direct' : 'default'}
+          label={
+            ready
+              ? t(locale, 'settings.worldModelGeneration.ready')
+              : provider.hasPublicApi
+                ? t(locale, 'settings.worldModelGeneration.needsConfig')
+                : t(locale, 'settings.worldModelGeneration.previewOnly')
+          }
+        />
+      </div>
+
+      {provider.needsKey && (
+        <label className="block space-y-1">
+          <span className="text-xs text-fg-faint">
+            {provider.keyLabel ?? t(locale, 'settings.worldModelGeneration.apiKey')}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <input
+              type={showKey ? 'text' : 'password'}
+              value={keyValue}
+              placeholder={provider.keyPlaceholder ?? ''}
+              onChange={(e) => patchProvider({ key: e.target.value })}
+              className="min-w-0 flex-1 rounded border border-border bg-bg px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+            />
+            <button
+              type="button"
+              onClick={() => setShowKey((v) => !v)}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-border text-fg-faint hover:text-fg"
+              aria-label="toggle key visibility"
+            >
+              <KeyIcon size={13} />
+            </button>
+          </div>
+        </label>
+      )}
+
+      {provider.supportsBaseUrl && (
+        <label className="block space-y-1">
+          <span className="text-xs text-fg-faint">
+            {t(locale, 'settings.worldModelGeneration.endpoint')}
+          </span>
+          <input
+            type="text"
+            value={baseUrl}
+            placeholder={provider.endpointPlaceholder}
+            onChange={(e) => patchProvider({ baseUrl: e.target.value })}
+            className="w-full rounded border border-border bg-bg px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+          />
+        </label>
+      )}
+
+      <label className="block space-y-1">
+        <span className="text-xs text-fg-faint">
+          {t(locale, 'settings.worldModelGeneration.model')}
+        </span>
+        <input
+          type="text"
+          value={model}
+          placeholder={provider.defaultModel}
+          onChange={(e) => patchProvider({ model: e.target.value })}
+          className="w-full rounded border border-border bg-bg px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+        />
+      </label>
+
+      {effectiveBaseUrl && (
+        <p className="truncate text-[11px] text-fg-faint" title={effectiveBaseUrl}>
+          {effectiveBaseUrl}
+        </p>
+      )}
+      {provider.credentialUrl && (
+        <button
+          type="button"
+          onClick={() => void openExternal(provider.credentialUrl as string)}
+          className="text-[11px] text-accent hover:underline"
+        >
+          {t(locale, 'settings.worldModelGeneration.getAccess')}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function videoProviderCategoryTitleKey(
   category: VideoProviderCategory,
 ): TranslationKey {
@@ -7117,7 +7370,7 @@ function CommandsSettings({ locale }: { locale: Locale }) {
     const order = new Map(
       PROJECT_COMMAND_NAMES.map((name, index) => [name.toLowerCase(), index]),
     );
-    return buildSlashSuggestions([], locale)
+    return buildGameSkillSuggestions(locale)
       .filter((item) => isProjectCommandName(item.name))
       .sort(
         (a, b) =>

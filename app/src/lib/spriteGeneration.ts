@@ -555,11 +555,13 @@ function spritePromptWithContract(payload: SpriteProviderPayload): string {
     payload.prompt.trim(),
     '',
     'Sprite Forge compatible raw spritesheet constraints:',
-    `- exact layout: ${grid.rows} rows x ${grid.columns} columns, ${payload.frameCount} frames, each frame ${payload.frameSize}x${payload.frameSize}px`,
-    `- ${backgroundLine}`,
+    '- output one raw spritesheet image only; no separate panels, no rendered manifest, no descriptive text inside the image',
+    `- exact layout: ${grid.rows} rows x ${grid.columns} columns, ${payload.frameCount} frames, each frame ${payload.frameSize}x${payload.frameSize}px, identical canvas size per cell`,
+    `- ${backgroundLine}; raw sheet should remain suitable for lossless normalization`,
     '- one subject and one action only, consistent identity, proportions, facing direction, lighting, and silhouette across all frames',
-    `- stable ${payload.frameAnchor} anchor, centered subject, even spacing, safe margins, no frame touches canvas edge`,
+    '- real animation poses only: change limbs, body posture, timing, or VFX shape; do not fake motion by sliding, zooming, or rotating a static pose across cells',
+    `- stable ${payload.frameAnchor} root anchor, centered subject, even spacing, safe margins, no frame touches canvas edge, subject fit around ${Math.round(payload.fitScale * 100)}% of each cell`,
     '- no text, labels, UI, watermark, border, grid line, scenery, shadow-only artifacts, duplicate poses, or mixed actions',
-    '- output a single game-ready spritesheet suitable for deterministic chroma-key cleanup, frame extraction, alignment, and QC',
+    '- compatible with deterministic chroma-key cleanup, frame extraction, anchor alignment, normalized sheet export, GIF preview, manifest metadata, and QC',
   ].join('\n');
 }

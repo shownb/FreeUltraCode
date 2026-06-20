@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react';
 import {
   Code2,
   ExternalLink,
@@ -59,6 +66,13 @@ const MARKDOWN_PREVIEW_EXT = new Set([
 ]);
 
 type TextPreviewMode = 'code' | 'html' | 'markdown';
+
+export interface FilePreviewCustomContent {
+  label: string;
+  path?: string;
+  meta?: string;
+  children: ReactNode;
+}
 
 const FILE_PREVIEW_DEFAULT_WIDTH = 760;
 const FILE_PREVIEW_MIN_WIDTH = 360;
@@ -380,10 +394,12 @@ function DiffCodePreview({
 
 export default function FilePreviewDrawer({
   refData,
+  customContent = null,
   cwd,
   onClose,
 }: {
   refData: FileRef | null;
+  customContent?: FilePreviewCustomContent | null;
   cwd?: string;
   onClose: () => void;
 }) {
@@ -398,9 +414,10 @@ export default function FilePreviewDrawer({
     max: filePreviewMaxWidth(),
     edge: 'left',
   });
+  const open = Boolean(refData || customContent);
 
   useEffect(() => {
-    if (!refData) {
+    if (!refData || customContent) {
       setState({ status: 'idle' });
       setIsExpanded(false);
       return;
@@ -418,10 +435,10 @@ export default function FilePreviewDrawer({
     return () => {
       disposed = true;
     };
-  }, [cwd, refData]);
+  }, [customContent, cwd, refData]);
 
   useEffect(() => {
-    if (!refData || !cwd) {
+    if (!refData || !cwd || customContent) {
       setDiffState({ status: 'idle' });
       return;
     }
@@ -438,10 +455,10 @@ export default function FilePreviewDrawer({
     return () => {
       disposed = true;
     };
-  }, [cwd, refData]);
+  }, [customContent, cwd, refData]);
 
   useEffect(() => {
-    if (!refData) return;
+    if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       if (isExpanded) {
@@ -452,10 +469,10 @@ export default function FilePreviewDrawer({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isExpanded, onClose, refData]);
+  }, [isExpanded, onClose, open]);
 
   useEffect(() => {
-    if (!refData) return;
+    if (!open) return;
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (!target) return;
@@ -471,15 +488,16 @@ export default function FilePreviewDrawer({
       window.clearTimeout(timer);
       document.removeEventListener('pointerdown', onPointerDown, true);
     };
-  }, [onClose, refData]);
+  }, [onClose, open]);
 
   const file = state.status === 'ready' ? state.file : null;
   const imageUrl = useBase64ObjectUrl(
     file?.kind === 'image' ? file.base64 : null,
     file?.kind === 'image' ? file.mime : null,
   );
-  const label = file?.fileName ?? refData?.basename ?? '文件预览';
-  const path = file?.path ?? (refData ? displayFileRefPath(refData, cwd) : '');
+  const label = customContent?.label ?? file?.fileName ?? refData?.basename ?? '文件预览';
+  const path =
+    customContent?.path ?? file?.path ?? (refData ? displayFileRefPath(refData, cwd) : '');
   const lineSuffix = refData?.startLine
     ? `:${refData.startLine}${refData.endLine ? `-${refData.endLine}` : ''}`
     : '';
@@ -492,7 +510,7 @@ export default function FilePreviewDrawer({
   }, [file, textPreviewMode]);
   const vcsDiff = diffState.status === 'ready' ? diffState.diff : null;
 
-  if (!refData) return null;
+  if (!open) return null;
 
   return (
     <div className="fixed inset-0 z-50 pointer-events-none">
@@ -522,8 +540,11 @@ export default function FilePreviewDrawer({
                 {lineSuffix && <span className="text-fg-faint">{lineSuffix}</span>}
               </span>
             </div>
-            <div className="mt-0.5 truncate font-mono text-[10px] text-fg-faint" title={path}>
-              {path}
+            <div
+              className="mt-0.5 truncate font-mono text-[10px] text-fg-faint"
+              title={path || customContent?.meta}
+            >
+              {path || customContent?.meta}
             </div>
           </div>
           <button
@@ -557,14 +578,26 @@ export default function FilePreviewDrawer({
           </button>
         </header>
 
-        {state.status === 'loading' && (
+        {customContent && (
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg">
+            {customContent.meta && (
+              <div className="flex shrink-0 items-center gap-2 border-b border-border-soft px-3 py-1.5 font-mono text-[10px] text-fg-faint">
+                <FileText size={12} />
+                {customContent.meta}
+              </div>
+            )}
+            <div className="min-h-0 flex-1 overflow-hidden">{customContent.children}</div>
+          </div>
+        )}
+
+        {!customContent && state.status === 'loading' && (
           <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-fg-dim">
             <Loader2 size={16} className="animate-spin text-accent" />
             读取中
           </div>
         )}
 
-        {state.status === 'error' && (
+        {!customContent && state.status === 'error' && (
           <div className="flex min-h-0 flex-1 items-center justify-center p-6">
             <div className="max-w-md rounded-md border border-status-error/40 bg-status-error/10 p-4 text-sm leading-relaxed text-fg-dim">
               <div className="mb-2 flex items-center gap-2 font-medium text-status-error">
@@ -576,7 +609,7 @@ export default function FilePreviewDrawer({
           </div>
         )}
 
-        {file?.truncated && (
+        {!customContent && file?.truncated && (
           <div className="shrink-0 border-b border-accent-3/30 bg-accent-3/10 px-3 py-1.5 text-xs text-accent-3">
             文件较大，已截断显示。原始大小 {formatBytes(file.sizeBytes)}。
           </div>
